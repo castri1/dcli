@@ -110,6 +110,15 @@ pub enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Markdown report of the latest failure (error, commit, build log excerpt) to share or
+    /// give to an AI agent
+    Report {
+        env: Option<String>,
+        pipeline: Option<String>,
+        /// Include the whole build log instead of an excerpt
+        #[arg(long)]
+        full: bool,
+    },
     /// Print CodeBuild logs of the latest execution
     Logs {
         env: Option<String>,
@@ -416,6 +425,12 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Stop { env, pipeline, abandon, reason, yes } => stop(&target(config, env, pipeline)?, abandon, reason, yes),
         Command::Logs { env, pipeline, follow } => print_logs(&target(config, env, pipeline)?, follow),
+        Command::Report { env, pipeline, full } => {
+            let t = target(config, env, pipeline)?;
+            let report = crate::report::failure_report(&t.aws, &t.env_name, &t.pipeline.name, full)?;
+            print!("{}", report.markdown);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Param { env, name, decrypt, json } => {
             let (env, Some(name)) = env_and(config, env, name)? else { bail!("which parameter? {} param [ENV] NAME", program()) };
             param(aws_for(config, &env)?.as_ref(), &name, decrypt, json)

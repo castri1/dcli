@@ -37,3 +37,25 @@ pub fn get_log_events(aws: &Aws, group: &str, stream: &str, token: Option<&str>)
     }
     aws.call(&SERVICE, "GetLogEvents", &input)
 }
+
+/// Every line of a stream, oldest first, reading at most `max_pages` pages of 1,000 events.
+/// Returns the lines and whether the stream had more.
+pub fn read_all(aws: &Aws, group: &str, stream: &str, max_pages: usize) -> Result<(Vec<String>, bool)> {
+    let mut lines = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..max_pages {
+        let page = get_log_events(aws, group, stream, token.as_deref())?;
+        let done = page.events.is_empty() || page.next_forward_token == token;
+        for event in page.events {
+            if event.message.trim().is_empty() {
+                lines.push(String::new());
+            }
+            lines.extend(event.message.lines().map(|l| l.trim_end().to_string()));
+        }
+        if done {
+            return Ok((lines, false));
+        }
+        token = page.next_forward_token;
+    }
+    Ok((lines, true))
+}

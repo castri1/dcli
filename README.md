@@ -69,6 +69,7 @@ dcli deploy               # picks a pipeline, runs hooks, starts and follows it 
 dcli approve dev app-dev  # --reject, -m "comment"
 dcli stop dev app-dev     # --abandon
 dcli logs dev app-dev -f
+dcli report app-dev       # Markdown failure report for an AI agent or an issue (--full: whole log)
 dcli param /app/db/url --decrypt
 dcli lambda dev my-function --json
 ```
@@ -86,7 +87,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Where | Keys |
 |---|---|
 | Everywhere | `:` / `Ctrl+K` go to a module or environment · `Tab` / `1`-`9` switch module · `e` environment · `L` SSO login · `?` help · `q` quit |
-| Pipelines | `↑↓` pipeline · `←→` stage · `d` deploy · `a` approve/reject · `s` stop · `l` logs · `h` history · `o` open in console · `r` refresh · `n` search the account and add pipelines · `x` remove from config |
+| Pipelines | `↑↓` pipeline · `←→` stage · `d` deploy · `a` approve/reject · `s` stop · `l` logs · `h` history · `o` open in console · `r` refresh · `n` search the account and add pipelines · `x` remove from config · `c` copy a failure report · `C` save it with the full log |
 | Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name |
 | Lambda | `/` search · `v` show env values · `c` copy ARN · `o` open in console · `PgUp/PgDn` scroll |
 
@@ -97,6 +98,19 @@ The header shows every module while they fit; with more modules (or a narrow ter
 shows only the current one, and `:` reaches the rest by name.
 
 The mouse works too: wheel to scroll, click to select and switch modules.
+
+### When a pipeline fails
+
+`c` copies a Markdown report of the pipeline's most recent failure, ready to paste into
+Claude Code or any other AI agent (or an issue): the failed stage and action, the error, the
+commit, the failed CodeBuild phase and the useful part of the build log (error lines with the
+lines around them, and the end of the log). `C` saves the report with the whole log to a file
+and copies its path, for logs too long to paste. `dcli report [env] [pipeline]` prints the same
+report, so an agent can also run it by itself: "run `dcli report dev app-dev` and find out why
+it failed".
+
+Build logs can contain secrets that the build printed; read the report before sharing it
+outside your team.
 
 Production-looking environments (`prod`, `prd`, `live`) ask you to type the environment name
 before deploying.

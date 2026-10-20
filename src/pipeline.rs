@@ -207,6 +207,7 @@ pub fn stages(
                         .then(|| {
                             live.and_then(|l| l.error_details.as_ref())
                                 .and_then(|e| e.message.clone())
+                                .or_else(|| result.and_then(|r| r.error_details.as_ref()).and_then(|e| e.message.clone()))
                                 .or_else(|| result.and_then(|r| r.external_execution_summary.clone()))
                         })
                         .flatten();

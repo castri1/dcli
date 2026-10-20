@@ -132,6 +132,7 @@ pub struct ExecutionResult {
     pub external_execution_id: Option<String>,
     pub external_execution_summary: Option<String>,
     pub external_execution_url: Option<String>,
+    pub error_details: Option<ErrorDetails>,
 }
 
 pub fn get_pipeline_state(aws: &Aws, name: &str) -> Result<PipelineState> {

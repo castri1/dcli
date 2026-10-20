@@ -136,7 +136,10 @@ def action_details(name, exec_filter):
                  "input": {"actionTypeId": {"category": "Source" if s == "Source" else "Build", "owner": "AWS", "provider": provider},
                            "configuration": {"BranchName": "main", "FullRepositoryId": "acme/" + name} if s == "Source" else {}},
                  "output": {"outputVariables": {"BranchName": "main"} if s == "Source" else {},
-                            "executionResult": {"externalExecutionId": f"{name}-build:{p['exec'][:8]}"} if s == "Build" else {}}}
+                            "executionResult": {"externalExecutionId": f"{name}-build:{p['exec'][:8]}",
+                                                **({"externalExecutionSummary": "Build terminated with state: FAILED",
+                                                    "errorDetails": {"code": "JobFailed", "message": "Build terminated with state: FAILED. Phase BUILD: COMMAND_EXECUTION_ERROR"}}
+                                                   if st == "Failed" else {})} if s == "Build" else {}}}
             out.append(d)
     if exec_filter is None:
         for hid, _, start, total in p["history"]:
@@ -190,8 +193,15 @@ def codebuild(op, body):
     name = bid.split("-build:")[0]
     st = timeline(PIPES[name])["Build"][0]
     status = {"InProgress": "IN_PROGRESS", "Failed": "FAILED"}.get(st, "SUCCEEDED")
+    phases = [{"phaseType": t, "phaseStatus": "SUCCEEDED", "durationInSeconds": d}
+              for t, d in [("SUBMITTED", 0), ("PROVISIONING", 8), ("DOWNLOAD_SOURCE", 3), ("INSTALL", 21)]]
+    if status == "FAILED":
+        phases.append({"phaseType": "BUILD", "phaseStatus": "FAILED", "durationInSeconds": 38, "contexts": [
+            {"statusCode": "COMMAND_EXECUTION_ERROR", "message": "Error while executing command: npm test. Reason: exit status 1"}]})
     return {"builds": [{"id": bid, "buildStatus": status, "currentPhase": "BUILD" if status == "IN_PROGRESS" else "COMPLETED",
-                        "logs": {"groupName": "/aws/codebuild/" + name, "streamName": bid.split(":")[1]}}]}
+                        "phases": phases,
+                        "logs": {"groupName": "/aws/codebuild/" + name, "streamName": bid.split(":")[1],
+                                 "deepLink": "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logEvent:group=/aws/codebuild/" + name}}]}
 
 
 LOG = ["[Container] 2026/10/19 20:25:01 Running command npm ci",
@@ -202,7 +212,34 @@ LOG = ["[Container] 2026/10/19 20:25:01 Running command npm ci",
        "dist/index.js  412.3kb", "Error: something failed in a test fixture (expected)"]
 
 
+# A finished, failed build (worker-dev): install noise, a failing test in the middle, the
+# test summary and CodeBuild's verdict at the end.
+FAILED_LOG = (
+    ["[Container] 2026/10/19 20:25:01.112 Running command npm ci"]
+    + [f"npm http fetch GET 200 https://registry.npmjs.org/pkg-{i} {i % 90}ms (cache hit)" for i in range(400)]
+    + ["added 812 packages, and audited 813 packages in 14s", "found 0 vulnerabilities",
+       "[Container] 2026/10/19 20:25:20.410 Running command npm test", "> worker@3.4.1 test", "> jest --ci"]
+    + [f"PASS src/jobs/job-{i}.test.ts" for i in range(30)]
+    + ["FAIL src/queue/retry.test.ts", "  ● Queue › retries a failed job three times", "",
+       "    expect(received).toBe(expected) // Object.is equality", "", "    Expected: 3", "    Received: 1", "",
+       "      41 |     await queue.process(job);", "      42 |     await flush();", "    > 43 |     expect(job.attempts).toBe(3);",
+       "         |                          ^", "      44 |   });", "",
+       "      at Object.<anonymous> (src/queue/retry.test.ts:43:26)"]
+    + [f"PASS src/api/route-{i}.test.ts" for i in range(150)]
+    + ["", "Test Suites: 1 failed, 56 passed, 57 total", "Tests:       1 failed, 211 passed, 212 total",
+       "Snapshots:   0 total", "Time:        31.4 s", "Ran all test suites.",
+       "[Container] 2026/10/19 20:25:58.902 Command did not exit successfully npm test exit status 1",
+       "[Container] 2026/10/19 20:25:58.907 Phase complete: BUILD State: FAILED",
+       "[Container] 2026/10/19 20:25:58.907 Phase context status code: COMMAND_EXECUTION_ERROR Message: Error while executing command: npm test. Reason: exit status 1"]
+)
+
+
 def cwlogs(op, body):
+    if body.get("logGroupName", "").endswith("/worker-dev"):
+        start = int((body.get("nextToken") or "f/0").split("/")[1])
+        end = min(len(FAILED_LOG), start + 1000)
+        events = [{"timestamp": int(T0 * 1000), "message": line} for line in FAILED_LOG[start:end]]
+        return {"events": events, "nextForwardToken": f"f/{end}"}
     start = int((body.get("nextToken") or "f/0").split("/")[1])
     avail = min(400, int((time.time() - T0) * 3) + 25)
     end = min(avail, start + 50)

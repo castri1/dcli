@@ -16,6 +16,7 @@ pub struct Build {
     pub build_status: String,
     pub current_phase: Option<String>,
     pub logs: Option<LogsLocation>,
+    pub phases: Vec<BuildPhase>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -23,6 +24,25 @@ pub struct Build {
 pub struct LogsLocation {
     pub group_name: Option<String>,
     pub stream_name: Option<String>,
+    /// Console link to the log stream.
+    pub deep_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BuildPhase {
+    /// `INSTALL`, `BUILD`, `POST_BUILD`, …
+    pub phase_type: String,
+    pub phase_status: Option<String>,
+    pub duration_in_seconds: Option<i64>,
+    pub contexts: Vec<PhaseContext>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PhaseContext {
+    pub status_code: Option<String>,
+    pub message: Option<String>,
 }
 
 pub fn get_build(aws: &Aws, id: &str) -> Result<Option<Build>> {

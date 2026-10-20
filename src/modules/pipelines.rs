@@ -120,6 +120,7 @@ enum Msg {
     Started { name: String, result: aws::Result<String> },
     Acted { name: String, what: &'static str, result: aws::Result<()> },
     Discovered(aws::Result<Vec<cp::PipelineSummary>>),
+    Report { name: String, full: bool, result: aws::Result<crate::report::Report> },
 }
 
 pub struct Pipelines {
@@ -150,6 +151,7 @@ pub struct Pipelines {
     logs_area: Rect,
     /// The last deploy dialog fit on screen, so every hook it lists was visible.
     deploy_fits: bool,
+    report_loading: bool,
 }
 
 impl Pipelines {
@@ -179,6 +181,7 @@ impl Pipelines {
             list_area: Rect::default(),
             logs_area: Rect::default(),
             deploy_fits: false,
+            report_loading: false,
         }
     }
 
@@ -563,6 +566,56 @@ impl Pipelines {
         }
     }
 
+    /// Builds the failure report of the selected pipeline: `c` copies it (log excerpt), `C`
+    /// saves it with the whole log to a file and copies the path.
+    fn copy_report(&mut self, full: bool, ctx: &mut Ctx) {
+        let Some(name) = self.row().map(|r| r.name().to_string()) else { return };
+        if self.report_loading {
+            return;
+        }
+        self.report_loading = true;
+        ctx.toast(Level::Info, format!("Collecting the failure report of {name}…"));
+        let env = ctx.env();
+        ctx.spawn(move || {
+            let result = crate::report::failure_report(&env.aws, &env.name, &name, full);
+            Msg::Report { name, full, result }
+        });
+    }
+
+    fn on_report(&mut self, name: String, full: bool, result: aws::Result<crate::report::Report>, ctx: &mut Ctx) {
+        self.report_loading = false;
+        let report = match result {
+            Ok(r) => r,
+            Err(e) => return self.report(ctx, &format!("Could not build the report of {name}"), e),
+        };
+        let Some(execution) = &report.execution else {
+            return ctx.toast(Level::Info, report.markdown.trim().to_string());
+        };
+        let lines = match (report.log_lines, full) {
+            (0, _) => "no build log".to_string(),
+            (n, true) => format!("{n} log lines"),
+            (n, false) => format!("{} of {n} log lines", report.shown_lines),
+        };
+        if !full && crate::platform::copy_to_clipboard(&report.markdown) {
+            ctx.toast(Level::Success, format!("Copied the failure report of {name} ({lines}). Paste it into your AI agent."));
+            return;
+        }
+        // The whole log (or a failed copy) goes to a file; agents can read it from there.
+        match crate::platform::write_temp_file(&format!("{name}-{}", &execution[..8.min(execution.len())]), &report.markdown) {
+            Ok(path) => {
+                // The temp folder path is long: show the file name, copy the full path.
+                let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                let text = if crate::platform::copy_to_clipboard(&path.display().to_string()) {
+                    format!("Saved the report of {name} ({lines}) as {file}. Path copied: give it to your AI agent.")
+                } else {
+                    format!("Saved the report of {name} ({lines}) to {}", path.display())
+                };
+                ctx.toast(Level::Success, text);
+            }
+            Err(e) => ctx.toast(Level::Error, format!("Could not save the report: {e}")),
+        }
+    }
+
     fn open_console(&self, ctx: &mut Ctx) {
         let Some(row) = self.row() else { return };
         let url = aws::console_url(
@@ -807,6 +860,7 @@ impl Pipelines {
                 }
             }
             Msg::Discovered(result) => self.on_discovered(result, ctx),
+            Msg::Report { name, full, result } => self.on_report(name, full, result, ctx),
         }
     }
 
@@ -976,6 +1030,17 @@ impl Pipelines {
             lines.push(Line::raw(""));
             lines.push(Line::styled(format!(" {text}"), Style::new().fg(color)));
         }
+        if row.exec_status() == Some(Status::Failed) {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("c", theme::key()),
+                Span::styled(" copy a failure report for an AI agent  ", theme::muted()),
+                Span::styled("C", theme::key()),
+                Span::styled(" save it with the full log  ", theme::muted()),
+                Span::styled("l", theme::key()),
+                Span::styled(" build log", theme::muted()),
+            ]));
+        }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
     }
 
@@ -987,7 +1052,8 @@ impl Pipelines {
             .get(self.current_stage(&stages))
             .and_then(stage_note)
             .map_or(0, |(text, _)| 2 + text.chars().count() as u16 / width.saturating_sub(4).max(1));
-        stages.len() as u16 + 9 + note
+        let report_hint = u16::from(row.exec_status() == Some(Status::Failed));
+        stages.len() as u16 + 9 + note + report_hint
     }
 
     fn render_logs(&mut self, f: &mut Frame, area: Rect, view: &View) {
@@ -1396,6 +1462,8 @@ impl Module for Pipelines {
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('+') => self.open_add(ctx),
+            KeyCode::Char('c') => self.copy_report(false, ctx),
+            KeyCode::Char('C') => self.copy_report(true, ctx),
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(row) = self.row() {
                     self.dialog = Some(Dialog::Remove { name: row.name().to_string() });
@@ -1551,6 +1619,9 @@ impl Module for Pipelines {
                     ("n", "add"),
                     ("x", "remove"),
                 ];
+                if self.row().and_then(Row::exec_status) == Some(Status::Failed) {
+                    h.insert(2, ("c", "copy for AI"));
+                }
                 if self.lower == Lower::Logs {
                     h.push(("PgUp/PgDn", "scroll"));
                 }
@@ -1562,6 +1633,7 @@ impl Module for Pipelines {
     fn animating(&self) -> bool {
         self.any_running()
             || self.rows.iter().any(|r| r.loading && r.state.is_none())
+            || self.report_loading
             || matches!(self.dialog, Some(Dialog::Busy(_)) | Some(Dialog::Hooks { state: HookState::Running, .. }))
             || self.logs.as_ref().is_some_and(|p| matches!(p.state, LogsState::Loading | LogsState::Live))
             || (self.lower == Lower::History && self.row().is_some_and(|r| !self.history.contains_key(r.name())))

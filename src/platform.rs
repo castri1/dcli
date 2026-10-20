@@ -1,7 +1,9 @@
 //! OS integration without extra crates: shell commands, desktop notifications,
-//! clipboard and opening URLs. Everything here is best-effort and never blocks the UI.
+//! clipboard, opening URLs and private temporary files. Everything here is best-effort
+//! and never blocks the UI.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// A command run through the platform shell (`sh -c` / `cmd /C`).
@@ -101,7 +103,12 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     let native = if cfg!(target_os = "macos") {
         pipe_to("pbcopy", &[], text)
     } else if cfg!(windows) {
-        pipe_to("powershell", &["-NoProfile", "-Command", "$input | Set-Clipboard"], text)
+        // Read stdin as UTF-8, not the console code page, so non-ASCII text survives.
+        pipe_to(
+            "powershell",
+            &["-NoProfile", "-Command", "[Console]::InputEncoding = [Text.Encoding]::UTF8; $input | Set-Clipboard"],
+            text,
+        )
     } else {
         pipe_to("wl-copy", &[], text)
             || pipe_to("xclip", &["-selection", "clipboard"], text)
@@ -112,4 +119,56 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     }
     let mut out = std::io::stdout();
     write!(out, "\u{1b}]52;c;{}\u{7}", crate::util::base64(text.as_bytes())).is_ok() && out.flush().is_ok()
+}
+
+/// Writes `content` to a new file in the temp folder, named `dcli-<label>-<random>.md`.
+/// The file is created exclusively (an existing file or symlink with that name is never
+/// followed) and readable only by the user, since the temp folder may be shared.
+pub fn write_temp_file(label: &str, content: &str) -> std::io::Result<PathBuf> {
+    let label: String =
+        label.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
+    let mut last_error = None;
+    for attempt in 0..8u32 {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let suffix = format!("{:x}", std::process::id() ^ nanos.rotate_left(attempt * 4));
+        let path = std::env::temp_dir().join(format!("dcli-{label}-{suffix}.md"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(content.as_bytes())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_error = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("no free file name")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_files_are_new_and_private() {
+        let a = write_temp_file("../x/app dev", "one").unwrap();
+        let b = write_temp_file("../x/app dev", "two").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("dcli-.._x_app_dev-"));
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "two");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
 }

@@ -5,6 +5,7 @@ mod hooks;
 mod modules;
 mod pipeline;
 mod platform;
+mod report;
 mod tui;
 mod util;
 
