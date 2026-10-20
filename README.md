@@ -36,6 +36,9 @@ irm https://raw.githubusercontent.com/castri1/dcli/main/install.ps1 | iex
 
 Run the same command again to update. `DCLI_VERSION=v2.0.0` installs a specific version and
 `DCLI_INSTALL_DIR` changes where it goes (default `~/.local/bin`, or `%LOCALAPPDATA%\dcli\bin`).
+
+With Node.js on any system: `npm install -g @castri1/dcli` (the same command updates it).
+
 You can also download the archive for your platform from
 [Releases](https://github.com/castri1/dcli/releases) and put `dcli` on your `PATH`.
 
@@ -173,11 +176,14 @@ CI runs clippy and the tests on Linux, macOS and Windows.
 To release: set `version` in `Cargo.toml`, commit, then tag and push (`git tag v2.1.0 &&
 git push origin v2.1.0`). The release workflow builds archives for macOS (arm64, x86_64),
 Linux (x86_64, arm64, static musl) and Windows (x86_64) and attaches them, with checksums,
-to a GitHub release; the install scripts pick up the newest one.
+to a GitHub release; the install scripts pick up the newest one. It then publishes them to npm
+(`npm/build.mjs`): `@castri1/dcli` is a small launcher, and npm installs only the
+`@castri1/dcli-<os>-<cpu>` package with the binary for the machine.
 
 ## The Node.js version
 
-`dcli` 2.x replaces the Node.js `deploy-cli` 1.x (npm `@castri1/deployment-cli`). That code is
+`dcli` 2.x replaces the Node.js `deploy-cli` 1.x (npm `@castri1/deployment-cli`, now deprecated
+in favour of `@castri1/dcli`). That code is
 frozen at the git tag [`node-v1.0.1`](https://github.com/castri1/dcli/tree/node-v1.0.1); new
 work happens here, on `main`. Both read the same config, so they can be installed side by side
 while you switch over.

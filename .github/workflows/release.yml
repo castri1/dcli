@@ -1,4 +1,5 @@
-# Push a tag like v0.1.0 to build every platform and attach the binaries to a GitHub release.
+# Push a tag like v2.1.0 to build every platform, attach the binaries to a GitHub release
+# and publish them to npm.
 name: Release
 
 on:
@@ -59,3 +60,30 @@ jobs:
             dcli-*.tar.gz
             dcli-*.zip
             dcli-*.sha256
+
+  # Publishes @castri1/dcli and its per-platform packages, built from the archives above.
+  # Uses npm trusted publishing (OIDC): no token; each package trusts this workflow
+  # (npm trust github <package> --file release.yml --repo castri1/dcli --allow-publish).
+  npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest
+      - run: gh release download "$TAG" --dir archives --pattern 'dcli-*'
+      - run: node npm/build.mjs "$TAG" archives out
+      - name: Publish (platform packages first, the launcher last)
+        run: |
+          for dir in out/dcli-*/ out/dcli/; do
+            npm publish --access public "$dir"
+          done
