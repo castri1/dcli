@@ -283,6 +283,15 @@ pub fn xml_text(xml: &str, tag: &str) -> Option<String> {
     Some(sanitize(&xml_unescape(&xml[start..end])))
 }
 
+/// Like [`xml_text`] but not sanitized: for identifiers sent back to AWS (S3 keys, tokens),
+/// which must stay byte-exact. Sanitize them (or [`show_invisible`]) only to display them.
+pub fn xml_text_raw(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = start + xml[start..].find(&format!("</{tag}>"))?;
+    Some(xml_unescape(&xml[start..end]))
+}
+
 /// The `<tag>…</tag>` blocks of `xml`, in order (list members are `<member>`).
 pub fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
@@ -445,6 +454,7 @@ mod tests {
         assert_eq!(members.len(), 2);
         assert_eq!(xml_text(members[0], "Reason").as_deref(), Some("a & b <c> \nx"));
         assert_eq!(xml_text("<M>a&#x1b;]52;c;aGk=&#7;b&#27;[2J</M>", "M").as_deref(), Some("ab"));
+        assert_eq!(xml_text_raw("<Key>a&#x1b;b</Key>", "Key").as_deref(), Some("a\u{1b}b"));
         assert_eq!(xml_text(members[1], "Reason"), None);
         assert_eq!(xml_text(xml, "NextToken").as_deref(), Some("t"));
         assert_eq!(xml_unescape("AT&T &bogus; ok"), "AT&T &bogus; ok");

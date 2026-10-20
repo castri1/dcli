@@ -19,7 +19,7 @@ use crate::tui::module::{Ctx, Emitter, Handled, Level, Module, Payload, View};
 use crate::tui::picker::{Item, Outcome, Picker};
 use crate::tui::theme;
 use crate::tui::widgets::{self, InputEvent, TextInput};
-use crate::util::{display_path, ellipsize, fmt_ago, fmt_bytes, fmt_duration, fmt_utc, now_secs, pretty_json};
+use crate::util::{display_path, ellipsize, fmt_ago, fmt_bytes, fmt_duration, fmt_utc, now_secs, pretty_json, show_invisible};
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
 /// Entries read at most per folder.
@@ -170,10 +170,11 @@ impl S3 {
         });
     }
 
-    /// Relative name shown for a key or prefix inside the current folder.
-    fn label<'a>(&self, full: &'a str) -> &'a str {
+    /// Relative name shown for a key or prefix inside the current folder. Keys are kept
+    /// byte-exact for requests; control or invisible characters show as `\u{…}` here.
+    fn label(&self, full: &str) -> String {
         let prefix = self.place.as_ref().map_or("", |p| p.prefix.as_str());
-        full.strip_prefix(prefix).unwrap_or(full)
+        show_invisible(full.strip_prefix(prefix).unwrap_or(full))
     }
 
     fn rebuild(&mut self) {
@@ -190,10 +191,10 @@ impl S3 {
             Some(_) => {
                 self.entries.push(Entry::Up);
                 let folders: Vec<String> =
-                    self.folders.iter().filter(|f| matches_filter(self.label(f), &query)).cloned().collect();
+                    self.folders.iter().filter(|f| matches_filter(&self.label(f), &query)).cloned().collect();
                 self.entries.extend(folders.into_iter().map(Entry::Folder));
                 let objects: Vec<usize> =
-                    (0..self.objects.len()).filter(|&i| matches_filter(self.label(&self.objects[i].key), &query)).collect();
+                    (0..self.objects.len()).filter(|&i| matches_filter(&self.label(&self.objects[i].key), &query)).collect();
                 self.entries.extend(objects.into_iter().map(Entry::Object));
             }
         }
@@ -448,12 +449,12 @@ impl S3 {
                 }
                 Entry::Folder(p) => ListItem::new(Line::from(vec![
                     Span::styled("▸ ", theme::accent()),
-                    Span::styled(ellipsize(self.label(p), width.saturating_sub(2)), theme::accent().bold()),
+                    Span::styled(ellipsize(&self.label(p), width.saturating_sub(2)), theme::accent().bold()),
                 ])),
                 Entry::Object(i) => {
                     let o = &self.objects[*i];
                     let right = format!("{:>9}  {:>7}", fmt_bytes(o.size), o.modified.map(fmt_ago).unwrap_or_default().replace(" ago", ""));
-                    let name = ellipsize(self.label(&o.key), width.saturating_sub(right.chars().count() + 3));
+                    let name = ellipsize(&self.label(&o.key), width.saturating_sub(right.chars().count() + 3));
                     let pad = width.saturating_sub(name.chars().count() + right.chars().count() + 2);
                     ListItem::new(Line::from(vec![
                         Span::raw("  "),
@@ -497,7 +498,7 @@ impl S3 {
             }
             Some(Entry::Object(_)) => {
                 let Some((place, o)) = self.selected_object() else { return };
-                lines.push(widgets::kv("URI", s3::uri(&place.bucket, &o.key), kw));
+                lines.push(widgets::kv("URI", show_invisible(&s3::uri(&place.bucket, &o.key)), kw));
                 lines.push(widgets::kv("Size", format!("{} ({} bytes)", fmt_bytes(o.size), o.size), kw));
                 if let Some(t) = o.modified {
                     lines.push(widgets::kv("Modified", format!("{} · {}", fmt_ago(t), fmt_utc(t)), kw));

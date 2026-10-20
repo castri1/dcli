@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{Aws, AwsError, Result, Service};
-use crate::util::{parse_rfc3339, xml_blocks, xml_text};
+use crate::util::{parse_rfc3339, xml_blocks, xml_text, xml_text_raw};
 
 pub const SERVICE: Service = Service { endpoint: "s3", signing_name: "s3", target_prefix: "" };
 
@@ -91,7 +91,7 @@ pub fn list_buckets(aws: &Aws) -> Result<Vec<Bucket>> {
         }
         let xml = text(aws.raw(&SERVICE, "GET", &[], &query, Vec::new(), Vec::new())?.body);
         buckets.extend(parse_buckets(&xml));
-        token = xml_text(&xml, "ContinuationToken").filter(|t| !t.is_empty());
+        token = xml_text_raw(&xml, "ContinuationToken").filter(|t| !t.is_empty());
         if token.is_none() {
             break;
         }
@@ -192,7 +192,7 @@ fn parse_page(xml: &str, prefix: &str) -> Page {
     let objects = xml_blocks(xml, "Contents")
         .into_iter()
         .map(|c| Object {
-            key: xml_text(c, "Key").unwrap_or_default(),
+            key: xml_text_raw(c, "Key").unwrap_or_default(),
             size: xml_text(c, "Size").and_then(|s| s.parse().ok()).unwrap_or(0),
             modified: xml_text(c, "LastModified").and_then(|d| parse_rfc3339(&d)),
             storage_class: xml_text(c, "StorageClass"),
@@ -200,9 +200,9 @@ fn parse_page(xml: &str, prefix: &str) -> Page {
         // The folder's own marker object ("photos/" inside "photos/").
         .filter(|o| !o.key.is_empty() && o.key != prefix)
         .collect();
-    let folders = xml_blocks(xml, "CommonPrefixes").into_iter().filter_map(|p| xml_text(p, "Prefix")).collect();
+    let folders = xml_blocks(xml, "CommonPrefixes").into_iter().filter_map(|p| xml_text_raw(p, "Prefix")).collect();
     let truncated = xml_text(xml, "IsTruncated").is_some_and(|t| t == "true");
-    let next = xml_text(xml, "NextContinuationToken").filter(|t| truncated && !t.is_empty());
+    let next = xml_text_raw(xml, "NextContinuationToken").filter(|t| truncated && !t.is_empty());
     Page { folders, objects, next }
 }
 

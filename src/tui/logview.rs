@@ -47,8 +47,10 @@ impl LogView {
         &self.lines
     }
 
+    /// Appends lines, made safe to print: object contents, inputs and logs can carry
+    /// terminal escape sequences.
     pub fn extend(&mut self, lines: impl IntoIterator<Item = String>) {
-        self.lines.extend(lines);
+        self.lines.extend(lines.into_iter().map(|l| crate::util::sanitize(&l)));
         if self.lines.len() > MAX_LINES {
             let drop = self.lines.len() - MAX_LINES;
             self.lines.drain(..drop);
