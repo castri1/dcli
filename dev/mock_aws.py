@@ -502,9 +502,178 @@ def eventbridge(op, body):
 
 
 # ---- AppConfig (restJson1; hosted configurations are raw documents) --------------------------
+AC_APPS = [{"Id": "ckout01", "Name": "checkout", "Description": "Checkout service"},
+           {"Id": "store02", "Name": "storefront", "Description": "Web storefront"}]
+AC_ENVS = {"ckout01": [{"Id": "envdev", "Name": "Development"}, {"Id": "envbeta", "Name": "Beta"},
+                       {"Id": "envprod", "Name": "Production"}],
+           "store02": [{"Id": "stdev", "Name": "Development"}, {"Id": "stprod", "Name": "Production"}]}
+AC_PROFILES = {"ckout01": [{"Id": "flags01", "Name": "checkout-flags", "Type": "AWS.AppConfig.FeatureFlags", "LocationUri": "hosted"},
+                           {"Id": "free01", "Name": "service-config", "Type": "AWS.Freeform", "LocationUri": "hosted"}],
+               "store02": [{"Id": "flags02", "Name": "storefront-flags", "Type": "AWS.AppConfig.FeatureFlags", "LocationUri": "hosted"}]}
+
+
+def ac_flags(values, extra=()):
+    """A feature flags document: values {key: (enabled, {attr: value})}."""
+    defs = {
+        "new_checkout": {"name": "New checkout", "description": "One-page checkout",
+                         "attributes": {"rollout_percent": {"constraints": {"type": "number"}}}},
+        "dark_mode": {"name": "Dark mode", "attributes": {"theme": {"constraints": {"type": "string"}}}},
+        "express_shipping": {"name": "Express shipping", "description": "Same-day delivery in big cities",
+                             "attributes": {"max_items": {"constraints": {"type": "number"}},
+                                            "carriers": {"constraints": {"type": "string[]"}}}},
+        "beta_banner": {"name": "Beta banner", "attributes": {"message": {"constraints": {"type": "string"}}},
+                        "_createdAt": "2026-10-01T10:00:00.000Z"},
+    }
+    keys = list(values) + list(extra)
+    return json.dumps({"version": "1", "flags": {k: defs[k] for k in keys},
+                       "values": {k: {"enabled": on, **attrs} for k, (on, attrs) in values.items()}})
+
+
+AC_VERSIONS = {
+    ("ckout01", "flags01"): {
+        1: ac_flags({"new_checkout": (False, {"rollout_percent": 0}), "dark_mode": (False, {"theme": "day"})}),
+        2: ac_flags({"new_checkout": (True, {"rollout_percent": 10}), "dark_mode": (False, {"theme": "day"})}),
+        3: ac_flags({"new_checkout": (True, {"rollout_percent": 50}), "dark_mode": (True, {"theme": "night"}),
+                     "express_shipping": (False, {"max_items": 3, "carriers": ["dhl"]})}),
+        4: ac_flags({"new_checkout": (True, {"rollout_percent": 100}), "dark_mode": (True, {"theme": "night"}),
+                     "express_shipping": (True, {"max_items": 5, "carriers": ["dhl", "fedex"]}),
+                     "beta_banner": (False, {"message": "Try the new checkout!"})}),
+    },
+    ("ckout01", "free01"): {
+        1: json.dumps({"timeoutMs": 3000, "retries": 2}),
+        2: json.dumps({"timeoutMs": 2500, "retries": 3, "endpoints": {"payments": "https://pay.internal", "tax": "https://tax.internal"}}),
+    },
+    ("store02", "flags02"): {1: ac_flags({"dark_mode": (True, {"theme": "auto"}), "beta_banner": (True, {"message": "Hi"})})},
+}
+AC_STRATEGIES = [
+    {"Id": "AppConfig.AllAtOnce", "Name": "AppConfig.AllAtOnce", "Description": "Quick",
+     "DeploymentDurationInMinutes": 0, "GrowthType": "LINEAR", "GrowthFactor": 100, "FinalBakeTimeInMinutes": 0},
+    {"Id": "AppConfig.Linear50PercentEvery30Seconds", "Name": "AppConfig.Linear50PercentEvery30Seconds",
+     "Description": "Testing/demonstration", "DeploymentDurationInMinutes": 1, "GrowthType": "LINEAR",
+     "GrowthFactor": 50, "FinalBakeTimeInMinutes": 1},
+    {"Id": "AppConfig.Canary10Percent20Minutes", "Name": "AppConfig.Canary10Percent20Minutes",
+     "Description": "AWS recommended", "DeploymentDurationInMinutes": 20, "GrowthType": "EXPONENTIAL",
+     "GrowthFactor": 10, "FinalBakeTimeInMinutes": 10},
+]
+
+
+def ac_history(app, env, rows):
+    """rows: (profile id, version, state, days ago); numbered oldest first."""
+    profiles = {p["Id"]: p for p in AC_PROFILES[app]}
+    out = []
+    for n, (pid, version, state, days) in enumerate(rows, start=1):
+        start = time.time() - 86400 * days
+        out.append({"DeploymentNumber": n, "ConfigurationProfileId": pid, "ConfigurationName": profiles[pid]["Name"],
+                    "ConfigurationVersion": str(version), "DeploymentStrategyId": "AppConfig.AllAtOnce",
+                    "Description": "", "Started": start, "Duration": 0, "Fixed": state})
+    return out
+
+
+AC_DEPLOYMENTS = {
+    ("ckout01", "envdev"): ac_history("ckout01", "envdev", [("flags01", 1, "COMPLETE", 30), ("free01", 1, "COMPLETE", 29),
+                                                            ("flags01", 2, "COMPLETE", 20), ("free01", 2, "COMPLETE", 12),
+                                                            ("flags01", 3, "COMPLETE", 8), ("flags01", 4, "COMPLETE", 1)]),
+    ("ckout01", "envbeta"): ac_history("ckout01", "envbeta", [("flags01", 1, "COMPLETE", 28), ("free01", 1, "COMPLETE", 27),
+                                                              ("flags01", 3, "COMPLETE", 6), ("free01", 2, "COMPLETE", 5)]),
+    ("ckout01", "envprod"): ac_history("ckout01", "envprod", [("flags01", 1, "COMPLETE", 26), ("free01", 1, "COMPLETE", 25),
+                                                              ("flags01", 2, "COMPLETE", 15), ("flags01", 3, "ROLLED_BACK", 4)]),
+    ("store02", "stdev"): ac_history("store02", "stdev", [("flags02", 1, "COMPLETE", 3)]),
+    ("store02", "stprod"): ac_history("store02", "stprod", [("flags02", 1, "COMPLETE", 2)]),
+}
+
+
+def ac_deployment(app, env, d):
+    """A deployment as AppConfig returns it; started ones progress over d["Duration"] seconds, then bake 3 s."""
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+    elapsed = time.time() - d["Started"]
+    if d.get("Fixed"):
+        state, pct = d["Fixed"], 100.0
+    elif elapsed < d["Duration"]:
+        state, pct = "DEPLOYING", round(100.0 * elapsed / d["Duration"], 1)
+    elif elapsed < d["Duration"] + 3:
+        state, pct = "BAKING", 100.0
+    else:
+        state, pct = "COMPLETE", 100.0
+    out = {"ApplicationId": app, "EnvironmentId": env, "DeploymentNumber": d["DeploymentNumber"],
+           "ConfigurationProfileId": d["ConfigurationProfileId"], "ConfigurationName": d["ConfigurationName"],
+           "ConfigurationVersion": d["ConfigurationVersion"], "DeploymentStrategyId": d["DeploymentStrategyId"],
+           "Description": d["Description"], "State": state, "PercentageComplete": pct,
+           "DeploymentDurationInMinutes": round(d["Duration"] / 60, 2), "StartedAt": iso(d["Started"])}
+    if state in ("COMPLETE", "ROLLED_BACK"):
+        out["CompletedAt"] = iso(d["Started"] + d["Duration"] + 3)
+    return out
+
+
 def appconfig_rest(method, path, query, headers, body):
     """Returns (status, headers, body bytes)."""
-    return 404, {"content-type": "application/json"}, json.dumps({"Message": "mock: not implemented"}).encode()
+    def ok(obj, status=200):
+        return status, {"content-type": "application/json"}, json.dumps(obj).encode()
+
+    def err(status, code, message):
+        return status, {"content-type": "application/json", "x-amzn-ErrorType": code}, json.dumps({"Message": message}).encode()
+
+    parts = [p for p in path.split("/") if p]
+    if parts == ["deploymentstrategies"]:
+        return ok({"Items": AC_STRATEGIES})
+    if parts == ["applications"]:
+        return ok({"Items": AC_APPS})
+    if len(parts) < 3 or parts[1] not in AC_ENVS:
+        return err(404, "ResourceNotFoundException", f"Application {parts[1:2]} not found")
+    app = parts[1]
+    if parts[2:] == ["environments"]:
+        return ok({"Items": [{**e, "ApplicationId": app, "State": "READY_FOR_DEPLOYMENT"} for e in AC_ENVS[app]]})
+    if parts[2:] == ["configurationprofiles"]:
+        return ok({"Items": [{**p, "ApplicationId": app} for p in AC_PROFILES[app]]})
+    if parts[2] == "environments" and len(parts) >= 5 and parts[4] == "deployments":
+        env = parts[3]
+        if (app, env) not in AC_DEPLOYMENTS:
+            return err(404, "ResourceNotFoundException", f"Environment {env} not found")
+        history = AC_DEPLOYMENTS[(app, env)]
+        if len(parts) == 5 and method == "GET":
+            return ok({"Items": [ac_deployment(app, env, d) for d in reversed(history)]})
+        if len(parts) == 5 and method == "POST":
+            req = json.loads(body or b"{}")
+            busy = [d for d in history if ac_deployment(app, env, d)["State"] in ("DEPLOYING", "BAKING")]
+            if busy:
+                return err(409, "ConflictException", f"Deployment #{busy[0]['DeploymentNumber']} is in progress in {env}")
+            profile = next((p for p in AC_PROFILES[app] if p["Id"] == req["ConfigurationProfileId"]), None)
+            if profile is None or int(req["ConfigurationVersion"]) not in AC_VERSIONS.get((app, profile["Id"]), {}):
+                return err(400, "BadRequestException", "Unknown profile or version")
+            fast = req["DeploymentStrategyId"] == "AppConfig.AllAtOnce"
+            d = {"DeploymentNumber": len(history) + 1, "ConfigurationProfileId": profile["Id"],
+                 "ConfigurationName": profile["Name"], "ConfigurationVersion": str(req["ConfigurationVersion"]),
+                 "DeploymentStrategyId": req["DeploymentStrategyId"], "Description": req.get("Description", ""),
+                 "Started": time.time(), "Duration": 4 if fast else 15, "Fixed": None}
+            history.append(d)
+            return ok(ac_deployment(app, env, d), 201)
+        d = next((x for x in history if str(x["DeploymentNumber"]) == parts[5]), None) if len(parts) == 6 else None
+        if d is None:
+            return err(404, "ResourceNotFoundException", "Deployment not found")
+        if method == "DELETE":
+            if ac_deployment(app, env, d)["State"] not in ("DEPLOYING", "BAKING"):
+                return err(400, "BadRequestException", "The deployment is not in progress")
+            d["Fixed"] = "ROLLED_BACK"
+            return ok(ac_deployment(app, env, d), 202)
+        return ok(ac_deployment(app, env, d))
+    if parts[2] == "configurationprofiles" and len(parts) >= 5 and parts[4] == "hostedconfigurationversions":
+        versions = AC_VERSIONS.setdefault((app, parts[3]), {})
+        if len(parts) == 5 and method == "GET":
+            return ok({"Items": [{"ApplicationId": app, "ConfigurationProfileId": parts[3], "VersionNumber": n,
+                                  "ContentType": "application/json"} for n in sorted(versions, reverse=True)]})
+        if len(parts) == 5 and method == "POST":
+            latest = max(versions) if versions else 0
+            lock = headers.get("latest-version-number")
+            if lock is not None and int(lock) != latest:
+                return err(409, "ConflictException", f"Latest version is {latest}, not {lock}")
+            json.loads(body)  # the mock, like AppConfig, rejects invalid JSON for this profile
+            versions[latest + 1] = body.decode()
+            return 201, {"content-type": "application/json", "Version-Number": str(latest + 1),
+                         "Application-Id": app, "Configuration-Profile-Id": parts[3]}, body
+        if len(parts) == 6 and parts[5].isdigit() and int(parts[5]) in versions:
+            return 200, {"content-type": "application/json", "Version-Number": parts[5],
+                         "Application-Id": app, "Configuration-Profile-Id": parts[3]}, versions[int(parts[5])].encode()
+        return err(404, "ResourceNotFoundException", "Hosted configuration version not found")
+    return err(404, "ResourceNotFoundException", f"mock: no route for {method} {path}")
 
 
 def is_appconfig(path):
