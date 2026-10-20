@@ -1,7 +1,8 @@
 # dcli
 
 Terminal UI and CLI to deploy and explore AWS: **CodePipeline** (with a matrix of what is deployed
-where), **Parameter Store**, **Secrets Manager**, **Lambda** and **CloudWatch Logs**.
+where), **Parameter Store**, **Secrets Manager**, **Lambda**, **CloudWatch Logs**, **S3**,
+**Step Functions**, **DynamoDB**, **EventBridge** and **AppConfig** feature flags.
 A single ~3 MB binary for macOS, Linux and Windows. No Node.js, no AWS SDK, no runtime.
 
 It reads the same config as the Node.js `deploy-cli` it replaces (`~/.deployment-cli/config.yaml`),
@@ -78,11 +79,21 @@ dcli secret prod/payments/stripe                                  # print a secr
 dcli secret dev/api-key --set - --yes < key.txt                   # create or update from stdin
 dcli tail /aws/lambda/orders --since 1h --filter ERROR -f         # CloudWatch Logs, every stream
 dcli lambda dev my-function --json
+dcli s3 ls s3://my-bucket/exports/                                # buckets without a URI
+dcli s3 url s3://my-bucket/exports/report.csv --expires 12h       # presigned download link
+dcli s3 get s3://my-bucket/exports/report.csv ~/Downloads/
+dcli sfn order-fulfillment --status failed                        # executions (no machine: list them)
+dcli sfn order-fulfillment --report                               # Markdown report of the last failure
+dcli ddb orders --pk c-1001 --sk begins_with:2026-                # Query by key (--index for a GSI/LSI)
+dcli ddb orders --scan --limit 20                                 # read the whole table, page by page
+dcli events orders-bus                                            # rules and their targets
+dcli events send --bus orders-bus --source orders.service --detail-type OrderPaid --detail '{"amount": 101}'
+dcli flags checkout                                               # AppConfig feature flags × environments
 dcli update                # update dcli (npm installs update through npm); --check only tells
 ```
 
-Writes (`--set`) ask for confirmation, or for the environment name in production-looking
-environments; `--yes` skips it (needed when the value comes from stdin).
+Writes (`--set`, `events send`) ask for confirmation, or for the environment name in
+production-looking environments; `--yes` skips it (needed when the value comes from stdin).
 
 The environment argument is optional everywhere: without it, commands use the current
 environment (`use`, else the first one in the config). A single argument that is not an
@@ -105,6 +116,11 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Secrets | `/` search · `v` reveal · `c` copy value · `y` copy name · `n` new secret · `u` new value · `o` open in console |
 | Lambda | `/` search · `v` show env values · `c` copy ARN · `l` its logs · `o` open in console · `PgUp/PgDn` scroll |
 | Logs | `Enter` open a log group · `/` search groups · `t` time range · `f` filter pattern · `p` pause/resume live · `z` full screen · `y` copy · `o` console |
+| S3 | `Enter`/`←` open / go up · `/` filter · `p` preview (first 64 KB) · `u` download link (15 min, 1 h, 12 h) · `d` download to `~/Downloads` · `y` copy the `s3://` URI · `o` console · `r` reload |
+| Step Functions | `Enter` executions · `f` filter by status · `→` steps · `i`/`O` input/output · `l` logs · `c` copy a failure report · `R` redrive from the failed step · `n` start with the same input · `x` stop · `o` console |
+| DynamoDB | `Enter` open a table (scans the first 50 items) · `f` find by key (table or index) · `s` scan · `m` next page · `/` filter the items read · `y` copy the item · `z` full screen · `o` console |
+| EventBridge | `Enter` a bus's rules · `→` targets, `Enter` on one opens it (Lambda, Step Functions, Logs) · `t` send a test event · `y` copy the pattern · `o` console |
+| AppConfig | `Enter` application → profile → flags · `↑↓←→` flag × environment · `Enter` edit and deploy · `x` stop the deployment (rolls back) · `y` copy the document |
 
 Lists with a search box (`:`, `e`, `n`) filter as you type; `Space` marks several items
 where that makes sense and `Ctrl+A` marks every match.
@@ -134,6 +150,31 @@ The detail panel and `dcli status` also show what changed since the last success
 
 Production-looking environments (`prod`, `prd`, `live`) ask you to type the environment name
 before deploying and before creating or changing parameters and secrets.
+
+### Other services
+
+- **S3**: links are presigned URLs anyone can open until they expire; they are signed with
+  your session, so they stop working when the session ends (dcli tells you when that comes
+  first). The CLI allows up to 7 days (`--expires 7d`) with long-lived credentials.
+- **Step Functions**: a failed execution shows the step that failed, its error and cause.
+  `c` copies the same kind of report as a failed pipeline. Redrive (`R`) restarts from the
+  failed step without running the ones that succeeded; `n` starts a new execution with the
+  selected one's input, editable first. Express workflows keep no execution list: their
+  history is in their logs (`l`).
+- **DynamoDB**: find by key runs a Query (a GetItem with the whole key), which reads only the
+  matching items. A scan reads the whole table and is billed for everything it reads, so it
+  goes 50 items at a time. Items show as plain JSON, without DynamoDB's type wrappers.
+- **EventBridge**: `t` prefills an event that the selected rule's pattern accepts. The first
+  Enter checks it against the pattern (nothing is sent); the next one sends it to the bus,
+  where every matching rule receives it, so its targets run.
+- **AppConfig**: each cell is what that environment serves now. Editing starts from that
+  version, so other environments' changes do not slip in; you see the change, pick a
+  deployment strategy, and dcli creates the new version, deploys it and follows it. Freeform
+  profiles (JSON, YAML, text) are shown read-only.
+
+Production-looking environments ask for their name before these writes too (redrive, start,
+stop, test events, flag deploys; for AppConfig, also when its environment is named like
+production).
 
 ### What is deployed where
 
@@ -203,14 +244,18 @@ The current environment lives in `~/.deployment-cli/current-env`.
 ```
 src/
   aws/            minimal AWS client: SigV4 signing, profiles, SSO, one shared HTTP agent
-    mod.rs        Aws::call (awsJson1_1), Aws::rest (restJson1), Aws::query (XML), retries
+    mod.rs        Aws::call (awsJson1_1/1_0), Aws::rest (restJson1), Aws::query (XML), retries,
+                  Aws::raw (any request), Aws::presign (presigned URLs), Aws::download
     codepipeline.rs codebuild.rs cloudformation.rs logs.rs ssm.rs secrets.rs lambda.rs
+    s3.rs sfn.rs dynamodb.rs events.rs appconfig.rs
   tui/            app shell: header, module palette, environment, toasts, help, SSO login, event loop
     module.rs     the Module trait every module implements
     picker.rs     searchable list, in the UI and inline in the shell
     logview.rs    log viewer with full screen, search and error jumps (Pipelines, Logs)
     form.rs       modal forms (new parameter, new secret…)
-  modules/        one file per module: pipelines, matrix, parameters, secrets, lambda, cwlogs
+  modules/        one file per module: pipelines, matrix, parameters, secrets, lambda, cwlogs,
+                  s3, sfn, dynamodb, events, appconfig
+  clicmd/         the commands of the newer modules (dcli s3, sfn, ddb, events, flags)
   pipeline.rs     CodePipeline domain logic shared by the UI and the CLI
   matrix.rs       applications × environments: grouping, deployed commit, drift
   cli.rs          non-interactive commands
@@ -221,7 +266,7 @@ src/
 Background work runs on plain threads and reports back through a channel, so the UI never
 blocks. There is no async runtime and no AWS SDK: each service is a handful of typed JSON calls.
 
-### Adding a module (e.g. ECS, SQS, Step Functions)
+### Adding a module (e.g. ECS, SQS)
 
 1. **AWS calls**: create `src/aws/<service>.rs` with a `Service` constant and functions that
    call `aws.call(&SERVICE, "Operation", &json!({...}))` (or `aws.rest(...)` for REST APIs),
@@ -231,6 +276,8 @@ blocks. There is no async runtime and no AWS SDK: each service is a handful of t
    `activate` (load lazily), `key`, `task` (results from `ctx.spawn`), `render`, `hints`.
    `parameters.rs` is a compact example.
 3. **Register** it in `src/modules/mod.rs`. It appears in the header and the palette.
+4. **CLI** (optional): a `src/clicmd/<name>.rs` with a clap `Args` struct and `run`, added to
+   the `Command` enum in `src/cli.rs`.
 
 ## Development
 
