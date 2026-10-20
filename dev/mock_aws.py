@@ -497,7 +497,131 @@ def dynamodb(op, body):
 
 
 # ---- EventBridge (awsJson1_1) --------------------------------------------------------------
+EB_ACCOUNT = "123456789012"
+EVENT_BUSES = [{"Name": "default", "Arn": f"arn:aws:events:us-east-1:{EB_ACCOUNT}:event-bus/default"},
+               {"Name": "orders-bus", "Arn": f"arn:aws:events:us-east-1:{EB_ACCOUNT}:event-bus/orders-bus",
+                "Description": "Domain events of the orders service"}]
+EB_RULES = [
+    {"Name": "nightly-report", "EventBusName": "default", "State": "ENABLED", "ScheduleExpression": "cron(0 3 * * ? *)",
+     "Description": "Builds the daily sales report"},
+    {"Name": "ec2-state-change", "EventBusName": "default", "State": "ENABLED",
+     "EventPattern": json.dumps({"source": ["aws.ec2"], "detail-type": ["EC2 Instance State-change Notification"],
+                                 "detail": {"state": ["stopped", "terminated"]}})},
+    {"Name": "order-paid", "EventBusName": "orders-bus", "State": "ENABLED", "Description": "Charges and fulfils paid orders",
+     "EventPattern": json.dumps({"source": ["orders.service"], "detail-type": ["OrderPaid"],
+                                 "detail": {"amount": [{"numeric": [">", 100]}], "customer": {"tier": ["gold", "platinum"]}}})},
+    {"Name": "order-cancelled", "EventBusName": "orders-bus", "State": "DISABLED",
+     "EventPattern": json.dumps({"source": [{"prefix": "orders."}], "detail-type": ["OrderCancelled"],
+                                 "detail": {"reason": [{"exists": True}]}})},
+]
+for _r in EB_RULES:
+    _bus = "" if _r["EventBusName"] == "default" else _r["EventBusName"] + "/"
+    _r["Arn"] = f"arn:aws:events:us-east-1:{EB_ACCOUNT}:rule/{_bus}{_r['Name']}"
+EB_TARGETS = {
+    "nightly-report": [{"Id": "report", "Arn": f"arn:aws:lambda:us-east-1:{EB_ACCOUNT}:function:report-builder"}],
+    "ec2-state-change": [{"Id": "alerts", "Arn": f"arn:aws:sqs:us-east-1:{EB_ACCOUNT}:ops-alerts",
+                          "InputTransformer": {"InputPathsMap": {"id": "$.detail.instance-id", "state": "$.detail.state"},
+                                               "InputTemplate": "\"Instance <id> is now <state>\""}}],
+    "order-paid": [{"Id": "charge", "Arn": f"arn:aws:lambda:us-east-1:{EB_ACCOUNT}:function:payments-webhook", "InputPath": "$.detail"},
+                   {"Id": "fulfil", "Arn": f"arn:aws:states:us-east-1:{EB_ACCOUNT}:stateMachine:order-fulfillment",
+                    "RoleArn": f"arn:aws:iam::{EB_ACCOUNT}:role/events-invoke-sfn",
+                    "DeadLetterConfig": {"Arn": f"arn:aws:sqs:us-east-1:{EB_ACCOUNT}:order-events-dlq"},
+                    "RetryPolicy": {"MaximumRetryAttempts": 3, "MaximumEventAgeInSeconds": 3600}}],
+    "order-cancelled": [{"Id": "audit", "Arn": f"arn:aws:logs:us-east-1:{EB_ACCOUNT}:log-group:/aws/events/orders-audit"}],
+}
+SENT_EVENTS = []
+
+
+def eb_value_matches(element, present, value):
+    """One element of a pattern array against the event's value (present=False: key missing)."""
+    if not isinstance(element, dict):
+        return present and (element in value if isinstance(value, list) else element == value)
+    op, arg = next(iter(element.items()))
+    if op == "exists":
+        return present == bool(arg)
+    if not present:
+        return False
+    values = value if isinstance(value, list) else [value]
+    if op == "prefix":
+        return any(isinstance(v, str) and v.startswith(arg) for v in values)
+    if op == "suffix":
+        return any(isinstance(v, str) and v.endswith(arg) for v in values)
+    if op == "equals-ignore-case":
+        return any(isinstance(v, str) and v.lower() == arg.lower() for v in values)
+    if op == "anything-but":
+        banned = arg if isinstance(arg, list) else [arg]
+        return all(v not in banned for v in values)
+    if op == "wildcard":
+        import fnmatch
+        return any(isinstance(v, str) and fnmatch.fnmatchcase(v, arg) for v in values)
+    if op == "numeric":
+        def in_range(v):
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                return False
+            checks = {"<": lambda n: v < n, "<=": lambda n: v <= n, "=": lambda n: v == n,
+                      ">=": lambda n: v >= n, ">": lambda n: v > n}
+            return all(checks[cmp](n) for cmp, n in zip(arg[::2], arg[1::2]))
+        return any(in_range(v) for v in values)
+    raise KeyError(f"InvalidEventPatternException: unsupported filter {op}")
+
+
+def eb_matches(pattern, event):
+    for key, filt in pattern.items():
+        present = isinstance(event, dict) and key in event
+        value = event.get(key) if present else None
+        if isinstance(filt, dict):
+            if not (present and isinstance(value, dict) and eb_matches(filt, value)):
+                return False
+        elif isinstance(filt, list):
+            if not any(eb_value_matches(el, present, value) for el in filt):
+                return False
+        else:
+            raise KeyError("InvalidEventPatternException: pattern values must be arrays or objects")
+    return True
+
+
+def eb_rule(body):
+    bus = body.get("EventBusName") or "default"
+    name = body.get("Name", body.get("Rule"))
+    rule = next((r for r in EB_RULES if r["Name"] == name and r["EventBusName"] == bus), None)
+    if rule is None:
+        raise KeyError(f"ResourceNotFoundException: Rule {name} does not exist on EventBus {bus}.")
+    return rule
+
+
 def eventbridge(op, body):
+    if op == "ListEventBuses":
+        return {"EventBuses": EVENT_BUSES}
+    if op == "ListRules":
+        bus = body.get("EventBusName") or "default"
+        return {"Rules": [r for r in EB_RULES if r["EventBusName"] == bus and r["Name"].startswith(body.get("NamePrefix", ""))]}
+    if op == "DescribeRule":
+        return {**eb_rule(body), "CreatedBy": EB_ACCOUNT}
+    if op == "ListTargetsByRule":
+        return {"Targets": EB_TARGETS.get(eb_rule(body)["Name"], [])}
+    if op == "TestEventPattern":
+        try:
+            pattern, event = json.loads(body["EventPattern"]), json.loads(body["Event"])
+        except ValueError as e:
+            raise KeyError(f"InvalidEventPatternException: {e}")
+        missing = [k for k in ("id", "account", "source", "time", "region", "detail-type") if k not in event]
+        if missing:
+            raise KeyError(f"InvalidEventPatternException: event is missing {missing}")
+        return {"Result": eb_matches(pattern, event)}
+    if op == "PutEvents":
+        entries = []
+        for e in body.get("Entries", []):
+            try:
+                detail = json.loads(e.get("Detail") or "")
+                ok = isinstance(detail, dict) and e.get("Source") and e.get("DetailType")
+            except ValueError:
+                ok = False
+            if ok:
+                entries.append({"EventId": str(uuid.uuid4())})
+                SENT_EVENTS.append(e)
+            else:
+                entries.append({"ErrorCode": "MalformedDetail", "ErrorMessage": "Detail is malformed."})
+        return {"FailedEntryCount": sum("ErrorCode" in x for x in entries), "Entries": entries}
     raise KeyError(op)
 
 
