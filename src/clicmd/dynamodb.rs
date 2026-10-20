@@ -1,4 +1,4 @@
-//! `dcli ddb`: describe a table, query it by key, or scan it. Items print as plain JSON,
+//! `dcli ddb`: list the tables, describe one, query it by key, or scan it. Items print as plain JSON,
 //! one per line (or a JSON array with `--json`).
 
 use std::process::ExitCode;
@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
+use crate::aws::Aws;
 use crate::aws::dynamodb::{self as ddb, KeyQuery, SortCondition, TableDescription};
 use crate::cli::{aws_for, env_and, paint, print_json};
 use crate::config::Config;
@@ -15,7 +16,7 @@ use crate::util::{fmt_bytes, program};
 pub struct Args {
     /// Environment (default: the current one, see `use`)
     env: Option<String>,
-    /// Table name
+    /// Table name; without it, lists the tables
     table: Option<String>,
     /// Partition key value: read the items with this key (Query, or GetItem for a whole key)
     #[arg(long, value_name = "VALUE", allow_hyphen_values = true)]
@@ -37,11 +38,41 @@ pub struct Args {
     json: bool,
 }
 
+fn list_tables(aws: &Aws, env: &str, json: bool) -> Result<ExitCode> {
+    let mut names = Vec::new();
+    let mut start = None;
+    loop {
+        let (page, next) = ddb::list_tables(aws, start.as_deref())?;
+        names.extend(page);
+        match next {
+            Some(n) => start = Some(n),
+            None => break,
+        }
+    }
+    if json {
+        print_json(&serde_json::to_value(&names)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    for name in &names {
+        println!("{name}");
+    }
+    if names.is_empty() {
+        println!("No tables.");
+    } else {
+        println!("{}", paint(&format!("Items of one: {} ddb {env} <table> --pk <value> · or --scan", program()), "90"));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
-    let (env, Some(table)) = env_and(config, args.env, args.table)? else {
-        bail!("which table? {} ddb [ENV] TABLE [--pk VALUE [--sk OP:VALUE]] [--scan]", program())
-    };
+    let (env, table) = env_and(config, args.env, args.table)?;
     let aws = aws_for(config, &env)?;
+    let Some(table) = table else {
+        if args.pk.is_some() || args.scan {
+            bail!("which table? {} ddb [ENV] TABLE [--pk VALUE [--sk OP:VALUE]] [--scan]", program())
+        }
+        return list_tables(&aws, &env, args.json);
+    };
     let desc = ddb::describe_table(&aws, &table)?;
 
     let query = match (&args.pk, args.scan) {

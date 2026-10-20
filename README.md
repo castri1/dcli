@@ -84,6 +84,7 @@ dcli s3 url s3://my-bucket/exports/report.csv --expires 12h       # presigned do
 dcli s3 get s3://my-bucket/exports/report.csv ~/Downloads/
 dcli sfn order-fulfillment --status failed                        # executions (no machine: list them)
 dcli sfn order-fulfillment --report                               # Markdown report of the last failure
+dcli ddb                                                          # the tables
 dcli ddb orders --pk c-1001 --sk begins_with:2026-                # Query by key (--index for a GSI/LSI)
 dcli ddb orders --scan --limit 20                                 # read the whole table, page by page
 dcli events orders-bus                                            # rules and their targets
