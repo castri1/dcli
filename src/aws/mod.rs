@@ -171,21 +171,24 @@ impl Aws {
 
 /// Deserializes a response body. Some services (Lambda, for one) send absent fields as
 /// explicit `null`; those are dropped first so every field falls back to its default.
+/// Strings lose terminal control sequences: commit messages, logs and errors are shown
+/// in a terminal and must not be able to drive it.
 fn parse<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let bytes = if bytes.is_empty() { b"{}".as_slice() } else { bytes };
     let unexpected = |e: serde_json::Error| AwsError::Network(format!("unexpected response from AWS: {e}"));
     let mut value: Value = serde_json::from_slice(bytes).map_err(unexpected)?;
-    drop_nulls(&mut value);
+    clean(&mut value);
     T::deserialize(value).map_err(unexpected)
 }
 
-fn drop_nulls(value: &mut Value) {
+fn clean(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.retain(|_, v| !v.is_null());
-            map.values_mut().for_each(drop_nulls);
+            map.values_mut().for_each(clean);
         }
-        Value::Array(items) => items.iter_mut().for_each(drop_nulls),
+        Value::Array(items) => items.iter_mut().for_each(clean),
+        Value::String(s) if s.chars().any(char::is_control) => *s = crate::util::sanitize(s),
         _ => {}
     }
 }
@@ -214,5 +217,9 @@ mod tests {
         assert!(f.layers.is_empty() && f.environment.is_none() && out.next_marker.is_none());
         assert!(f.vpc_config.as_ref().unwrap().subnet_ids.is_empty());
         assert_eq!(f.architectures, ["arm64"]);
+
+        let body = "{\"Functions\":[{\"FunctionName\":\"f\",\"Description\":\"x\\u001b]52;c;aGk=\\u0007y\"}]}";
+        let out: Out = parse(body.as_bytes()).unwrap();
+        assert_eq!(out.functions[0].description.as_deref(), Some("xy"));
     }
 }

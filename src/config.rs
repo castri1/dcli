@@ -80,8 +80,12 @@ impl From<HookRepr> for Hook {
 }
 
 impl Hook {
-    pub fn label(&self) -> &str {
-        self.description.as_deref().unwrap_or(&self.command)
+    /// The description, else the command (made safe to print).
+    pub fn label(&self) -> String {
+        match &self.description {
+            Some(d) => crate::util::sanitize(d),
+            None => crate::util::show_invisible(&self.command),
+        }
     }
 }
 
@@ -110,6 +114,9 @@ pub enum Source {
 pub struct Loaded {
     pub config: Config,
     pub source: Source,
+    /// Found in the current directory rather than the home directory or `--config`: it may
+    /// come from a cloned repository, so its hooks are shown before they run.
+    pub from_cwd: bool,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -153,14 +160,16 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded> {
         None => search_paths().into_iter().find(|p| p.exists()),
     };
     let Some(path) = path else {
-        return Ok(Loaded { config: from_aws_profiles(), source: Source::AwsProfiles });
+        return Ok(Loaded { config: from_aws_profiles(), source: Source::AwsProfiles, from_cwd: false });
     };
+    let from_cwd = explicit.is_none() && Some(&path) != primary_path().as_ref();
     let text = std::fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
     let mut config: Config =
         serde_saphyr::from_str(&text).map_err(|e| anyhow!("invalid config {}:\n{e}", path.display()))?;
+    config.sanitize_text();
     config.resolve_regions();
     config.validate().with_context(|| format!("invalid config {}", path.display()))?;
-    Ok(Loaded { config, source: Source::File(path) })
+    Ok(Loaded { config, source: Source::File(path), from_cwd })
 }
 
 fn from_aws_profiles() -> Config {
@@ -174,6 +183,27 @@ fn from_aws_profiles() -> Config {
 }
 
 impl Config {
+    /// Names and descriptions end up in the terminal; strip control sequences from them.
+    /// Hook commands are left as written (they run, and are sanitized when shown).
+    fn sanitize_text(&mut self) {
+        use crate::util::sanitize;
+        self.environments = std::mem::take(&mut self.environments)
+            .into_iter()
+            .map(|(name, mut env)| {
+                env.profile = sanitize(&env.profile);
+                env.region = sanitize(&env.region);
+                for p in &mut env.pipelines {
+                    p.name = sanitize(&p.name);
+                    p.description = p.description.as_deref().map(sanitize);
+                    for h in p.hooks.pre_deploy.iter_mut().chain(&mut p.hooks.post_deploy) {
+                        h.description = h.description.as_deref().map(sanitize);
+                    }
+                }
+                (sanitize(&name), env)
+            })
+            .collect();
+    }
+
     /// Fills empty regions from the AWS profile (or `AWS_REGION`).
     fn resolve_regions(&mut self) {
         let files = AwsFiles::load();
@@ -311,7 +341,9 @@ impl Loaded {
             write(&tmp, &yaml)?;
             std::fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))?;
         }
+        let from_cwd = self.from_cwd;
         *self = load(Some(&path))?;
+        self.from_cwd = from_cwd;
         Ok(path)
     }
 }

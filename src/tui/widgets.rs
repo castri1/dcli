@@ -26,6 +26,12 @@ pub fn popup_area(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+/// Rows `lines` take once wrapped as [`popup`] wraps them, `width` being the popup's inner
+/// width (4 less than the popup: borders and padding).
+pub fn wrapped_height(lines: &[Line], width: u16) -> u16 {
+    Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }).line_count(width) as u16
+}
+
 /// Clears the area and draws a modal box with `body`.
 pub fn popup(f: &mut Frame, area: Rect, title: &str, color: Color, body: Text) {
     f.render_widget(Clear, area);

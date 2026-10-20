@@ -409,7 +409,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Status { env, pipeline, json } => status(&target(config, env, pipeline)?, json),
         Command::History { env, pipeline, limit, json } => history(&target(config, env, pipeline)?, limit, json),
         Command::Deploy { env, pipeline, skip_hooks, yes, no_wait } => {
-            deploy(&target(config, env, pipeline)?, config, skip_hooks, yes, no_wait)
+            deploy(&target(config, env, pipeline)?, &loaded, skip_hooks, yes, no_wait)
         }
         Command::Approve { env, pipeline, reject, comment, yes } => {
             approve(&target(config, env, pipeline)?, !reject, comment, yes)
@@ -565,7 +565,7 @@ fn list(config: &Config, source: &config::Source, json: bool) -> Result<ExitCode
         return Ok(ExitCode::SUCCESS);
     }
     match source {
-        config::Source::File(p) => println!("{}", paint(&format!("Config: {}", p.display()), "90")),
+        config::Source::File(p) => println!("{}", paint(&format!("Config: {}", display_path(p)), "90")),
         config::Source::AwsProfiles => {
             println!("{}", paint("No config file — showing AWS profiles as environments", "90"))
         }
@@ -707,8 +707,26 @@ fn history(t: &Target, limit: u32, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn deploy(t: &Target, config: &Config, skip_hooks: bool, yes: bool, no_wait: bool) -> Result<ExitCode> {
+fn deploy(t: &Target, loaded: &Loaded, skip_hooks: bool, yes: bool, no_wait: bool) -> Result<ExitCode> {
+    let config = &loaded.config;
     let name = &t.pipeline.name;
+    let hooks = &t.pipeline.hooks;
+    if !skip_hooks && !hooks.is_empty() {
+        // Show what will run on this machine, and flag a config picked up from the current
+        // directory (a cloned repository, say).
+        let header = match &loaded.source {
+            config::Source::File(p) if loaded.from_cwd => {
+                paint(&format!("Hooks from {}, found in the current directory:", display_path(p)), "33")
+            }
+            _ => paint("Hooks:", "90"),
+        };
+        println!("{header}");
+        for (phase, list) in [("pre-deploy", &hooks.pre_deploy), ("post-deploy", &hooks.post_deploy)] {
+            for h in list {
+                println!("  {} {}", paint(&format!("{phase:<12}"), "90"), crate::util::show_invisible(&h.command));
+            }
+        }
+    }
     if let Some(l) = latest(t)?
         && Status::parse(&l.status).is_running()
     {
@@ -818,6 +836,10 @@ fn approve(t: &Target, approved: bool, comment: Option<String>, yes: bool) -> Re
     };
     let verb = if approved { "Approve" } else { "Reject" };
     println!("{} {}/{} in {name} ({})", paint("◆", "35"), a.stage, a.action, t.env_name);
+    if let Some(l) = &latest {
+        let id = &l.pipeline_execution_id;
+        println!("  {}", paint(&format!("execution {} · {}", &id[..8.min(id.len())], pipeline::revision(l, &[]).one_line()), "90"));
+    }
     if let Some(s) = &a.summary {
         println!("  {s}");
     }

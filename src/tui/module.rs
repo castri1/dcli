@@ -103,6 +103,18 @@ impl Ctx<'_> {
         &self.shared.loaded.config
     }
 
+    /// The config file when it was found in the current directory (a cloned repository,
+    /// say): its hooks deserve a look before they run.
+    pub fn local_config(&self) -> Option<String> {
+        match &self.shared.loaded.source {
+            crate::config::Source::File(p) if self.shared.loaded.from_cwd => {
+                let name = crate::util::sanitize(&p.file_name()?.to_string_lossy());
+                Some(format!(".{}{name}", std::path::MAIN_SEPARATOR))
+            }
+            _ => None,
+        }
+    }
+
     /// Adds pipelines to the current environment and saves the config file.
     /// Returns the file written and how many were new.
     pub fn add_pipelines(&mut self, names: &[String]) -> anyhow::Result<(PathBuf, usize)> {
@@ -155,7 +167,8 @@ impl Ctx<'_> {
     }
 
     pub fn toast(&mut self, level: Level, text: impl Into<String>) {
-        self.shared.toasts.push(Toast { level, text: text.into(), at: Instant::now() });
+        let text = crate::util::sanitize(&text.into());
+        self.shared.toasts.push(Toast { level, text, at: Instant::now() });
     }
 
     /// Toast plus a desktop notification when enabled in the config.

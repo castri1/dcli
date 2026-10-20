@@ -89,8 +89,18 @@ enum HookState {
 }
 
 enum Dialog {
-    Deploy { name: String, input: TextInput, needs_typing: bool, running: bool, hooks: usize },
-    Approve { name: String, approval: Approval, approve: bool, input: TextInput },
+    /// `hooks`: (phase, command) to show before confirming; `local`: the config path when it
+    /// was found in the current directory.
+    Deploy {
+        name: String,
+        input: TextInput,
+        needs_typing: bool,
+        running: bool,
+        hooks: Vec<(&'static str, String)>,
+        local: Option<String>,
+    },
+    /// `context`: the execution and revision the approval belongs to.
+    Approve { name: String, approval: Approval, context: String, approve: bool, input: TextInput },
     Stop { name: String, execution: String, abandon: bool, input: TextInput },
     Hooks { name: String, lines: Vec<String>, state: HookState },
     Busy(String),
@@ -138,6 +148,8 @@ pub struct Pipelines {
     seen_approvals: HashSet<String>,
     list_area: Rect,
     logs_area: Rect,
+    /// The last deploy dialog fit on screen, so every hook it lists was visible.
+    deploy_fits: bool,
 }
 
 impl Pipelines {
@@ -166,6 +178,7 @@ impl Pipelines {
             seen_approvals: HashSet::new(),
             list_area: Rect::default(),
             logs_area: Rect::default(),
+            deploy_fits: false,
         }
     }
 
@@ -382,14 +395,20 @@ impl Pipelines {
 
     fn open_deploy(&mut self, ctx: &mut Ctx) {
         let Some(row) = self.row() else { return };
+        let phases = [("pre-deploy", &row.cfg.hooks.pre_deploy), ("post-deploy", &row.cfg.hooks.post_deploy)];
+        let hooks: Vec<(&'static str, String)> = phases
+            .into_iter()
+            .flat_map(|(phase, list)| list.iter().map(move |h| (phase, crate::util::show_invisible(&h.command))))
+            .collect();
+        let local = if hooks.is_empty() { None } else { ctx.local_config() };
         self.dialog = Some(Dialog::Deploy {
             name: row.name().to_string(),
             input: TextInput::default(),
             needs_typing: is_production(&self.env_name),
             running: row.exec_status().is_some_and(Status::is_running),
-            hooks: row.cfg.hooks.pre_deploy.len(),
+            hooks,
+            local,
         });
-        let _ = ctx;
     }
 
     fn begin_deploy(&mut self, name: String, ctx: &mut Ctx) {
@@ -416,9 +435,18 @@ impl Pipelines {
         let approval = pipeline::approvals(&self.stages(row)).into_iter().next();
         match approval {
             Some(approval) => {
+                let context = row
+                    .latest
+                    .as_ref()
+                    .map(|l| {
+                        let id = &l.pipeline_execution_id;
+                        format!("execution {} · {}", &id[..8.min(id.len())], pipeline::revision(l, self.details_for(row)).one_line())
+                    })
+                    .unwrap_or_default();
                 self.dialog = Some(Dialog::Approve {
                     name: row.name().to_string(),
                     approval,
+                    context,
                     approve: true,
                     input: TextInput::default(),
                 })
@@ -445,9 +473,13 @@ impl Pipelines {
     fn dialog_key(&mut self, key: KeyEvent, ctx: &mut Ctx) {
         let Some(dialog) = &mut self.dialog else { return };
         match dialog {
-            Dialog::Deploy { name, input, needs_typing, .. } => match key.code {
+            Dialog::Deploy { name, input, needs_typing, hooks, .. } => match key.code {
                 KeyCode::Esc => self.dialog = None,
                 KeyCode::Enter => {
+                    if !hooks.is_empty() && !self.deploy_fits {
+                        ctx.toast(Level::Warn, "Enlarge the terminal to review every hook before deploying");
+                        return;
+                    }
                     if *needs_typing && input.value.trim() != self.env_name {
                         ctx.toast(Level::Warn, format!("Type '{}' to confirm", self.env_name));
                         return;
@@ -460,7 +492,7 @@ impl Pipelines {
                 }
                 _ => {}
             },
-            Dialog::Approve { name, approval, approve, input } => match key.code {
+            Dialog::Approve { name, approval, approve, input, .. } => match key.code {
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => *approve = !*approve,
                 _ => match input.handle(key) {
                     InputEvent::Cancel => self.dialog = None,
@@ -1028,7 +1060,7 @@ impl Pipelines {
         }
         let Some(dialog) = &self.dialog else { return };
         match dialog {
-            Dialog::Deploy { name, input, needs_typing, running, hooks } => {
+            Dialog::Deploy { name, input, needs_typing, running, hooks, local } => {
                 let env_color = theme::env_color(&self.env_name);
                 let mut lines = vec![
                     Line::raw(""),
@@ -1047,12 +1079,25 @@ impl Pipelines {
                         Style::new().fg(theme::WARN),
                     ));
                 }
-                if *hooks > 0 {
-                    lines.push(Line::styled(format!("Runs {hooks} pre-deploy hook(s) first."), theme::muted()));
+                if !hooks.is_empty() {
+                    // Every command in full: they run on this machine once confirmed.
+                    lines.push(Line::styled("These hooks run on your machine:", theme::muted()));
+                    for (phase, command) in hooks {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{phase}: "), theme::muted()),
+                            Span::raw(command.replace('\n', " ⏎ ")),
+                        ]));
+                    }
+                    if let Some(path) = local {
+                        lines.push(Line::styled(
+                            format!("! Defined in {path} (current folder)"),
+                            Style::new().fg(theme::WARN),
+                        ));
+                    }
                 }
                 let mut cursor = None;
                 if *needs_typing {
-                    if *running || *hooks > 0 {
+                    if *running || !hooks.is_empty() {
                         lines.push(Line::raw(""));
                     }
                     lines.push(Line::raw(format!("Type '{}' to confirm:", self.env_name)));
@@ -1062,13 +1107,15 @@ impl Pipelines {
                 }
                 lines.push(Line::raw(""));
                 lines.push(widgets::hints_line(&[("Enter", "deploy"), ("Esc", "cancel")]));
-                let rect = widgets::popup_area(area, 64, lines.len() as u16 + 2);
+                let height = widgets::wrapped_height(&lines, 60) + 2;
+                self.deploy_fits = height <= area.height.saturating_sub(2);
+                let rect = widgets::popup_area(area, 64, height);
                 widgets::popup(f, rect, "Deploy", env_color, Text::from(lines));
                 if let Some((row, col)) = cursor {
                     f.set_cursor_position((rect.x + 1 + col, rect.y + 1 + row));
                 }
             }
-            Dialog::Approve { name, approval, approve, input } => {
+            Dialog::Approve { name, approval, context, approve, input } => {
                 let choice = |label: &'static str, on: bool, color| {
                     if on {
                         Span::styled(format!(" {label} "), Style::new().fg(ratatui::style::Color::Black).bg(color).bold())
@@ -1082,6 +1129,7 @@ impl Pipelines {
                         Span::styled(name.clone(), theme::bold()),
                         Span::styled(format!(" · {} / {}", approval.stage, approval.action), theme::muted()),
                     ]),
+                    Line::styled(ellipsize(context, 66), theme::muted()),
                 ];
                 if let Some(s) = &approval.summary {
                     lines.push(Line::raw(""));
@@ -1099,11 +1147,11 @@ impl Pipelines {
                 ]));
                 lines.push(Line::raw(""));
                 let (line, col) = input.line("Comment › ", "optional");
-                let input_row = lines.len() as u16;
+                let input_row = widgets::wrapped_height(&lines, 68);
                 lines.push(line);
                 lines.push(Line::raw(""));
                 lines.push(widgets::hints_line(&[("Enter", "submit"), ("Esc", "cancel")]));
-                let rect = widgets::popup_area(area, 72, lines.len() as u16 + 2);
+                let rect = widgets::popup_area(area, 72, widgets::wrapped_height(&lines, 68) + 2);
                 widgets::popup(f, rect, "Manual approval", theme::APPROVAL, Text::from(lines));
                 f.set_cursor_position((rect.x + 1 + col, rect.y + 1 + input_row));
             }

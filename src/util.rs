@@ -28,12 +28,12 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `path` with the home directory shown as `~`.
+/// `path` with the home directory shown as `~`, safe to print.
 pub fn display_path(path: &std::path::Path) -> String {
-    match home_dir().and_then(|h| path.strip_prefix(h).ok().map(|rest| rest.to_path_buf())) {
+    sanitize(&match home_dir().and_then(|h| path.strip_prefix(h).ok().map(|rest| rest.to_path_buf())) {
         Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
         None => path.display().to_string(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -190,42 +190,72 @@ pub fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("").trim()
 }
 
-/// Removes ANSI escape sequences and expands tabs, so log lines render cleanly.
-pub fn strip_ansi(s: &str) -> String {
+/// Bidi overrides and zero-width characters: invisible, and able to make text read
+/// differently from what it is.
+fn is_invisible(c: char) -> bool {
+    matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+}
+
+fn is_unsafe(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t') || is_invisible(c)
+}
+
+/// Removes terminal escape sequences, control characters other than `\n` and `\t`, and
+/// invisible formatting characters, so text from AWS (commit messages, logs, errors) or a
+/// config file can neither drive the terminal nor disguise itself.
+pub fn sanitize(s: &str) -> String {
+    if !s.chars().any(is_unsafe) {
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\u{1b}' => {
-                if chars.peek() == Some(&'[') {
+            '\u{1b}' => match chars.peek() {
+                // CSI: parameters until a final byte in @..~
+                Some('[') => {
                     chars.next();
-                    // CSI: parameters until a final byte in @..~
                     for c in chars.by_ref() {
                         if ('@'..='~').contains(&c) {
                             break;
                         }
                     }
-                } else if chars.peek() == Some(&']') {
-                    // OSC: until BEL or ST
+                }
+                // OSC, DCS, APC, PM, SOS: until BEL or ST
+                Some(']' | 'P' | '_' | '^' | 'X') => {
                     chars.next();
                     while let Some(c) = chars.next() {
-                        if c == '\u{7}' || (c == '\u{1b}' && chars.peek() == Some(&'\\')) {
+                        if c == '\u{7}' || c == '\u{9c}' || (c == '\u{1b}' && chars.peek() == Some(&'\\')) {
                             if c == '\u{1b}' {
                                 chars.next();
                             }
                             break;
                         }
                     }
-                } else {
+                }
+                // Two-character sequences (ESC 7, ESC c, …)
+                _ => {
                     chars.next();
                 }
-            }
-            '\t' => out.push_str("    "),
-            '\r' => {}
+            },
+            c if is_unsafe(c) => {}
             c => out.push(c),
         }
     }
     out
+}
+
+/// For text that will run (hook commands): every control or invisible character is shown
+/// as a visible `\u{…}` escape instead of being dropped, so what you read is what runs.
+pub fn show_invisible(s: &str) -> String {
+    s.chars()
+        .map(|c| if is_unsafe(c) { format!("\\u{{{:x}}}", c as u32) } else { c.to_string() })
+        .collect()
+}
+
+/// [`sanitize`] with tabs expanded, for log lines shown in fixed columns.
+pub fn strip_ansi(s: &str) -> String {
+    sanitize(s).replace('\t', "    ")
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +333,10 @@ mod tests {
         assert_eq!(base64(b"hi!"), "aGkh");
         assert_eq!(uri_encode("a b/c~"), "a%20b%2Fc~");
         assert_eq!(strip_ansi("\u{1b}[32mok\u{1b}[0m\tdone"), "ok    done");
+        assert_eq!(sanitize("a\u{1b}]52;c;ZXZpbA==\u{7}b\rc\u{8}\u{9b}2Jd\n"), "abc2Jd\n");
+        assert_eq!(sanitize("title\u{1b}]0;x\u{1b}\\ok\u{1b}c"), "titleok");
+        assert_eq!(sanitize("fix \u{202e}gnp.exe\u{200b}"), "fix gnp.exe");
+        assert_eq!(show_invisible("rm -rf \u{202e}x\u{1b}[2J\n"), "rm -rf \\u{202e}x\\u{1b}[2J\n");
     }
 
     #[test]

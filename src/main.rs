@@ -19,7 +19,8 @@ fn main() -> ExitCode {
     match cli::run(args) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            // Errors can quote AWS responses or a config file; keep them from driving the terminal.
+            eprintln!("error: {}", util::sanitize(&format!("{e:#}")));
             if e.downcast_ref::<aws::AwsError>().is_some_and(aws::AwsError::is_login_required) {
                 eprintln!("hint: run `{} login <env>` (or press L in the UI)", util::program());
             }
