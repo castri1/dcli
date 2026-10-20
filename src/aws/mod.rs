@@ -4,6 +4,7 @@
 //! its own file. Most AWS APIs speak either `awsJson1_1` (`Aws::call`) or `restJson1`
 //! (`Aws::rest`), so no per-service SDK crate is needed.
 
+pub mod cloudformation;
 pub mod codebuild;
 pub mod codepipeline;
 pub mod credentials;
@@ -12,6 +13,7 @@ pub mod http;
 pub mod lambda;
 pub mod logs;
 pub mod profile;
+pub mod secrets;
 pub mod sigv4;
 pub mod ssm;
 pub mod sso;
@@ -86,6 +88,23 @@ impl Aws {
         let body = serde_json::to_vec(input).unwrap_or_default();
         let bytes = self.send(svc, "POST", &[], &[], headers, body)?;
         parse(&bytes)
+    }
+
+    /// `awsQuery` call (CloudFormation and other older APIs): a form-encoded `POST /`;
+    /// returns the XML response body.
+    pub fn query(&self, svc: &Service, action: &str, version: &str, params: &[(&str, &str)]) -> Result<String> {
+        let mut body = format!("Action={}&Version={}", uri_encode(action), uri_encode(version));
+        for (k, v) in params {
+            body.push_str(&format!("&{}={}", uri_encode(k), uri_encode(v)));
+        }
+        let headers = vec![("content-type".to_string(), "application/x-www-form-urlencoded; charset=utf-8".to_string())];
+        let bytes = self.send(svc, "POST", &[], &[], headers, body.into_bytes())?;
+        Ok(crate::util::sanitize(&String::from_utf8_lossy(&bytes)))
+    }
+
+    /// The same profile in another region (an action that deploys elsewhere, say).
+    pub fn in_region(&self, region: &str) -> Arc<Aws> {
+        Aws::new(&self.profile, region)
     }
 
     /// `restJson1` call. `segments` are raw path segments, encoded here.

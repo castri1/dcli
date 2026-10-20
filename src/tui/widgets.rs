@@ -120,6 +120,24 @@ impl TextInput {
         self.cursor = 0;
     }
 
+    /// A field that starts with `value`, cursor at the end.
+    pub fn with_value(value: impl Into<String>) -> TextInput {
+        let value = value.into();
+        let cursor = value.chars().count();
+        TextInput { value, cursor }
+    }
+
+    /// Inserts pasted text at the cursor. Line breaks are kept (shown as ⏎) when
+    /// `multiline`, otherwise turned into spaces.
+    pub fn insert_str(&mut self, text: &str, multiline: bool) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = if multiline { text } else { text.replace('\n', " ") };
+        let text = crate::util::sanitize(&text);
+        let i = self.byte_index(self.cursor);
+        self.value.insert_str(i, &text);
+        self.cursor += text.chars().count();
+    }
+
     pub fn handle(&mut self, key: KeyEvent) -> InputEvent {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let len = self.value.chars().count();
@@ -180,11 +198,18 @@ impl TextInput {
 
     /// Renders `prefix` + value; returns the line and the cursor column offset.
     pub fn line<'a>(&self, prefix: &'a str, placeholder: &'a str) -> (Line<'a>, u16) {
+        self.line_with(prefix, placeholder, false)
+    }
+
+    /// Like [`line`](Self::line); `masked` shows `•` instead of the characters.
+    pub fn line_with<'a>(&self, prefix: &'a str, placeholder: &'a str, masked: bool) -> (Line<'a>, u16) {
         let mut spans = vec![Span::styled(prefix, theme::accent())];
         if self.value.is_empty() {
             spans.push(Span::styled(placeholder, theme::muted()));
+        } else if masked {
+            spans.push(Span::raw("•".repeat(self.value.chars().count())));
         } else {
-            spans.push(Span::raw(self.value.clone()));
+            spans.push(Span::raw(self.value.replace('\n', "⏎")));
         }
         let col = prefix.chars().count() + self.cursor;
         (Line::from(spans), col as u16)

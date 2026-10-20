@@ -1,6 +1,8 @@
 //! Interactive terminal UI.
 
 mod app;
+pub mod form;
+pub mod logview;
 pub mod module;
 pub mod picker;
 pub mod theme;
@@ -11,7 +13,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture};
 use ratatui::crossterm::execute;
 
 use crate::config::Loaded;
@@ -42,10 +44,11 @@ pub fn run(loaded: Loaded, start_env: Option<&str>) -> Result<()> {
     });
 
     let mut terminal = ratatui::init();
-    let _ = execute!(stdout(), EnableMouseCapture);
+    let _ = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste);
+    let mut mouse_on = true;
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), DisableMouseCapture);
+        let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
         previous_hook(info);
     }));
 
@@ -68,11 +71,17 @@ pub fn run(loaded: Loaded, start_env: Option<&str>) -> Result<()> {
             if app.quit {
                 break;
             }
+            // Full-screen logs leave the mouse to the terminal, so text can be selected.
+            let wanted = app.mouse_wanted();
+            if wanted != mouse_on {
+                let _ = if wanted { execute!(stdout(), EnableMouseCapture) } else { execute!(stdout(), DisableMouseCapture) };
+                mouse_on = wanted;
+            }
         }
         Ok(())
     })();
 
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }

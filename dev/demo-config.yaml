@@ -12,6 +12,8 @@ environments:
       - name: api-dev
         description: "Public API - Dev"
       - name: worker-dev
+      - name: infra-dev
+        description: "Infrastructure (CloudFormation) - Dev"
   prod:
     profile: ""
     region: us-east-1

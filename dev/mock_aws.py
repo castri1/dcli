@@ -5,6 +5,7 @@ import sys
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 T0 = time.time()
 SIGNED = {"ok": 0, "unsigned": 0}
@@ -21,7 +22,8 @@ PIPES = {}
 
 
 def new_run(name, offset, mode="run", trigger="Webhook"):
-    """mode: run (progresses with time), approval (stops at Approval), fail (fails at Build)."""
+    """mode: run (progresses with time), approval (stops at Approval), fail (fails at Build),
+    cfnfail (fails at Production, a CloudFormation deploy)."""
     PIPES[name] = {
         "exec": eid(), "start": time.time() - offset, "mode": mode, "trigger": trigger,
         "stopped": False, "approved": None,
@@ -29,9 +31,24 @@ def new_run(name, offset, mode="run", trigger="Webhook"):
     }
 
 
+COMMITS = [("3f9e1a2b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f", "fix(payments): retry on timeout"),
+           ("9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b", "chore: bump queue client"),
+           ("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "feat: earlier change")]
+
+
+def revision(name, k):
+    """Source revision of the current run (k=0) or the k-th history entry."""
+    sha, msg = COMMITS[min(k, len(COMMITS) - 1)]
+    return [{"actionName": "Source", "revisionId": sha,
+             "revisionUrl": f"https://github.com/acme/{name}/commit/{sha}",
+             "revisionSummary": json.dumps({"ProviderType": "GitHub", "CommitMessage": msg})}]
+
+
 new_run("app-dev", 120)
 new_run("api-dev", 600, "approval")
 new_run("worker-dev", 400, "fail")
+PIPES["worker-dev"]["history"][0] = (eid(), "Failed", time.time() - 86400 - 3600, 300)
+new_run("infra-dev", 900, "cfnfail")
 new_run("app-prod", 0, "idle")
 PIPES["app-prod"]["exec"] = None
 # In the account but not in demo-config.yaml: found with `n` (add pipelines); they get a
@@ -53,6 +70,10 @@ def timeline(p):
             continue
         if p["mode"] == "fail" and s == "Build":
             out[s] = ("Failed", t, t + 70)
+            t = now + 1e9
+            continue
+        if p["mode"] == "cfnfail" and s == "Production" and t < now:
+            out[s] = ("Failed", t, t + 45)
             t = now + 1e9
             continue
         if p["mode"] == "approval" and s == "Approval" and p["approved"] is None:
@@ -88,8 +109,7 @@ def summary(name, p):
         "pipelineExecutionId": p["exec"], "status": exec_status(p), "startTime": p["start"],
         "lastUpdateTime": max(ends) if exec_status(p) != "InProgress" and ends else time.time(),
         "trigger": {"triggerType": p["trigger"]},
-        "sourceRevisions": [{"actionName": "Source", "revisionId": "3f9e1a2b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f",
-                             "revisionSummary": json.dumps({"ProviderType": "GitHub", "CommitMessage": "fix(payments): retry on timeout\n\nlong body"})}],
+        "sourceRevisions": revision(name, 0),
     }
 
 
@@ -109,7 +129,8 @@ def pipeline_state(name):
                 le["externalExecutionId"] = f"{name}-build:{p['exec'][:8]}"
                 le["externalExecutionUrl"] = "https://console.aws.amazon.com/codebuild/home"
             if st == "Failed":
-                le["errorDetails"] = {"code": "JobFailed", "message": "Error while executing command: npm test. Reason: exit status 1"}
+                le["errorDetails"] = {"code": "JobFailed", "message": "Error while executing command: npm test. Reason: exit status 1"
+                                      if s == "Build" else f"Stack {name}-stack failed: UPDATE_ROLLBACK_COMPLETE"}
             if s == "Approval" and st == "InProgress":
                 le["token"] = "tok-" + p["exec"][:8]
                 le["summary"] = "Please review the release notes before promoting to production."
@@ -134,7 +155,8 @@ def action_details(name, exec_filter):
             d = {"pipelineExecutionId": p["exec"], "stageName": s, "actionName": action_name(s), "startTime": start,
                  "lastUpdateTime": end or time.time(), "status": st,
                  "input": {"actionTypeId": {"category": "Source" if s == "Source" else "Build", "owner": "AWS", "provider": provider},
-                           "configuration": {"BranchName": "main", "FullRepositoryId": "acme/" + name} if s == "Source" else {}},
+                           "configuration": {"BranchName": "main", "FullRepositoryId": "acme/" + name} if s == "Source"
+                           else {"StackName": f"{name}-stack", "ActionMode": "CREATE_UPDATE"} if s == "Production" else {}},
                  "output": {"outputVariables": {"BranchName": "main"} if s == "Source" else {},
                             "executionResult": {"externalExecutionId": f"{name}-build:{p['exec'][:8]}",
                                                 **({"externalExecutionSummary": "Build terminated with state: FAILED",
@@ -165,9 +187,8 @@ def codepipeline(op, body):
         p = PIPES[name]
         items = ([summary(name, p)] if p["exec"] else []) + [
             {"pipelineExecutionId": h, "status": st, "startTime": s, "lastUpdateTime": s + d,
-             "trigger": {"triggerType": "StartPipelineExecution"},
-             "sourceRevisions": [{"revisionId": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "revisionSummary": "feat: earlier change"}]}
-            for (h, st, s, d) in p["history"]]
+             "trigger": {"triggerType": "StartPipelineExecution"}, "sourceRevisions": revision(name, k + 1)}
+            for k, (h, st, s, d) in enumerate(p["history"])]
         return {"pipelineExecutionSummaries": items[: body.get("maxResults", 10)]}
     if op == "GetPipelineExecution":
         return {"pipelineExecution": summary(name, PIPES[name])}
@@ -186,6 +207,38 @@ def codepipeline(op, body):
         PIPES[name]["mode"] = "run"
         return {"approvedAt": time.time()}
     raise KeyError(op)
+
+
+def cloudformation(params):
+    """Query protocol: form-encoded request, XML response."""
+    action = params.get("Action", [""])[0]
+    stack = params.get("StackName", [""])[0]
+    name = stack.removesuffix("-stack")
+    if action != "DescribeStackEvents" or name not in PIPES:
+        return 400, ("<ErrorResponse><Error><Type>Sender</Type><Code>ValidationError</Code>"
+                     f"<Message>Stack with id {stack} does not exist</Message></Error></ErrorResponse>")
+    start = timeline(PIPES[name])["Production"][1] or time.time()
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+    events = [  # newest first, as CloudFormation returns them
+        (start + 44, stack, "AWS::CloudFormation::Stack", "UPDATE_ROLLBACK_COMPLETE", ""),
+        (start + 40, "WorkerFunction", "AWS::Lambda::Function", "UPDATE_COMPLETE", ""),
+        (start + 30, stack, "AWS::CloudFormation::Stack", "UPDATE_ROLLBACK_IN_PROGRESS",
+         "The following resource(s) failed to update: [WorkerFunction]."),
+        (start + 29, "ApiRole", "AWS::IAM::Role", "UPDATE_FAILED", "Resource update cancelled"),
+        (start + 28, "WorkerFunction", "AWS::Lambda::Function", "UPDATE_FAILED",
+         'Resource handler returned message: "Unzipped size must be smaller than 262144000 bytes &amp; layers count less than 6 '
+         '(Service: Lambda, Status Code: 400, Request ID: 7f3c)" (HandlerErrorCode: InvalidRequest)'),
+        (start + 10, "OrdersQueue", "AWS::SQS::Queue", "UPDATE_COMPLETE", ""),
+        (start + 2, stack, "AWS::CloudFormation::Stack", "UPDATE_IN_PROGRESS", "User Initiated"),
+        (start - 86400, stack, "AWS::CloudFormation::Stack", "UPDATE_COMPLETE", ""),
+    ]
+    members = "".join(
+        f"<member><StackName>{stack}</StackName><LogicalResourceId>{lid}</LogicalResourceId>"
+        f"<ResourceType>{rtype}</ResourceType><Timestamp>{iso(t)}</Timestamp><ResourceStatus>{st}</ResourceStatus>"
+        + (f"<ResourceStatusReason>{reason}</ResourceStatusReason>" if reason else "") + "</member>"
+        for t, lid, rtype, st, reason in events)
+    return 200, (f"<DescribeStackEventsResponse><DescribeStackEventsResult><StackEvents>{members}</StackEvents>"
+                 "</DescribeStackEventsResult></DescribeStackEventsResponse>")
 
 
 def codebuild(op, body):
@@ -234,7 +287,55 @@ FAILED_LOG = (
 )
 
 
+def log_groups():
+    return [f"/aws/lambda/{f['FunctionName']}" for f in FUNCS] + [
+        "/aws/codebuild/app-dev", "/ecs/orders-api", "API-Gateway-Execution-Logs_a1b2c3/prod"]
+LAMBDA_LINES = [
+    "START RequestId: {rid} Version: $LATEST",
+    "INFO processing order {n}",
+    "INFO order {n} charged in 182 ms",
+    "WARN retrying payment provider (attempt 2)",
+    "ERROR Unhandled exception: TimeoutError: payment provider did not answer in 3000 ms\n    at charge (/var/task/payments.js:42:11)\n    at handler (/var/task/index.js:17:5)",
+    "END RequestId: {rid}",
+    "REPORT RequestId: {rid}  Duration: 211.40 ms  Billed Duration: 212 ms  Memory Size: 512 MB  Max Memory Used: 96 MB",
+]
+
+
+def synthetic_events(group, start_ms, pattern):
+    """An event every 7 s for the last 2 hours, the same on every call (by timestamp)."""
+    now_ms = int(time.time() * 1000)
+    first = max(start_ms, now_ms - 2 * 3600 * 1000)
+    t = first - first % 7000 + 7000
+    terms = [w.strip('"?') for w in pattern.split()] if pattern else []
+    out = []
+    while t <= now_ms:
+        k = t // 7000
+        line = LAMBDA_LINES[k % len(LAMBDA_LINES)].format(rid=f"{k:08x}-7f3c", n=1000 + k % 977)
+        if not terms or any(term.lower() in line.lower() for term in terms):
+            out.append({"logStreamName": f"2026/10/20/[$LATEST]{k % 3:04x}", "timestamp": t, "message": line + "\n",
+                        "ingestionTime": t + 300, "eventId": f"{k}-{group}"})
+        t += 7000
+    return out
+
+
 def cwlogs(op, body):
+    if op == "DescribeLogGroups":
+        prefix = body.get("logGroupNamePrefix", "")
+        groups = [g for g in log_groups() if g.startswith(prefix)]
+        return {"logGroups": [{"logGroupName": g, "storedBytes": 1_000_000 * (i + 1), "retentionInDays": 30,
+                               "creationTime": int(T0 * 1000)} for i, g in enumerate(groups)]}
+    if op == "FilterLogEvents":
+        group = body["logGroupName"]
+        if group not in log_groups():
+            raise KeyError(f"ResourceNotFoundException: log group {group} does not exist")
+        events = synthetic_events(group, body.get("startTime", 0), body.get("filterPattern", ""))
+        offset = int(body.get("nextToken") or 0)
+        limit = body.get("limit", 1000)
+        page = events[offset:offset + limit]
+        out = {"events": page, "searchedLogStreams": []}
+        if offset + limit < len(events):
+            out["nextToken"] = str(offset + limit)
+        return out
     if body.get("logGroupName", "").endswith("/worker-dev"):
         start = int((body.get("nextToken") or "f/0").split("/")[1])
         end = min(len(FAILED_LOG), start + 1000)
@@ -259,22 +360,87 @@ for app in ["payments", "orders", "users"]:
 PARAMS.append({"Name": "legacy-api-key", "Type": "SecureString", "Value": "abc123", "KeyId": "alias/aws/ssm"})
 
 
+def ssm_meta(p):
+    return {"Name": p["Name"], "Type": p["Type"], "Version": p.get("Version", 3), "Tier": "Standard",
+            "LastModifiedDate": p.get("Modified", time.time() - 86400 * 3), "DataType": "text",
+            "LastModifiedUser": "arn:aws:sts::123456789012:assumed-role/Admin/dev-user",
+            **({"Description": p["Description"]} if p.get("Description") else {}),
+            **({"KeyId": p["KeyId"]} if "KeyId" in p else {})}
+
+
 def ssm(op, body):
+    if op == "DescribeParameters" and body.get("ParameterFilters"):
+        names = body["ParameterFilters"][0]["Values"]
+        return {"Parameters": [ssm_meta(p) for p in PARAMS if p["Name"] in names]}
+    if op == "PutParameter":
+        existing = next((x for x in PARAMS if x["Name"] == body["Name"]), None)
+        if existing and not body.get("Overwrite"):
+            raise KeyError("ParameterAlreadyExists")
+        if existing is None:
+            existing = {"Name": body["Name"], "Version": 0}
+            PARAMS.append(existing)
+        existing.update({"Type": body["Type"], "Value": body["Value"], "Version": existing.get("Version", 3) + 1,
+                         "Modified": time.time(), "Description": body.get("Description", existing.get("Description"))})
+        if body["Type"] == "SecureString":
+            existing["KeyId"] = body.get("KeyId", existing.get("KeyId", "alias/aws/ssm"))
+        return {"Version": existing["Version"], "Tier": "Standard"}
     if op == "DescribeParameters":
         start = int(body.get("NextToken") or 0)
         page = PARAMS[start:start + 7]
         time.sleep(0.15)
-        out = {"Parameters": [{"Name": p["Name"], "Type": p["Type"], "Version": 3, "Tier": "Standard",
-                               "LastModifiedDate": time.time() - 86400 * 3, "DataType": "text",
-                               "LastModifiedUser": "arn:aws:sts::123456789012:assumed-role/Admin/dev-user",
-                               **({"KeyId": p["KeyId"]} if "KeyId" in p else {})} for p in page]}
+        out = {"Parameters": [ssm_meta(p) for p in page]}
         if start + 7 < len(PARAMS):
             out["NextToken"] = str(start + 7)
         return out
     if op == "GetParameter":
         p = next(x for x in PARAMS if x["Name"] == body["Name"])
         value = p["Value"] if (p["Type"] != "SecureString" or body.get("WithDecryption")) else "AQICAHh...ciphertext"
-        return {"Parameter": {"Name": p["Name"], "Type": p["Type"], "Value": value, "Version": 3}}
+        return {"Parameter": {"Name": p["Name"], "Type": p["Type"], "Value": value, "Version": p.get("Version", 3)}}
+    raise KeyError(op)
+
+
+SECRETS = [
+    {"Name": n, "Description": d, "Value": v, "Created": time.time() - 86400 * 40, "Changed": time.time() - 86400 * k,
+     "Tags": [{"Key": "team", "Value": "platform"}], "Versions": 2}
+    for k, (n, d, v) in enumerate([
+        ("prod/payments/stripe", "Stripe API keys", json.dumps({"publishable": "pk_live_abc", "secret": "sk_live_xyz"})),
+        ("prod/orders/db", "Orders database credentials", json.dumps({"username": "orders", "password": "s3cr3t", "host": "orders.cluster.internal", "port": 5432})),
+        ("dev/payments/stripe", "Stripe test keys", json.dumps({"publishable": "pk_test_abc", "secret": "sk_test_xyz"})),
+        ("shared/slack-webhook", "", "https://hooks.slack.com/services/T000/B000/XXXX"),
+    ], start=1)]
+
+
+def secret_meta(sec):
+    return {"ARN": f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{sec['Name']}-AbCdEf", "Name": sec["Name"],
+            **({"Description": sec["Description"]} if sec["Description"] else {}),
+            "LastChangedDate": sec["Changed"], "LastAccessedDate": time.time() - 86400, "CreatedDate": sec["Created"],
+            "RotationEnabled": False, "Tags": sec["Tags"]}
+
+
+def secretsmanager(op, body):
+    find = lambda: next((x for x in SECRETS if x["Name"] == body.get("SecretId") or secret_meta(x)["ARN"] == body.get("SecretId")), None)
+    if op == "ListSecrets":
+        return {"SecretList": [secret_meta(x) for x in SECRETS]}
+    if op in ("DescribeSecret", "GetSecretValue", "PutSecretValue"):
+        sec = find()
+        if sec is None:
+            raise KeyError("ResourceNotFoundException")
+        if op == "DescribeSecret":
+            return secret_meta(sec)
+        if op == "GetSecretValue":
+            return {**{k: secret_meta(sec)[k] for k in ("ARN", "Name")}, "SecretString": sec["Value"],
+                    "VersionId": f"v{sec['Versions']}", "VersionStages": ["AWSCURRENT"], "CreatedDate": sec["Changed"]}
+        assert body.get("ClientRequestToken"), "ClientRequestToken required"
+        sec.update({"Value": body["SecretString"], "Changed": time.time(), "Versions": sec["Versions"] + 1})
+        return {"ARN": secret_meta(sec)["ARN"], "Name": sec["Name"], "VersionId": f"v{sec['Versions']}"}
+    if op == "CreateSecret":
+        assert body.get("ClientRequestToken"), "ClientRequestToken required"
+        if any(x["Name"] == body["Name"] for x in SECRETS):
+            raise KeyError("ResourceExistsException")
+        sec = {"Name": body["Name"], "Description": body.get("Description", ""), "Value": body["SecretString"],
+               "Created": time.time(), "Changed": time.time(), "Tags": [], "Versions": 1}
+        SECRETS.append(sec)
+        return {"ARN": secret_meta(sec)["ARN"], "Name": sec["Name"], "VersionId": "v1"}
     raise KeyError(op)
 
 
@@ -331,17 +497,31 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             self.reply(404, {"Type": "User", "message": f"Function not found: {e}"})
 
+    def reply_xml(self, code, text):
+        data = text.encode()
+        self.send_response(code)
+        self.send_header("content-type", "text/xml")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_POST(self):
         self.check_sig()
-        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        raw = self.rfile.read(int(self.headers.get("content-length", 0)))
+        if self.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
+            return self.reply_xml(*cloudformation(parse_qs(raw.decode())))
+        body = json.loads(raw or b"{}")
         target = self.headers.get("x-amz-target", "")
         prefix, _, op = target.partition(".")
         handler = {"CodePipeline_20150709": codepipeline, "CodeBuild_20161006": codebuild,
-                   "Logs_20140328": cwlogs, "AmazonSSM": ssm}.get(prefix)
+                   "Logs_20140328": cwlogs, "AmazonSSM": ssm, "secretsmanager": secretsmanager}.get(prefix)
         try:
             self.reply(200, handler(op, body))
         except Exception as e:
-            self.reply(400, {"__type": "com.amazon.coral#ValidationException", "message": f"{target}: {e!r}"})
+            # KeyError("ResourceNotFoundException: …") → that error code, like AWS.
+            first = str(e.args[0]).split(":")[0] if e.args else ""
+            code = first if first[:1].isupper() and " " not in first else "ValidationException"
+            self.reply(400, {"__type": f"com.amazon.coral#{code}", "message": f"{target}: {e!r}"})
 
 
 if __name__ == "__main__":

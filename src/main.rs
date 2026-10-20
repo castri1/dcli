@@ -7,6 +7,7 @@ mod pipeline;
 mod platform;
 mod report;
 mod tui;
+mod update;
 mod util;
 
 use std::process::ExitCode;
@@ -14,6 +15,7 @@ use std::process::ExitCode;
 use clap::{CommandFactory, FromArgMatches};
 
 fn main() -> ExitCode {
+    update::cleanup();
     // Usage and help show the name the binary was invoked as.
     let matches = cli::Cli::command().bin_name(util::program()).get_matches();
     let args = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());

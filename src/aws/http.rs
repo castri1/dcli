@@ -57,6 +57,14 @@ pub fn send(method: &str, url: &str, headers: &[(String, String)], body: Vec<u8>
 /// Turns a non-2xx response into an `AwsError::Api`, reading the error code from the
 /// `x-amzn-ErrorType` header or the JSON body (`__type`, `code`, `Code`).
 pub fn api_error(resp: &RawResponse) -> AwsError {
+    // Query APIs (CloudFormation…) answer with XML: <Error><Code>…</Code><Message>…</Message>.
+    if resp.body.trim_ascii_start().starts_with(b"<") {
+        let text = String::from_utf8_lossy(&resp.body);
+        if let Some(code) = crate::util::xml_text(&text, "Code") {
+            let message = crate::util::xml_text(&text, "Message").unwrap_or_default();
+            return AwsError::Api { status: resp.status, code, message };
+        }
+    }
     let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or_default();
     let field = |names: &[&str]| {
         names

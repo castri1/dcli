@@ -386,6 +386,17 @@ impl Module for Lambda {
                     ctx.toast(if ok { Level::Success } else { Level::Warn }, if ok { "ARN copied" } else { "Clipboard not available" });
                 }
             }
+            KeyCode::Char('l') => {
+                if let Some(func) = self.selected() {
+                    // The function's log group: its logging config, else the default name.
+                    let group = func
+                        .logging_config
+                        .as_ref()
+                        .and_then(|l| l.log_group.clone())
+                        .unwrap_or_else(|| format!("/aws/lambda/{}", func.function_name));
+                    ctx.jump("Logs", group);
+                }
+            }
             KeyCode::Char('o') => {
                 if let Some(func) = self.selected() {
                     let url = aws::console_url(
@@ -481,6 +492,7 @@ impl Module for Lambda {
             ("/", "search"),
             ("v", "env values"),
             ("c", "copy ARN"),
+            ("l", "logs"),
             ("o", "console"),
             ("r", "refresh"),
             ("PgUp/PgDn", "scroll"),

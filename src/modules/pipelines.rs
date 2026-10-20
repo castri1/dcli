@@ -15,13 +15,13 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use crate::aws::{self, AwsError, codebuild, codepipeline as cp, logs};
 use crate::config::{Hook, PipelineConfig, is_production};
 use crate::pipeline::{self, Approval, StageView, Status};
+use crate::tui::logview::{LogKey, LogView};
 use crate::tui::module::{Ctx, Emitter, Handled, Level, Module, Payload, View};
 use crate::tui::picker::{Item, Outcome, Picker};
 use crate::tui::theme;
 use crate::tui::widgets::{self, InputEvent, TextInput};
 use crate::util::{display_path, ellipsize, fmt_ago, fmt_duration, strip_ansi};
 
-const MAX_LOG_LINES: usize = 10_000;
 const AVERAGES_TTL: Duration = Duration::from_secs(15 * 60);
 
 struct Row {
@@ -66,14 +66,12 @@ struct LogsPanel {
     action: String,
     build_id: String,
     stream: Option<(String, String)>,
-    lines: Vec<String>,
+    view: LogView,
     token: Option<String>,
     state: LogsState,
     phase: Option<String>,
     in_flight: bool,
     last_fetch: Instant,
-    /// Lines scrolled up from the bottom; 0 follows the tail.
-    scroll: usize,
 }
 
 #[derive(PartialEq)]
@@ -187,6 +185,38 @@ impl Pipelines {
 
     fn row(&self) -> Option<&Row> {
         self.rows.get(self.selected)
+    }
+
+    /// "Since the last success …" for the detail panel, when the latest run did not succeed.
+    fn since_success(&self, row: &Row) -> Option<String> {
+        let latest = row.latest.as_ref()?;
+        if Status::parse(&latest.status) == Status::Succeeded {
+            return None;
+        }
+        let Some(Ok(history)) = self.history.get(row.name()) else { return None };
+        let Some(i) = pipeline::last_success(history, 0) else {
+            return Some(format!("No success in the last {} runs", history.len()));
+        };
+        let ok = &history[i];
+        let rev = pipeline::revision(ok, &[]);
+        let when = ok.last_update_time.map(fmt_ago).unwrap_or_default();
+        let runs = if i == 1 { "1 run".to_string() } else { format!("{i} runs") };
+        let compare = if self.compare_link(row).is_some() { " · g compare commits" } else { "" };
+        Some(format!("Since the last success {} ({when}): {runs}{compare}", rev.commit.unwrap_or_default()))
+    }
+
+    /// Link comparing the last successful commit with the latest one.
+    fn compare_link(&self, row: &Row) -> Option<String> {
+        let Some(Ok(history)) = self.history.get(row.name()) else { return None };
+        let ok = &history[pipeline::last_success(history, 0)?];
+        let latest = row.latest.as_ref()?;
+        let repo = pipeline::revision(latest, self.details_for(row)).repo;
+        pipeline::compare_url(ok, latest, repo.as_deref())
+    }
+
+    /// The build log fills the screen (`z`).
+    fn zoomed(&self) -> bool {
+        self.logs.as_ref().is_some_and(|p| p.view.zoomed)
     }
 
     fn row_by_name(&self, name: &str) -> Option<&Row> {
@@ -338,13 +368,12 @@ impl Pipelines {
             action: action.name.clone(),
             build_id: action.build_id.clone().unwrap_or_default(),
             stream: None,
-            lines: Vec::new(),
+            view: LogView::default(),
             token: None,
             state: LogsState::Loading,
             phase: None,
             in_flight: false,
             last_fetch: Instant::now(),
-            scroll: 0,
         });
         self.lower = Lower::Logs;
         self.fetch_logs(ctx);
@@ -799,10 +828,7 @@ impl Pipelines {
                     Ok(chunk) => {
                         let got_lines = !chunk.lines.is_empty();
                         panel.stream = chunk.stream.or(panel.stream.take());
-                        panel.lines.extend(chunk.lines);
-                        if panel.lines.len() > MAX_LOG_LINES {
-                            panel.lines.drain(..panel.lines.len() - MAX_LOG_LINES);
-                        }
+                        panel.view.extend(chunk.lines);
                         panel.token = chunk.token;
                         panel.phase = chunk.phase;
                         panel.state = if chunk.build_done && !got_lines && panel.stream.is_some() {
@@ -990,6 +1016,9 @@ impl Pipelines {
             }
             lines.push(Line::from(spans));
         }
+        if let Some(text) = self.since_success(row) {
+            lines.push(Line::from(vec![Span::styled(format!("    {text}"), theme::muted())]));
+        }
         lines.push(Line::raw(""));
 
         let stages = self.stages(row);
@@ -1053,7 +1082,8 @@ impl Pipelines {
             .and_then(stage_note)
             .map_or(0, |(text, _)| 2 + text.chars().count() as u16 / width.saturating_sub(4).max(1));
         let report_hint = u16::from(row.exec_status() == Some(Status::Failed));
-        stages.len() as u16 + 9 + note + report_hint
+        let since = u16::from(self.since_success(row).is_some());
+        stages.len() as u16 + 9 + note + report_hint + since
     }
 
     fn render_logs(&mut self, f: &mut Frame, area: Rect, view: &View) {
@@ -1061,7 +1091,10 @@ impl Pipelines {
         let Some(panel) = &self.logs else { return };
         let (state_text, state_style) = match &panel.state {
             LogsState::Loading => (format!("{} loading", theme::spinner(view.tick)), theme::accent()),
-            LogsState::Live if panel.scroll > 0 => (format!("↑ {} lines · End to follow", panel.scroll), theme::muted()),
+            LogsState::Live if !panel.view.following() => (
+                format!("↑ {} lines · End to follow", panel.view.lines_above_end().unwrap_or(0)),
+                theme::muted(),
+            ),
             LogsState::Live => (
                 format!("{} following{}", theme::spinner(view.tick), panel.phase.as_deref().map(|p| format!(" · {p}")).unwrap_or_default()),
                 Style::new().fg(theme::RUNNING),
@@ -1071,18 +1104,12 @@ impl Pipelines {
         };
         let block = widgets::panel(format!(" Logs · {} / {} ", panel.stage, panel.action), false)
             .title_top(Line::styled(format!(" {state_text} "), state_style).right_aligned());
-        let height = area.height.saturating_sub(2) as usize;
-        let end = panel.lines.len().saturating_sub(panel.scroll);
-        let start = end.saturating_sub(height);
-        let lines: Vec<Line> = panel.lines[start..end].iter().map(|l| log_line(l)).collect();
-        if lines.is_empty() {
-            let text = match panel.state {
-                LogsState::Loading | LogsState::Live => "Waiting for log output…",
-                _ => "No log output",
-            };
-            f.render_widget(widgets::placeholder(Line::styled(text, theme::muted())).block(block), area);
-        } else {
-            f.render_widget(Paragraph::new(lines).block(block), area);
+        let empty = match panel.state {
+            LogsState::Loading | LogsState::Live => "Waiting for log output…",
+            _ => "No log output",
+        };
+        if let Some(panel) = &mut self.logs {
+            panel.view.render_panel(f, area, block, empty);
         }
     }
 
@@ -1096,24 +1123,31 @@ impl Pipelines {
             ])],
             Some(Err(e)) => vec![Line::styled(format!(" {}", e.short()), Style::new().fg(theme::ERR))],
             Some(Ok(execs)) if execs.is_empty() => vec![Line::styled(" No executions", theme::muted())],
-            Some(Ok(execs)) => execs
-                .iter()
-                .map(|e| {
-                    let s = Status::parse(&e.status);
-                    let duration = e.start_time.zip(e.last_update_time).map(|(a, b)| fmt_duration(b - a)).unwrap_or_default();
-                    let rev = pipeline::revision(e, &[]);
-                    Line::from(vec![
-                        Span::styled(format!(" {} ", theme::status_symbol(s, view.tick)), theme::status_style(s)),
-                        Span::raw(format!("{:<9}", &e.pipeline_execution_id[..8.min(e.pipeline_execution_id.len())])),
-                        Span::styled(format!("{:<12}", s.label()), theme::status_style(s)),
-                        Span::styled(format!("{:<9}", pipeline::trigger_label(e)), theme::muted()),
-                        Span::styled(format!("{:<10}", e.start_time.map(fmt_ago).unwrap_or_default()), theme::muted()),
-                        Span::raw(format!("{duration:<9}")),
-                        Span::styled(rev.commit.unwrap_or_default(), Style::new().fg(theme::WARN)),
-                        Span::raw(format!(" {}", ellipsize(&rev.message.unwrap_or_default(), 60))),
-                    ])
-                })
-                .collect(),
+            Some(Ok(execs)) => {
+                let last_ok = pipeline::last_success(execs, 0);
+                execs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let s = Status::parse(&e.status);
+                        let duration =
+                            e.start_time.zip(e.last_update_time).map(|(a, b)| fmt_duration(b - a)).unwrap_or_default();
+                        let rev = pipeline::revision(e, &[]);
+                        let marker = if Some(i) == last_ok { "  ← last success" } else { "" };
+                        Line::from(vec![
+                            Span::styled(format!(" {} ", theme::status_symbol(s, view.tick)), theme::status_style(s)),
+                            Span::raw(format!("{:<9}", &e.pipeline_execution_id[..8.min(e.pipeline_execution_id.len())])),
+                            Span::styled(format!("{:<12}", s.label()), theme::status_style(s)),
+                            Span::styled(format!("{:<9}", pipeline::trigger_label(e)), theme::muted()),
+                            Span::styled(format!("{:<10}", e.start_time.map(fmt_ago).unwrap_or_default()), theme::muted()),
+                            Span::raw(format!("{duration:<9}")),
+                            Span::styled(rev.commit.unwrap_or_default(), Style::new().fg(theme::WARN)),
+                            Span::raw(format!(" {}", ellipsize(&rev.message.unwrap_or_default(), 60))),
+                            Span::styled(marker, Style::new().fg(theme::OK)),
+                        ])
+                    })
+                    .collect()
+            }
         };
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
@@ -1364,20 +1398,6 @@ fn stage_note(s: &StageView) -> Option<(String, ratatui::style::Color)> {
     }
 }
 
-fn log_line(l: &str) -> Line<'static> {
-    let lower = l.to_ascii_lowercase();
-    let style = if lower.contains("error") || lower.contains("failed") || lower.contains("exception") {
-        Style::new().fg(theme::ERR)
-    } else if lower.contains("warn") {
-        Style::new().fg(theme::WARN)
-    } else if l.starts_with("[Container]") {
-        theme::accent()
-    } else {
-        Style::new()
-    };
-    Line::styled(format!(" {l}"), style)
-}
-
 fn run_hooks(ctx: &mut Ctx, name: String, hooks: Vec<Hook>, pre_deploy: bool) {
     ctx.spawn_stream(move |em: Emitter<Msg>| {
         let line = |em: &Emitter<Msg>, line: String| em.emit(Msg::HookLine { name: name.clone(), line });
@@ -1427,6 +1447,14 @@ impl Module for Pipelines {
             self.dialog_key(key, ctx);
             return Handled::Yes;
         }
+        if let Some(p) = self.logs.as_mut().filter(|p| p.view.zoomed) {
+            if let LogKey::Copy = p.view.key(key) {
+                let ok = crate::platform::copy_to_clipboard(&p.view.lines().join("\n"));
+                let n = p.view.lines().len();
+                ctx.toast(if ok { Level::Success } else { Level::Warn }, if ok { format!("Copied {n} log lines") } else { "Clipboard not available".into() });
+            }
+            return Handled::Yes;
+        }
         let stage_count = self.row().map(|r| self.stages(r).len()).unwrap_or(0);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1), ctx),
@@ -1454,6 +1482,14 @@ impl Module for Pipelines {
                 }
             }
             KeyCode::Char('o') => self.open_console(ctx),
+            KeyCode::Char('g') => match self.row().and_then(|r| self.compare_link(r)) {
+                Some(url) => {
+                    if !crate::platform::open_url(&url) {
+                        ctx.toast(Level::Warn, format!("Could not open a browser: {url}"));
+                    }
+                }
+                None => ctx.toast(Level::Info, "No commit comparison: needs a failed or running run after a success, on GitHub, GitLab or Bitbucket"),
+            },
             KeyCode::Char('r') => {
                 self.last_poll = None;
                 self.averages.clear();
@@ -1473,19 +1509,17 @@ impl Module for Pipelines {
                 self.lower = Lower::None;
                 self.logs = None;
             }
-            KeyCode::PageUp => {
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::End => {
                 if let Some(p) = &mut self.logs {
-                    p.scroll = (p.scroll + 10).min(p.lines.len().saturating_sub(1));
+                    p.view.key(key);
                 }
             }
-            KeyCode::PageDown => {
-                if let Some(p) = &mut self.logs {
-                    p.scroll = p.scroll.saturating_sub(10);
+            KeyCode::Char('z') => {
+                if self.logs.is_none() {
+                    self.toggle_logs(ctx);
                 }
-            }
-            KeyCode::End => {
                 if let Some(p) = &mut self.logs {
-                    p.scroll = 0;
+                    p.view.zoomed = true;
                 }
             }
             _ => return Handled::No,
@@ -1502,12 +1536,12 @@ impl Module for Pipelines {
         match event.kind {
             MouseEventKind::ScrollUp if in_logs => {
                 if let Some(p) = &mut self.logs {
-                    p.scroll = (p.scroll + 3).min(p.lines.len().saturating_sub(1));
+                    p.view.scroll(-3);
                 }
             }
             MouseEventKind::ScrollDown if in_logs => {
                 if let Some(p) = &mut self.logs {
-                    p.scroll = p.scroll.saturating_sub(3);
+                    p.view.scroll(3);
                 }
             }
             MouseEventKind::ScrollUp if self.list_area.contains(pos) => self.select(self.selected.saturating_sub(1), ctx),
@@ -1551,6 +1585,12 @@ impl Module for Pipelines {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        let pipeline = self.row().map(|r| r.name().to_string()).unwrap_or_default();
+        if let Some(p) = self.logs.as_mut().filter(|p| p.view.zoomed) {
+            let title = format!("{pipeline} · {} / {}", p.stage, p.action);
+            p.view.render_zoomed(f, area, &title);
+            return;
+        }
         if self.rows.is_empty() {
             let text = Text::from(vec![
                 Line::raw(""),
@@ -1602,6 +1642,7 @@ impl Module for Pipelines {
                 vec![("Tab", "switch"), ("Enter", "submit"), ("Esc", "cancel")]
             }
             Some(Dialog::Add(..)) => vec![("Space", "mark"), ("Enter", "add"), ("Esc", "cancel")],
+            None if self.zoomed() => vec![("/", "search"), ("e", "next error"), ("y", "copy all"), ("Esc", "back")],
             Some(Dialog::Remove { .. }) => vec![("Enter", "remove"), ("Esc", "cancel")],
             Some(_) => vec![("Esc", "close")],
             None if self.rows.is_empty() => vec![("n", "add pipelines")],
@@ -1623,6 +1664,7 @@ impl Module for Pipelines {
                     h.insert(2, ("c", "copy for AI"));
                 }
                 if self.lower == Lower::Logs {
+                    h.insert(h.iter().position(|(k, _)| *k == "l").map_or(h.len(), |i| i + 1), ("z", "full screen"));
                     h.push(("PgUp/PgDn", "scroll"));
                 }
                 h
@@ -1640,6 +1682,10 @@ impl Module for Pipelines {
     }
 
     fn capturing(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || self.zoomed()
+    }
+
+    fn wants_mouse(&self) -> bool {
+        !self.zoomed()
     }
 }

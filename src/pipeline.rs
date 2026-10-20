@@ -338,6 +338,40 @@ pub fn trigger_label(summary: &ExecutionSummary) -> &'static str {
     }
 }
 
+/// Index of the newest successful execution in `history` (newest first) older than
+/// `history[from]`. The executions before it, from `from`, are what changed since.
+pub fn last_success(history: &[ExecutionSummary], from: usize) -> Option<usize> {
+    (from + 1..history.len()).find(|&i| Status::parse(&history[i].status) == Status::Succeeded)
+}
+
+/// Web page comparing the commits of two executions, for GitHub (also Enterprise), GitLab
+/// and Bitbucket sources. `repo` is the source's `FullRepositoryId`, used when the
+/// revision has no URL.
+pub fn compare_url(older: &ExecutionSummary, newer: &ExecutionSummary, repo: Option<&str>) -> Option<String> {
+    let old = older.source_revisions.first()?.revision_id.as_deref()?;
+    let src = newer.source_revisions.first()?;
+    let new = src.revision_id.as_deref()?;
+    if old == new {
+        return None;
+    }
+    let base = match src.revision_url.as_deref() {
+        Some(url) if url.contains("/commit/") || url.contains("/commits/") => {
+            url.split("/-/commit/").next()?.split("/commits/").next()?.split("/commit/").next()?.to_string()
+        }
+        _ => {
+            let github = src.revision_summary.as_deref().is_some_and(|s| s.contains("\"GitHub"));
+            format!("https://github.com/{}", repo.filter(|_| github)?)
+        }
+    };
+    Some(if base.contains("gitlab") {
+        format!("{base}/-/compare/{old}...{new}")
+    } else if base.contains("bitbucket.org") {
+        format!("{base}/branches/compare/{new}%0D{old}")
+    } else {
+        format!("{base}/compare/{old}...{new}")
+    })
+}
+
 /// Average duration per stage over recent fully-successful executions, from an
 /// unfiltered ListActionExecutions (newest first). Used to estimate progress.
 pub fn stage_averages(details: &[ActionExecutionDetail]) -> HashMap<String, f64> {
@@ -379,6 +413,51 @@ pub fn stage_averages(details: &[ActionExecutionDetail]) -> HashMap<String, f64>
         .into_iter()
         .map(|(k, v)| (k, v.iter().sum::<f64>() / v.len() as f64))
         .collect()
+}
+
+#[cfg(test)]
+mod changes_tests {
+    use super::*;
+    use crate::aws::codepipeline::SourceRevision;
+
+    fn exec(status: &str, sha: &str, url: Option<&str>) -> ExecutionSummary {
+        ExecutionSummary {
+            status: status.into(),
+            source_revisions: vec![SourceRevision {
+                revision_id: Some(sha.into()),
+                revision_url: url.map(str::to_string),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn finds_the_last_success_and_compare_links() {
+        let history = [
+            exec("Failed", "ccc", Some("https://github.com/acme/app/commit/ccc")),
+            exec("Superseded", "bbb", None),
+            exec("Succeeded", "aaa", None),
+        ];
+        assert_eq!(last_success(&history, 0), Some(2));
+        assert_eq!(last_success(&history, 2), None);
+        assert_eq!(
+            compare_url(&history[2], &history[0], None).as_deref(),
+            Some("https://github.com/acme/app/compare/aaa...ccc")
+        );
+        let gitlab = exec("Failed", "ccc", Some("https://gitlab.com/g/app/-/commit/ccc"));
+        assert_eq!(
+            compare_url(&history[2], &gitlab, None).as_deref(),
+            Some("https://gitlab.com/g/app/-/compare/aaa...ccc")
+        );
+        let mut no_url = exec("Failed", "ccc", None);
+        no_url.source_revisions[0].revision_summary = Some(r#"{"ProviderType":"GitHub","CommitMessage":"x"}"#.into());
+        assert_eq!(
+            compare_url(&history[2], &no_url, Some("acme/app")).as_deref(),
+            Some("https://github.com/acme/app/compare/aaa...ccc")
+        );
+        assert_eq!(compare_url(&history[2], &history[2], None), None);
+    }
 }
 
 #[cfg(test)]

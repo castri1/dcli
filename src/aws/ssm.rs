@@ -62,3 +62,42 @@ pub fn get_parameter(aws: &Aws, name: &str, decrypt: bool) -> Result<Parameter> 
     let out: Out = aws.call(&SERVICE, "GetParameter", &json!({ "Name": name, "WithDecryption": decrypt }))?;
     Ok(out.parameter)
 }
+
+/// Metadata of one parameter (type, KMS key, description), or `None` when it does not exist.
+pub fn describe_parameter(aws: &Aws, name: &str) -> Result<Option<ParameterMetadata>> {
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "PascalCase", default)]
+    struct Out {
+        parameters: Vec<ParameterMetadata>,
+    }
+    let input = json!({ "ParameterFilters": [{ "Key": "Name", "Option": "Equals", "Values": [name] }] });
+    let out: Out = aws.call(&SERVICE, "DescribeParameters", &input)?;
+    Ok(out.parameters.into_iter().find(|p| p.name == name))
+}
+
+/// Creates a parameter, or with `overwrite` replaces its value (a new version). `key_id`
+/// keeps a SecureString on its KMS key. Returns the new version.
+pub fn put_parameter(
+    aws: &Aws,
+    name: &str,
+    value: &str,
+    kind: &str,
+    description: Option<&str>,
+    key_id: Option<&str>,
+    overwrite: bool,
+) -> Result<i64> {
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "PascalCase", default)]
+    struct Out {
+        version: i64,
+    }
+    let mut input = json!({ "Name": name, "Value": value, "Type": kind, "Overwrite": overwrite });
+    if let Some(d) = description.filter(|d| !d.is_empty()) {
+        input["Description"] = json!(d);
+    }
+    if let Some(k) = key_id.filter(|_| kind == "SecureString") {
+        input["KeyId"] = json!(k);
+    }
+    let out: Out = aws.call(&SERVICE, "PutParameter", &input)?;
+    Ok(out.version)
+}

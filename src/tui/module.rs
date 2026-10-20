@@ -57,6 +57,8 @@ pub struct Shared {
     pub tx: Sender<AppEvent>,
     pub generation: u64,
     pub toasts: Vec<Toast>,
+    /// A module asked to show another one: (module title, what to open there).
+    pub jump: Option<(&'static str, String)>,
 }
 
 /// Per-frame values for rendering.
@@ -171,6 +173,12 @@ impl Ctx<'_> {
         self.shared.toasts.push(Toast { level, text, at: Instant::now() });
     }
 
+    /// Switches to the module titled `module` and asks it to open `target`
+    /// (Lambda → its log group in Logs, for example).
+    pub fn jump(&mut self, module: &'static str, target: impl Into<String>) {
+        self.shared.jump = Some((module, target.into()));
+    }
+
     /// Toast plus a desktop notification when enabled in the config.
     pub fn notify(&mut self, level: Level, title: &str, body: &str) {
         if self.config().defaults.notifications {
@@ -221,4 +229,15 @@ pub trait Module {
     fn capturing(&self) -> bool {
         false
     }
+
+    /// False while the module wants the terminal to handle the mouse (text selection).
+    fn wants_mouse(&self) -> bool {
+        true
+    }
+
+    /// Text pasted into the terminal (bracketed paste), for the focused field.
+    fn paste(&mut self, _text: &str, _ctx: &mut Ctx) {}
+
+    /// Another module sent the user here to see `target` (see [`Ctx::jump`]).
+    fn open(&mut self, _target: &str, _ctx: &mut Ctx) {}
 }

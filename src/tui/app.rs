@@ -34,6 +34,9 @@ enum LoginMsg {
     Done(Result<(), String>),
 }
 
+/// A newer dcli release exists (tag).
+struct UpdateAvailable(String);
+
 /// What a palette entry does.
 #[derive(Clone)]
 enum Jump {
@@ -91,7 +94,7 @@ impl App {
             modules,
             active: 0,
             activated: vec![false; count],
-            shared: Shared { env, loaded, tx, generation: 0, toasts: Vec::new() },
+            shared: Shared { env, loaded, tx, generation: 0, toasts: Vec::new(), jump: None },
             overlay: None,
             started: Instant::now(),
             tab_hits: Vec::new(),
@@ -99,6 +102,12 @@ impl App {
             quit: false,
         };
         app.reset_modules();
+        let tx = app.shared.tx.clone();
+        std::thread::spawn(move || {
+            if let Some(tag) = crate::update::newer_version_available() {
+                let _ = tx.send(AppEvent::Task { module: APP, generation: 0, payload: Box::new(UpdateAvailable(tag)) });
+            }
+        });
         app
     }
 
@@ -152,10 +161,22 @@ impl App {
         }
     }
 
+    pub fn mouse_wanted(&self) -> bool {
+        self.modules[self.active].wants_mouse()
+    }
+
     pub fn handle(&mut self, event: AppEvent) {
         match event {
             AppEvent::Input(Event::Key(key)) if key.kind != KeyEventKind::Release => self.key(key),
             AppEvent::Input(Event::Mouse(m)) => self.mouse(m),
+            AppEvent::Input(Event::Paste(text)) => match &mut self.overlay {
+                Some(Overlay::Palette(picker, _)) => picker.paste(&text),
+                Some(_) => {}
+                None => {
+                    let active = self.active;
+                    self.with_module(active, |m, ctx| m.paste(&text, ctx));
+                }
+            },
             AppEvent::Input(_) => {}
             AppEvent::Task { module: APP, payload, .. } => self.app_task(payload),
             AppEvent::Task { module, generation, payload } => {
@@ -163,6 +184,12 @@ impl App {
                     self.with_module(module, |m, ctx| m.task(payload, ctx));
                 }
             }
+        }
+        if let Some((title, target)) = self.shared.jump.take()
+            && let Some(i) = self.modules.iter().position(|m| m.title() == title)
+        {
+            self.select_module(i);
+            self.with_module(i, |m, ctx| m.open(&target, ctx));
         }
     }
 
@@ -330,6 +357,20 @@ impl App {
     }
 
     fn app_task(&mut self, payload: Payload) {
+        let payload = match payload.downcast::<UpdateAvailable>() {
+            Ok(update) => {
+                let text = format!(
+                    "dcli {} is available (you have {}). Quit and run: {} update",
+                    update.0.trim_start_matches('v'),
+                    crate::update::CURRENT,
+                    crate::util::program()
+                );
+                let mut ctx = Ctx { shared: &mut self.shared, module: APP };
+                ctx.toast(Level::Info, text);
+                return;
+            }
+            Err(other) => other,
+        };
         let Ok(msg) = payload.downcast::<LoginMsg>() else { return };
         match *msg {
             LoginMsg::Line(line) => {

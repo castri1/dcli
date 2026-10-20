@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::aws::credentials::effective_profile;
 use crate::aws::profile::AwsFiles;
-use crate::aws::{Aws, AwsError, codebuild, codepipeline as cp, lambda, logs, ssm};
+use crate::aws::{Aws, AwsError, codebuild, codepipeline as cp, lambda, logs, secrets, ssm};
 use crate::config::{self, Config, Environment, Loaded, PipelineConfig};
 use crate::pipeline::{self, StageView, Status};
 use crate::tui::picker::{self, Item, Picker};
@@ -126,7 +126,21 @@ pub enum Command {
         #[arg(short, long)]
         follow: bool,
     },
-    /// Read a Parameter Store parameter: param [ENV] NAME
+    /// Print the events of a CloudWatch log group (every stream): tail [ENV] GROUP
+    Tail {
+        env: Option<String>,
+        group: Option<String>,
+        /// How far back to start: 30s, 15m, 2h, 1d
+        #[arg(long, default_value = "15m")]
+        since: String,
+        /// CloudWatch filter pattern (e.g. ERROR, "exact phrase", { $.level = "error" })
+        #[arg(long)]
+        filter: Option<String>,
+        /// Keep printing new events
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Read a Parameter Store parameter, or store a value with --set: param [ENV] NAME
     Param {
         env: Option<String>,
         name: Option<String>,
@@ -134,6 +148,33 @@ pub enum Command {
         decrypt: bool,
         #[arg(long)]
         json: bool,
+        /// Create the parameter or store a new version with this value ("-" reads stdin, with --yes)
+        #[arg(long, value_name = "VALUE")]
+        set: Option<String>,
+        /// Type of a new parameter: String (default), SecureString or StringList
+        #[arg(long = "type", value_name = "TYPE")]
+        kind: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        /// Do not ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Read a Secrets Manager secret, or store a value with --set: secret [ENV] NAME
+    Secret {
+        env: Option<String>,
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+        /// Create the secret or store a new version with this value ("-" reads stdin, with --yes)
+        #[arg(long, value_name = "VALUE")]
+        set: Option<String>,
+        /// Description of a new secret
+        #[arg(long)]
+        description: Option<String>,
+        /// Do not ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Show a Lambda function's configuration: lambda [ENV] NAME
     Lambda {
@@ -141,6 +182,15 @@ pub enum Command {
         name: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Update dcli to the latest release (through npm when installed with npm)
+    Update {
+        /// Only tell whether a newer version exists
+        #[arg(long)]
+        check: bool,
+        /// Install this version instead of the latest (e.g. 2.1.0)
+        #[arg(long, value_name = "VERSION")]
+        to: Option<String>,
     },
     /// `<env>` alone opens the UI there
     #[command(external_subcommand)]
@@ -390,6 +440,10 @@ fn stage_json(s: &StageView) -> Value {
 // ---- commands ----------------------------------------------------------------------
 
 pub fn run(cli: Cli) -> Result<ExitCode> {
+    // Needs no config.
+    if let Some(Command::Update { check, to }) = cli.command {
+        return crate::update::run(check, to);
+    }
     let mut loaded = config::load(cli.config.as_deref())?;
     let command = cli.command.unwrap_or(Command::Ui { env: None });
     let config = &loaded.config;
@@ -410,6 +464,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
                 program()
             ),
         },
+        Command::Update { .. } => unreachable!("handled before loading the config"),
         Command::Use { env } => use_env(config, env),
         Command::Add { env, pipelines } => add(&mut loaded, env, pipelines),
         Command::Remove { env, pipeline } => remove(&mut loaded, env, pipeline),
@@ -431,9 +486,25 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", report.markdown);
             Ok(ExitCode::SUCCESS)
         }
-        Command::Param { env, name, decrypt, json } => {
+        Command::Param { env, name, decrypt, json, set, kind, description, yes } => {
             let (env, Some(name)) = env_and(config, env, name)? else { bail!("which parameter? {} param [ENV] NAME", program()) };
-            param(aws_for(config, &env)?.as_ref(), &name, decrypt, json)
+            let aws = aws_for(config, &env)?;
+            match set {
+                Some(value) => param_set(&aws, &env, &name, &read_value(&value)?, kind, description, yes),
+                None => param(aws.as_ref(), &name, decrypt, json),
+            }
+        }
+        Command::Secret { env, name, json, set, description, yes } => {
+            let (env, Some(name)) = env_and(config, env, name)? else { bail!("which secret? {} secret [ENV] NAME", program()) };
+            let aws = aws_for(config, &env)?;
+            match set {
+                Some(value) => secret_set(&aws, &env, &name, &read_value(&value)?, description, yes),
+                None => secret_show(&aws, &name, json),
+            }
+        }
+        Command::Tail { env, group, since, filter, follow } => {
+            let (env, Some(group)) = env_and(config, env, group)? else { bail!("which log group? {} tail [ENV] GROUP", program()) };
+            tail(aws_for(config, &env)?.as_ref(), &group, &since, filter.as_deref().unwrap_or(""), follow)
         }
         Command::Lambda { env, name, json } => {
             let (env, Some(name)) = env_and(config, env, name)? else { bail!("which function? {} lambda [ENV] NAME", program()) };
@@ -607,7 +678,8 @@ fn list(config: &Config, source: &config::Source, json: bool) -> Result<ExitCode
 fn status(t: &Target, json: bool) -> Result<ExitCode> {
     let name = &t.pipeline.name;
     let state = cp::get_pipeline_state(&t.aws, name)?;
-    let latest = latest(t)?;
+    let history = cp::list_executions(&t.aws, name, 10)?;
+    let latest = history.first().cloned();
     let details = match &latest {
         Some(l) => cp::list_action_executions(&t.aws, name, Some(&l.pipeline_execution_id), 100)?,
         None => Vec::new(),
@@ -664,6 +736,21 @@ fn status(t: &Target, json: bool) -> Result<ExitCode> {
     let rev = pipeline::revision(l, &details);
     if rev.commit.is_some() || rev.message.is_some() {
         println!("  {}", paint(&rev.one_line(), "90"));
+    }
+    if s != Status::Succeeded {
+        match pipeline::last_success(&history, 0) {
+            Some(i) => {
+                let ok = &history[i];
+                let commit = pipeline::revision(ok, &[]).commit.unwrap_or_default();
+                let when = ok.last_update_time.map(fmt_ago).unwrap_or_default();
+                let runs = if i == 1 { "1 run".to_string() } else { format!("{i} runs") };
+                println!("  {}", paint(&format!("Since the last success {commit} ({when}): {runs}"), "90"));
+                if let Some(url) = pipeline::compare_url(ok, l, rev.repo.as_deref()) {
+                    println!("  {}", paint(&format!("Changes: {url}"), "90"));
+                }
+            }
+            None => println!("  {}", paint(&format!("No success in the last {} runs", history.len()), "90")),
+        }
     }
     println!();
     let width = stages.iter().map(|s| s.name.len()).max().unwrap_or(5);
@@ -932,6 +1019,129 @@ fn print_logs(t: &Target, follow: bool) -> Result<ExitCode> {
             break;
         }
         std::thread::sleep(Duration::from_secs(3));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn tail(aws: &Aws, group: &str, since: &str, pattern: &str, follow: bool) -> Result<ExitCode> {
+    let secs = logs::parse_since(since).ok_or_else(|| anyhow!("--since takes 30s, 15m, 2h, 1d…"))?;
+    let mut start = (now_secs() as i64 - secs) * 1000;
+    let (mut last_ms, mut ids) = (0i64, std::collections::HashSet::new());
+    loop {
+        let mut token: Option<String> = None;
+        loop {
+            let (events, next) = logs::filter_log_events(aws, group, start, pattern, token.as_deref())?;
+            for e in events {
+                if e.timestamp < last_ms || (e.timestamp == last_ms && ids.contains(&e.event_id)) {
+                    continue;
+                }
+                if e.timestamp > last_ms {
+                    last_ms = e.timestamp;
+                    ids.clear();
+                }
+                ids.insert(e.event_id.clone());
+                for line in logs::event_lines(&e, true) {
+                    println!("{line}");
+                }
+            }
+            match next {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        if !follow {
+            return Ok(ExitCode::SUCCESS);
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        start = last_ms.max((now_secs() as i64 - 60) * 1000);
+    }
+}
+
+/// A `--set` value; `-` reads it from stdin (without the final newline). Stdin then cannot
+/// answer the confirmation, so `--yes` is needed.
+fn read_value(value: &str) -> Result<String> {
+    if value != "-" {
+        return Ok(value.to_string());
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+    if text.ends_with('\n') {
+        text.pop();
+        if text.ends_with('\r') {
+            text.pop();
+        }
+    }
+    Ok(text)
+}
+
+/// Asks before a write: y/N, or typing the environment name for production-looking ones.
+fn confirm_write(env_name: &str, question: &str, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("refusing to write without confirmation; pass --yes");
+    }
+    if config::is_production(env_name) {
+        let typed = ask(&format!("{question} Type '{env_name}' to confirm:"));
+        return Ok(typed == env_name);
+    }
+    Ok(confirm(question))
+}
+
+fn param_set(
+    aws: &Aws,
+    env_name: &str,
+    name: &str,
+    value: &str,
+    kind: Option<String>,
+    description: Option<String>,
+    yes: bool,
+) -> Result<ExitCode> {
+    let existing = ssm::describe_parameter(aws, name)?;
+    let kind = kind.or_else(|| existing.as_ref().map(|p| p.kind.clone())).unwrap_or_else(|| "String".into());
+    if !["String", "SecureString", "StringList"].contains(&kind.as_str()) {
+        bail!("--type must be String, SecureString or StringList");
+    }
+    let action = if existing.is_some() { "Update" } else { "Create" };
+    if !confirm_write(env_name, &format!("{action} parameter {name} ({kind}) in {env_name}?"), yes)? {
+        println!("Cancelled.");
+        return Ok(ExitCode::FAILURE);
+    }
+    let description = description.or_else(|| existing.as_ref().and_then(|p| p.description.clone()));
+    let key_id = existing.as_ref().and_then(|p| p.key_id.clone());
+    let version = ssm::put_parameter(aws, name, value, &kind, description.as_deref(), key_id.as_deref(), existing.is_some())?;
+    println!("{} {action}d {name} · version {version}", paint("✓", "32"));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn secret_show(aws: &Aws, name: &str, json: bool) -> Result<ExitCode> {
+    let v = secrets::get_secret_value(aws, name)?;
+    if json {
+        print_json(&serde_json::to_value(&v)?);
+    } else {
+        println!("{}", v.secret_string.unwrap_or_default());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn secret_set(aws: &Aws, env_name: &str, name: &str, value: &str, description: Option<String>, yes: bool) -> Result<ExitCode> {
+    let exists = match secrets::describe_secret(aws, name) {
+        Ok(_) => true,
+        Err(AwsError::Api { code, .. }) if code == "ResourceNotFoundException" => false,
+        Err(e) => return Err(e.into()),
+    };
+    let action = if exists { "Store a new value for" } else { "Create" };
+    if !confirm_write(env_name, &format!("{action} secret {name} in {env_name}?"), yes)? {
+        println!("Cancelled.");
+        return Ok(ExitCode::FAILURE);
+    }
+    if exists {
+        secrets::put_secret_value(aws, name, value)?;
+        println!("{} Stored a new value for {name}", paint("✓", "32"));
+    } else {
+        secrets::create_secret(aws, name, value, description.as_deref())?;
+        println!("{} Created {name}", paint("✓", "32"));
     }
     Ok(ExitCode::SUCCESS)
 }

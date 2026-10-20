@@ -1,6 +1,7 @@
 # dcli
 
-Terminal UI and CLI to deploy and explore AWS: **CodePipeline**, **Parameter Store** and **Lambda**.
+Terminal UI and CLI to deploy and explore AWS: **CodePipeline**, **Parameter Store**, **Secrets
+Manager**, **Lambda** and **CloudWatch Logs**.
 A single ~3 MB binary for macOS, Linux and Windows. No Node.js, no AWS SDK, no runtime.
 
 It reads the same config as the Node.js `deploy-cli` it replaces (`~/.deployment-cli/config.yaml`),
@@ -71,8 +72,16 @@ dcli stop dev app-dev     # --abandon
 dcli logs dev app-dev -f
 dcli report app-dev       # Markdown failure report for an AI agent or an issue (--full: whole log)
 dcli param /app/db/url --decrypt
+dcli param /app/db/url --set "postgres://…" --type SecureString   # create or store a new version
+dcli secret prod/payments/stripe                                  # print a secret (--json: all fields)
+dcli secret dev/api-key --set - --yes < key.txt                   # create or update from stdin
+dcli tail /aws/lambda/orders --since 1h --filter ERROR -f         # CloudWatch Logs, every stream
 dcli lambda dev my-function --json
+dcli update                # update dcli (npm installs update through npm); --check only tells
 ```
+
+Writes (`--set`) ask for confirmation, or for the environment name in production-looking
+environments; `--yes` skips it (needed when the value comes from stdin).
 
 The environment argument is optional everywhere: without it, commands use the current
 environment (`use`, else the first one in the config). A single argument that is not an
@@ -88,8 +97,12 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 |---|---|
 | Everywhere | `:` / `Ctrl+K` go to a module or environment · `Tab` / `1`-`9` switch module · `e` environment · `L` SSO login · `?` help · `q` quit |
 | Pipelines | `↑↓` pipeline · `←→` stage · `d` deploy · `a` approve/reject · `s` stop · `l` logs · `h` history · `o` open in console · `r` refresh · `n` search the account and add pipelines · `x` remove from config · `c` copy a failure report · `C` save it with the full log |
-| Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name |
-| Lambda | `/` search · `v` show env values · `c` copy ARN · `o` open in console · `PgUp/PgDn` scroll |
+| Pipelines (logs) | `l` build log · `z` full screen · `g` compare the commits since the last success |
+| Full-screen logs | `/` search · `n`/`N` next/previous match · `e`/`E` next/previous error · `y` copy every line · `Esc` back. The mouse is left to the terminal: drag to select and copy |
+| Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name · `n` new parameter · `u` new value |
+| Secrets | `/` search · `v` reveal · `c` copy value · `y` copy name · `n` new secret · `u` new value · `o` open in console |
+| Lambda | `/` search · `v` show env values · `c` copy ARN · `l` its logs · `o` open in console · `PgUp/PgDn` scroll |
+| Logs | `Enter` open a log group · `/` search groups · `t` time range · `f` filter pattern · `p` pause/resume live · `z` full screen · `y` copy · `o` console |
 
 Lists with a search box (`:`, `e`, `n`) filter as you type; `Space` marks several items
 where that makes sense and `Ctrl+A` marks every match.
@@ -97,14 +110,16 @@ where that makes sense and `Ctrl+A` marks every match.
 The header shows every module while they fit; with more modules (or a narrow terminal) it
 shows only the current one, and `:` reaches the rest by name.
 
-The mouse works too: wheel to scroll, click to select and switch modules.
+The mouse works too: wheel to scroll, click to select and switch modules. Forms accept pasted
+text (multi-line JSON included); `Ctrl+R` shows a hidden value while typing it.
 
 ### When a pipeline fails
 
 `c` copies a Markdown report of the pipeline's most recent failure, ready to paste into
 Claude Code or any other AI agent (or an issue): the failed stage and action, the error, the
-commit, the failed CodeBuild phase and the useful part of the build log (error lines with the
-lines around them, and the end of the log). `C` saves the report with the whole log to a file
+commit, what changed since the last successful run (with a link comparing the commits), the
+failed CodeBuild phase and the useful part of the build log (error lines with the lines around
+them, and the end of the log), or the failed resources of a CloudFormation deploy. `C` saves the report with the whole log to a file
 and copies its path, for logs too long to paste. `dcli report [env] [pipeline]` prints the same
 report, so an agent can also run it by itself: "run `dcli report dev app-dev` and find out why
 it failed".
@@ -112,8 +127,17 @@ it failed".
 Build logs can contain secrets that the build printed; read the report before sharing it
 outside your team.
 
+The detail panel and `dcli status` also show what changed since the last successful run;
+`g` opens the comparison of those commits (GitHub, GitLab, Bitbucket).
+
 Production-looking environments (`prod`, `prd`, `live`) ask you to type the environment name
-before deploying.
+before deploying and before creating or changing parameters and secrets.
+
+### Updates
+
+`dcli update` downloads the latest release and replaces the binary (checksum verified); when
+dcli was installed with npm it runs `npm install -g @castri1/dcli` instead. The UI checks for a
+new release once a day and tells you; `DCLI_NO_UPDATE_CHECK=1` turns that off.
 
 ## Config
 
@@ -152,20 +176,24 @@ The current environment lives in `~/.deployment-cli/current-env`.
 ```
 src/
   aws/            minimal AWS client: SigV4 signing, profiles, SSO, one shared HTTP agent
-    mod.rs        Aws::call (awsJson1_1) and Aws::rest (restJson1), retries, endpoint
-    codepipeline.rs codebuild.rs logs.rs ssm.rs lambda.rs   typed calls per service
+    mod.rs        Aws::call (awsJson1_1), Aws::rest (restJson1), Aws::query (XML), retries
+    codepipeline.rs codebuild.rs cloudformation.rs logs.rs ssm.rs secrets.rs lambda.rs
   tui/            app shell: header, module palette, environment, toasts, help, SSO login, event loop
     module.rs     the Module trait every module implements
     picker.rs     searchable list, in the UI and inline in the shell
-  modules/        one file per module: pipelines.rs, parameters.rs, lambda.rs
+    logview.rs    log viewer with full screen, search and error jumps (Pipelines, Logs)
+    form.rs       modal forms (new parameter, new secret…)
+  modules/        one file per module: pipelines, parameters, secrets, lambda, cwlogs
   pipeline.rs     CodePipeline domain logic shared by the UI and the CLI
   cli.rs          non-interactive commands
+  report.rs       failure reports
+  update.rs       self-update and the daily new-version check
 ```
 
 Background work runs on plain threads and reports back through a channel, so the UI never
 blocks. There is no async runtime and no AWS SDK: each service is a handful of typed JSON calls.
 
-### Adding a module (e.g. ECS, Secrets Manager, CloudWatch)
+### Adding a module (e.g. ECS, SQS, Step Functions)
 
 1. **AWS calls**: create `src/aws/<service>.rs` with a `Service` constant and functions that
    call `aws.call(&SERVICE, "Operation", &json!({...}))` (or `aws.rest(...)` for REST APIs),

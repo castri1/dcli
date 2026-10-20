@@ -1,5 +1,6 @@
 //! Parameter Store explorer: browse parameters as folders by path, search across all
-//! names, view values (SecureString only on demand) and copy them.
+//! names, view values (SecureString only on demand), copy them, create parameters and
+//! store new values.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -13,6 +14,8 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use super::common::{LoadState, filter_bar, matches_filter};
 use crate::aws::{self, AwsError, ssm};
+use crate::config::is_production;
+use crate::tui::form::{Field, Form, FormEvent};
 use crate::tui::module::{Ctx, Emitter, Handled, Level, Module, Payload, View};
 use crate::tui::theme;
 use crate::tui::widgets::{self, InputEvent, TextInput};
@@ -31,6 +34,16 @@ enum Msg {
     Done,
     Failed(AwsError),
     Value { name: String, decrypt: bool, result: aws::Result<ssm::Parameter> },
+    Saved { name: String, created: bool, result: aws::Result<(i64, Option<ssm::ParameterMetadata>)> },
+}
+
+const TYPES: &[&str] = &["String", "SecureString", "StringList"];
+
+/// The form being filled: a new parameter, or a new value for an existing one.
+struct Editing {
+    form: Form,
+    existing: Option<ssm::ParameterMetadata>,
+    busy: bool,
 }
 
 pub struct Parameters {
@@ -49,6 +62,8 @@ pub struct Parameters {
     copy_after_decrypt: Option<String>,
     detail_scroll: u16,
     list_area: Rect,
+    editing: Option<Editing>,
+    env_name: String,
 }
 
 impl Parameters {
@@ -69,11 +84,15 @@ impl Parameters {
             copy_after_decrypt: None,
             detail_scroll: 0,
             list_area: Rect::default(),
+            editing: None,
+            env_name: String::new(),
         }
     }
 
     fn load(&mut self, ctx: &mut Ctx) {
+        let env_name = std::mem::take(&mut self.env_name);
         *self = Parameters::new();
+        self.env_name = env_name;
         self.load = LoadState::Loading;
         let aws = ctx.env().aws.clone();
         ctx.spawn_stream(move |em: Emitter<Msg>| {
@@ -261,6 +280,92 @@ impl Parameters {
         }
     }
 
+    fn open_form(&mut self, update: bool, ctx: &mut Ctx) {
+        let editing = if update {
+            let Some(p) = self.selected_param().cloned() else { return };
+            if p.kind != "SecureString" && !self.values.contains_key(&p.name) {
+                // Fills the form's value when it arrives (see `task`).
+                self.fetch(p.name.clone(), false, ctx);
+            }
+            let current = match self.value_of(&p).or_else(|| self.decrypted.get(&p.name)) {
+                Some(Ok(v)) => v.value.clone(),
+                _ => String::new(),
+            };
+            let mut value = Field::secret("Value", current);
+            value.masked = p.kind == "SecureString";
+            let mut form = Form::new(
+                format!("New value · {}", p.name),
+                vec![
+                    Field::fixed("Name", p.name.clone()),
+                    Field::fixed("Type", p.kind.clone()),
+                    value,
+                    Field::text("Description", p.description.clone().unwrap_or_default()).optional("optional"),
+                ],
+            );
+            if p.kind == "SecureString" && current_is_empty(&form) {
+                form.note = Some("The current value is not shown until decrypted (v); type the new one.".into());
+            }
+            Editing { form, existing: Some(p), busy: false }
+        } else {
+            let mut value = Field::secret("Value", "").hint("paste works; StringList: a,b,c");
+            value.masked = false;
+            let form = Form::new(
+                format!("New parameter · {}", self.env_name),
+                vec![
+                    Field::text("Name", self.prefix.clone()).hint("/app/prod/db/url"),
+                    Field::choice("Type", TYPES, "String"),
+                    value,
+                    Field::text("Description", "").optional("optional"),
+                ],
+            );
+            Editing { form, existing: None, busy: false }
+        };
+        let form = if is_production(&self.env_name) { editing.form.confirm_with(&self.env_name) } else { editing.form };
+        self.editing = Some(Editing { form, ..editing });
+    }
+
+    fn submit(&mut self, ctx: &mut Ctx) {
+        let Some(editing) = &mut self.editing else { return };
+        let form = &editing.form;
+        let name = form.get("Name").trim().to_string();
+        let value = form.get("Value").to_string();
+        let description = form.get("Description").trim().to_string();
+        let (kind, key_id, created) = match &editing.existing {
+            Some(p) => (p.kind.clone(), p.key_id.clone(), false),
+            None => (form.get("Type").to_string(), None, true),
+        };
+        editing.busy = true;
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || {
+            let description = Some(description.as_str()).filter(|d| !d.is_empty());
+            let result = ssm::put_parameter(&aws, &name, &value, &kind, description, key_id.as_deref(), !created)
+                .and_then(|version| Ok((version, ssm::describe_parameter(&aws, &name)?)));
+            Msg::Saved { name, created, result }
+        });
+    }
+
+    /// Shows a saved parameter: refreshed metadata, its folder open, the cached value dropped.
+    fn on_saved(&mut self, name: String, meta: Option<ssm::ParameterMetadata>) {
+        self.values.remove(&name);
+        self.decrypted.remove(&name);
+        self.revealed.remove(&name);
+        if let Some(meta) = meta {
+            match self.all.iter_mut().find(|p| p.name == name) {
+                Some(p) => *p = meta,
+                None => self.all.push(meta),
+            }
+        }
+        self.prefix = match name.rfind('/') {
+            Some(i) if i > 0 => name[..=i].to_string(),
+            _ => String::new(),
+        };
+        self.filter.clear();
+        self.rebuild();
+        if let Some(pos) = self.entries.iter().position(|e| matches!(e, Entry::Param(i) if self.all[*i].name == name)) {
+            self.select(pos);
+        }
+    }
+
     fn render_list(&mut self, f: &mut Frame, area: Rect, view: &View) {
         self.list_area = area;
         let width = area.width.saturating_sub(4) as usize;
@@ -365,9 +470,9 @@ impl Parameters {
             widgets::section("Value").spans.remove(0),
             Span::styled(
                 match (secure, self.revealed.contains(&p.name)) {
-                    (true, true) => "   v hide · c copy",
-                    (true, false) => "   v reveal · c copy",
-                    _ => "   c copy",
+                    (true, true) => "   v hide · c copy · u new value",
+                    (true, false) => "   v reveal · c copy · u new value",
+                    _ => "   c copy · u new value",
                 },
                 theme::muted(),
             ),
@@ -404,8 +509,9 @@ impl Module for Parameters {
         "SSM Parameter Store · browse folders, search, reveal and copy values"
     }
 
-    fn reset(&mut self, _ctx: &mut Ctx) {
+    fn reset(&mut self, ctx: &mut Ctx) {
         *self = Parameters::new();
+        self.env_name = ctx.env().name.clone();
     }
 
     fn activate(&mut self, ctx: &mut Ctx) {
@@ -415,6 +521,25 @@ impl Module for Parameters {
     }
 
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
+        if let Some(editing) = &mut self.editing {
+            if editing.busy {
+                return Handled::Yes;
+            }
+            let on_type = editing.form.focused_label() == Some("Type");
+            match editing.form.handle(key) {
+                FormEvent::Submit => self.submit(ctx),
+                FormEvent::Cancel => self.editing = None,
+                // SecureString values are typed hidden (Ctrl+R shows them).
+                FormEvent::Pending if on_type => {
+                    let secure = editing.form.get("Type") == "SecureString";
+                    if let Some(f) = editing.form.field_mut("Value") {
+                        f.masked = secure;
+                    }
+                }
+                FormEvent::Pending => {}
+            }
+            return Handled::Yes;
+        }
         let selected = self.list_state.selected().unwrap_or(0);
         if self.filtering {
             match self.filter.handle(key) {
@@ -456,12 +581,17 @@ impl Module for Parameters {
                 }
             }
             KeyCode::Char('r') => self.load(ctx),
+            KeyCode::Char('n') => self.open_form(false, ctx),
+            KeyCode::Char('u') => self.open_form(true, ctx),
             _ => return Handled::No,
         }
         Handled::Yes
     }
 
     fn mouse(&mut self, event: MouseEvent, _ctx: &mut Ctx) -> Handled {
+        if self.editing.is_some() {
+            return Handled::No;
+        }
         let pos = (event.column, event.row).into();
         if !self.list_area.contains(pos) {
             return Handled::No;
@@ -498,8 +628,29 @@ impl Module for Parameters {
             }
             Msg::Done => self.load = LoadState::Loaded,
             Msg::Failed(e) => self.load = LoadState::Failed(e),
+            Msg::Saved { name, created, result } => match result {
+                Ok((version, meta)) => {
+                    self.editing = None;
+                    let what = if created { "Created" } else { "Updated" };
+                    ctx.toast(Level::Success, format!("{what} {name} (version {version})"));
+                    self.on_saved(name, meta);
+                }
+                Err(e) => {
+                    if let Some(editing) = &mut self.editing {
+                        editing.busy = false;
+                        editing.form.fail(e.short());
+                    }
+                }
+            },
             Msg::Value { name, decrypt, result } => {
                 self.in_flight.remove(&(name.clone(), decrypt));
+                // An update form opened before the value loaded starts from it.
+                if let (Some(editing), Ok(v)) = (&mut self.editing, &result)
+                    && editing.existing.as_ref().is_some_and(|p| p.name == name)
+                    && let Some(field) = editing.form.field_mut("Value").filter(|f| f.input.value.is_empty())
+                {
+                    field.input = TextInput::with_value(v.value.clone());
+                }
                 if decrypt {
                     if self.copy_after_decrypt.as_deref() == Some(name.as_str()) {
                         self.copy_after_decrypt = None;
@@ -537,9 +688,16 @@ impl Module for Parameters {
         };
         self.render_list(f, left, view);
         self.render_detail(f, right, view);
+        if let Some(editing) = &self.editing {
+            let color = if is_production(&self.env_name) { theme::ERR } else { theme::ACCENT };
+            editing.form.render(f, area, color);
+        }
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.editing.is_some() {
+            return vec![("Tab", "next field"), ("Enter", "save"), ("Esc", "cancel")];
+        }
         if self.filtering {
             return vec![("Enter", "keep filter"), ("Esc", "clear"), ("↑↓", "move")];
         }
@@ -550,15 +708,33 @@ impl Module for Parameters {
             ("v", "reveal"),
             ("c", "copy value"),
             ("y", "copy name"),
+            ("n", "new"),
+            ("u", "new value"),
             ("r", "reload"),
         ]
     }
 
     fn animating(&self) -> bool {
-        matches!(self.load, LoadState::Loading) || self.pending.is_some() || !self.in_flight.is_empty()
+        matches!(self.load, LoadState::Loading)
+            || self.pending.is_some()
+            || !self.in_flight.is_empty()
+            || self.editing.as_ref().is_some_and(|e| e.busy)
     }
 
     fn capturing(&self) -> bool {
-        self.filtering
+        self.filtering || self.editing.is_some()
     }
+
+    fn paste(&mut self, text: &str, _ctx: &mut Ctx) {
+        if let Some(editing) = &mut self.editing {
+            editing.form.paste(text);
+        } else if self.filtering {
+            self.filter.insert_str(text, false);
+            self.rebuild();
+        }
+    }
+}
+
+fn current_is_empty(form: &Form) -> bool {
+    form.get("Value").is_empty()
 }

@@ -185,6 +185,17 @@ pub fn matches_filter(name: &str, query_lower: &str) -> bool {
     query_lower.split_whitespace().all(|term| name.contains(term))
 }
 
+/// A log line that looks like an error, a failed test or a crash.
+pub fn looks_like_error(line: &str) -> bool {
+    const HINTS: [&str; 15] = [
+        "error", "err!", "fail", "exception", "traceback", "panic", "fatal", "denied", "not found", "cannot ",
+        "unable to", "exit status", "exit code", "✗", "✖",
+    ];
+    let lower = line.to_lowercase();
+    HINTS.iter().any(|h| lower.contains(h))
+        && !["0 error", "0 fail", "no error", "without error"].iter().any(|ok| lower.contains(ok))
+}
+
 /// First line of `s`, trimmed.
 pub fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("").trim()
@@ -262,6 +273,84 @@ pub fn strip_ansi(s: &str) -> String {
 // Encodings
 // ---------------------------------------------------------------------------
 
+/// Text of the first `<tag>…</tag>` in `xml`, entities decoded. Enough for the flat
+/// responses of AWS query APIs; not a general XML parser.
+pub fn xml_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = start + xml[start..].find(&format!("</{tag}>"))?;
+    Some(xml_unescape(&xml[start..end]))
+}
+
+/// The `<tag>…</tag>` blocks of `xml`, in order (list members are `<member>`).
+pub fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        let body = &rest[i + open.len()..];
+        let Some(j) = body.find(&close) else { break };
+        out.push(&body[..j]);
+        rest = &body[j + close.len()..];
+    }
+    out
+}
+
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i..];
+        let Some(end) = after.find(';').filter(|&e| e <= 10) else {
+            out.push('&');
+            rest = &after[1..];
+            continue;
+        };
+        let entity = &after[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix("#x")
+                .map(|h| u32::from_str_radix(h, 16))
+                .or_else(|| entity.strip_prefix('#').map(str::parse::<u32>))
+                .and_then(Result::ok)
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A random-looking UUID (version 4 layout) for idempotency tokens: a SHA-256 of the time,
+/// the process id and a counter. Unique, not a secret.
+pub fn request_token() -> String {
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let seed = format!("{nanos}-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+    let mut b: [u8; 16] = Sha256::digest(seed.as_bytes())[..16].try_into().unwrap_or_default();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex(&b);
+    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -337,6 +426,26 @@ mod tests {
         assert_eq!(sanitize("title\u{1b}]0;x\u{1b}\\ok\u{1b}c"), "titleok");
         assert_eq!(sanitize("fix \u{202e}gnp.exe\u{200b}"), "fix gnp.exe");
         assert_eq!(show_invisible("rm -rf \u{202e}x\u{1b}[2J\n"), "rm -rf \\u{202e}x\\u{1b}[2J\n");
+    }
+
+    #[test]
+    fn request_tokens_are_unique_uuids() {
+        let (a, b) = (request_token(), request_token());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4");
+    }
+
+    #[test]
+    fn xml_helpers() {
+        let xml = "<R><StackEvents><member><Id>1</Id><Reason>a &amp; b &lt;c&gt; &#10;x&#xD;</Reason></member>\
+                   <member><Id>2</Id></member></StackEvents><NextToken>t</NextToken></R>";
+        let members = xml_blocks(xml, "member");
+        assert_eq!(members.len(), 2);
+        assert_eq!(xml_text(members[0], "Reason").as_deref(), Some("a & b <c> \nx\r"));
+        assert_eq!(xml_text(members[1], "Reason"), None);
+        assert_eq!(xml_text(xml, "NextToken").as_deref(), Some("t"));
+        assert_eq!(xml_unescape("AT&T &bogus; ok"), "AT&T &bogus; ok");
     }
 
     #[test]

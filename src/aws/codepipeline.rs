@@ -109,6 +109,8 @@ pub struct ActionExecutionDetail {
 pub struct ActionInput {
     pub action_type_id: Option<ActionTypeId>,
     pub configuration: HashMap<String, String>,
+    /// Set when the action runs in another region than the pipeline.
+    pub region: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

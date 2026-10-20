@@ -5,9 +5,9 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use crate::aws::{self, Aws, codebuild, codepipeline as cp, logs};
+use crate::aws::{self, Aws, cloudformation, codebuild, codepipeline as cp, logs};
 use crate::pipeline::{self, ActionView, StageView, Status};
-use crate::util::{first_line, fmt_ago, fmt_duration, fmt_utc};
+use crate::util::{first_line, fmt_ago, fmt_duration, fmt_utc, looks_like_error};
 
 /// Recent executions searched for the last failure.
 const LOOKBACK: u32 = 10;
@@ -90,6 +90,32 @@ pub fn failure_report(aws: &Aws, env_name: &str, pipeline: &str, full_log: bool)
         }
         let _ = writeln!(md, "- **Commit:** {}", text.trim());
     }
+    match pipeline::last_success(&executions, index) {
+        Some(ok_index) => {
+            let ok = &executions[ok_index];
+            let ok_rev = pipeline::revision(ok, &[]);
+            let when = ok.last_update_time.map(|t| format!(" · {}", fmt_ago(t))).unwrap_or_default();
+            let commit = ok_rev.commit.as_deref().map(|c| format!("`{c}` ")).unwrap_or_default();
+            let _ = writeln!(md, "- **Last success:** {commit}(execution `{}`{when})", short(&ok.pipeline_execution_id));
+            if ok_index > index + 1 {
+                let runs: Vec<String> = executions[index + 1..ok_index]
+                    .iter()
+                    .map(|e| {
+                        let rev = pipeline::revision(e, &[]);
+                        let commit = rev.commit.map(|c| format!(" `{c}`")).unwrap_or_default();
+                        format!("`{}` {}{commit}", short(&e.pipeline_execution_id), Status::parse(&e.status).label())
+                    })
+                    .collect();
+                let _ = writeln!(md, "- **Runs between:** {}", runs.join(" · "));
+            }
+            if let Some(url) = pipeline::compare_url(ok, exec, revision.repo.as_deref()) {
+                let _ = writeln!(md, "- **Changes since the last success:** {url}");
+            }
+        }
+        None => {
+            let _ = writeln!(md, "- **Last success:** none in the last {} runs", executions.len());
+        }
+    }
 
     let failed: Vec<(&StageView, &ActionView)> = stages
         .iter()
@@ -108,6 +134,19 @@ pub fn failure_report(aws: &Aws, env_name: &str, pipeline: &str, full_log: bool)
         }
         if let Some(u) = &action.url {
             let _ = writeln!(md, "- **Console:** {u}");
+        }
+        let detail = details.iter().find(|d| d.stage_name == stage.name && d.action_name == action.name);
+        let input = detail.and_then(|d| d.input.as_ref());
+        if let Some(stack) = input.and_then(|i| i.configuration.get("StackName")) {
+            let regional = input.and_then(|i| i.region.as_deref()).filter(|r| *r != aws.region).map(|r| aws.in_region(r));
+            let since = detail.and_then(|d| d.start_time).or(exec.start_time).unwrap_or(0.0) - 60.0;
+            match cloudformation::stack_events(regional.as_deref().unwrap_or(aws), stack, since, 5) {
+                Ok(events) => write_stack_events(&mut md, stack, &events),
+                Err(e) if e.is_login_required() => return Err(e),
+                Err(e) => {
+                    let _ = writeln!(md, "- Could not read the events of stack `{stack}`: {}", e.short());
+                }
+            }
         }
         let Some(build_id) = &action.build_id else { continue };
         let build = match codebuild::get_build(aws, build_id) {
@@ -178,6 +217,21 @@ pub fn failure_report(aws: &Aws, env_name: &str, pipeline: &str, full_log: bool)
     Ok(Report { markdown: md, execution: Some(id.clone()), log_lines, shown_lines })
 }
 
+/// The failed resources of a stack operation, oldest first: usually the first one is the
+/// cause and the rest are rollbacks or cancellations.
+fn write_stack_events(md: &mut String, stack: &str, events: &[cloudformation::StackEvent]) {
+    let failed: Vec<&cloudformation::StackEvent> = events.iter().rev().filter(|e| e.failed()).take(15).collect();
+    if failed.is_empty() {
+        let _ = writeln!(md, "- **Stack `{stack}`:** no failed resource events during this deploy");
+        return;
+    }
+    let _ = writeln!(md, "- **Stack `{stack}` — failed resources** (oldest first):");
+    for e in failed {
+        let reason = e.reason.as_deref().map(|r| format!(": {}", one_line(r))).unwrap_or_default();
+        let _ = writeln!(md, "  - `{}` ({}) {}{reason}", e.logical_id, e.resource_type, e.status);
+    }
+}
+
 fn short(id: &str) -> &str {
     &id[..8.min(id.len())]
 }
@@ -188,17 +242,6 @@ fn one_line(s: &str) -> String {
 
 fn prefixed(prefix: &str, text: &str) -> String {
     if text.is_empty() { String::new() } else { format!("{prefix}{text}") }
-}
-
-/// Lines that look like an error, a failed test or a crash.
-fn looks_like_error(line: &str) -> bool {
-    const HINTS: [&str; 15] = [
-        "error", "err!", "fail", "exception", "traceback", "panic", "fatal", "denied", "not found", "cannot ",
-        "unable to", "exit status", "exit code", "✗", "✖",
-    ];
-    let lower = line.to_lowercase();
-    HINTS.iter().any(|h| lower.contains(h))
-        && !["0 error", "0 fail", "no error", "without error"].iter().any(|ok| lower.contains(ok))
 }
 
 /// The lines worth reading in a long log: error-looking lines with a little context, earliest

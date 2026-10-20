@@ -162,6 +162,11 @@ impl Picker {
         Outcome::Pending
     }
 
+    pub fn paste(&mut self, text: &str) {
+        self.input.insert_str(text, false);
+        self.refilter();
+    }
+
     /// Height that fits every item, capped at `max`.
     pub fn height(&self, max: u16) -> u16 {
         (self.items.len() as u16 + 5).clamp(7, max.max(7))
