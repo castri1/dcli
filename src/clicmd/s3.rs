@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::aws::{logs, s3};
 use crate::cli::{aws_for, current_env, env_and, paint, print_json};
 use crate::config::Config;
-use crate::util::{display_path, fmt_bytes, fmt_duration, fmt_utc, now_secs, program};
+use crate::util::{display_path, fmt_bytes, fmt_duration, fmt_utc, now_secs, program, show_invisible};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -117,7 +117,7 @@ fn ls(config: &Config, env: &str, uri: Option<&str>, json: bool) -> Result<ExitC
         if json {
             print_json(&json!({ "key": key, "size": info.size, "modified": info.modified, "contentType": info.content_type }));
         } else {
-            println!("{}  {:>9}  {key}", info.modified.map(fmt_utc).unwrap_or_default(), fmt_bytes(info.size));
+            println!("{}  {:>9}  {}", info.modified.map(fmt_utc).unwrap_or_default(), fmt_bytes(info.size), show_invisible(&key));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -130,11 +130,11 @@ fn ls(config: &Config, env: &str, uri: Option<&str>, json: bool) -> Result<ExitC
         return Ok(ExitCode::SUCCESS);
     }
     for f in &folders {
-        println!("{:>16}  {:>9}  {}", "", paint("PRE", "36"), f.strip_prefix(&prefix).unwrap_or(f));
+        println!("{:>16}  {:>9}  {}", "", paint("PRE", "36"), show_invisible(f.strip_prefix(&prefix).unwrap_or(f)));
     }
     for o in &objects {
         let modified = o.modified.map(fmt_utc).unwrap_or_default().replace(" UTC", "");
-        println!("{modified:>16}  {:>9}  {}", fmt_bytes(o.size), o.key.strip_prefix(&prefix).unwrap_or(&o.key));
+        println!("{modified:>16}  {:>9}  {}", fmt_bytes(o.size), show_invisible(o.key.strip_prefix(&prefix).unwrap_or(&o.key)));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -178,6 +178,6 @@ fn get(config: &Config, env: &str, uri: &str, dest: Option<PathBuf>) -> Result<E
         None => PathBuf::from(&name),
     };
     let bytes = s3::download(&regional, &bucket, &key, &path)?;
-    println!("{} Downloaded {} ({}) → {}", paint("✓", "32"), s3::uri(&bucket, &key), fmt_bytes(bytes as i64), display_path(&path));
+    println!("{} Downloaded {} ({}) → {}", paint("✓", "32"), show_invisible(&s3::uri(&bucket, &key)), fmt_bytes(bytes as i64), display_path(&path));
     Ok(ExitCode::SUCCESS)
 }

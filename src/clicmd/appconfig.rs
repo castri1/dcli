@@ -115,7 +115,7 @@ fn show(aws: &Aws, app: &Application, profile: &Profile, json: bool) -> Result<E
     let mut states = Vec::new();
     let mut docs: HashMap<i64, String> = HashMap::new();
     for e in &envs {
-        let state = EnvState::of(&ac::list_deployments(aws, &app.id, &e.id, 2)?, &profile.name);
+        let state = EnvState::of(&ac::list_deployments(aws, &app.id, &e.id, 2)?, &profile.id, &profile.name);
         if let Some(v) = state.version()
             && !docs.contains_key(&v)
         {
@@ -240,7 +240,7 @@ fn show_freeform(
         let version = s.version().map(|v| format!("v{v}")).unwrap_or_else(|| "not deployed".into());
         println!("{}  {}", paint(&e.name, "1"), paint(&version, "90"));
         if let Some(text) = s.version().and_then(|v| docs.get(&v)) {
-            let pretty = crate::util::pretty_json(text).unwrap_or_else(|| text.clone());
+            let pretty = crate::util::sanitize(&crate::util::pretty_json(text).unwrap_or_else(|| text.clone()));
             for line in crate::util::sanitize(&pretty).lines() {
                 println!("  {line}");
             }

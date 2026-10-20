@@ -280,7 +280,8 @@ pub fn downloads_dir() -> PathBuf {
 /// The key's file name, made safe for a path (no separators or control characters).
 pub fn file_name(key: &str) -> String {
     let name = key.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-    let clean: String = name.chars().map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
+    let clean: String =
+        name.chars().map(|c| if crate::util::is_unsafe(c) || matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
     if clean.is_empty() || clean == "." || clean == ".." { "download".into() } else { clean }
 }
 

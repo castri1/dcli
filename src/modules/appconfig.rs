@@ -83,6 +83,10 @@ enum Focus {
 struct Plan {
     env: usize,
     base: Option<i64>,
+    /// What the environment served, and the profile's latest version, when the change was
+    /// made: deploying re-checks both so nobody else's change is overwritten.
+    env_version: Option<i64>,
+    latest: Option<i64>,
     doc: String,
     diff: Vec<String>,
 }
@@ -219,7 +223,7 @@ impl AppConfig {
     fn env_state(&self, env: usize, profile: &Profile) -> EnvState {
         let Some(open) = &self.open else { return EnvState::default() };
         let Some(e) = open.envs.get(env) else { return EnvState::default() };
-        open.deployments.get(&e.id).map(|d| EnvState::of(d, &profile.name)).unwrap_or_default()
+        open.deployments.get(&e.id).map(|d| EnvState::of(d, &profile.id, &profile.name)).unwrap_or_default()
     }
 
     fn doc(&self, profile: &Profile, version: Option<i64>) -> Option<&aws::Result<Doc>> {
@@ -388,7 +392,9 @@ impl AppConfig {
         if diff.is_empty() {
             return Err("Nothing changed".into());
         }
-        Ok(Plan { env, base, doc: newer.to_json(), diff })
+        let env_version = self.env_state(env, profile).version();
+        let latest = self.latest.get(&profile.id).copied().flatten();
+        Ok(Plan { env, base, env_version, latest, doc: newer.to_json(), diff })
     }
 
     fn choose_strategy(&mut self, plan: Plan) {
@@ -421,10 +427,25 @@ impl AppConfig {
         self.dialog = Some(Dialog::Busy(format!("Creating a version and deploying it to {}…", env.name)));
         let description = ellipsize(&format!("dcli: {}", plan.diff.join("; ")), 900);
         let aws = ctx.env().aws.clone();
-        let doc = plan.doc;
+        let (doc, env_version, known_latest) = (plan.doc, plan.env_version, plan.latest);
         ctx.spawn(move || {
             let result = (|| {
+                // Built on what the environment served and the versions that existed when the
+                // change was made: if either moved, someone else changed it meanwhile.
+                let changed = |what: String| {
+                    aws::AwsError::Config(format!("{what} since you opened the editor; press r to reload and edit again"))
+                };
+                let now = EnvState::of(&ac::list_deployments(&aws, &app, &env.id, 2)?, &profile.id, &profile.name);
+                if let Some(active) = &now.active {
+                    return Err(changed(format!("{} started a deployment ({})", env.name, active.progress())));
+                }
+                if now.version() != env_version {
+                    return Err(changed(format!("{} moved to another version", env.name)));
+                }
                 let latest = ac::latest_version(&aws, &app, &profile.id)?;
+                if latest != known_latest {
+                    return Err(changed("A new version of this profile was created".to_string()));
+                }
                 let version = ac::create_hosted_version(&aws, &app, &profile.id, &doc, &description, latest)?;
                 let deployment = ac::start_deployment(&aws, &app, &env.id, &profile.id, version, &strategy.id, &description)?;
                 Ok((version, deployment))

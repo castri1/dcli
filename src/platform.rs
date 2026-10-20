@@ -100,6 +100,8 @@ fn pipe_to(program: &str, args: &[&str], text: &str) -> bool {
 /// Copies to the system clipboard; falls back to the OSC 52 escape sequence,
 /// which most modern terminals (and SSH sessions) understand.
 pub fn copy_to_clipboard(text: &str) -> bool {
+    // Pasted into a terminal, escape sequences or invisible characters would act or hide.
+    let text = &crate::util::sanitize(text);
     let native = if cfg!(target_os = "macos") {
         pipe_to("pbcopy", &[], text)
     } else if cfg!(windows) {

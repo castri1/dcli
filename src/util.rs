@@ -207,7 +207,8 @@ fn is_invisible(c: char) -> bool {
     matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
 }
 
-fn is_unsafe(c: char) -> bool {
+/// Control characters (other than `\n` and `\t`) and invisible formatting characters.
+pub fn is_unsafe(c: char) -> bool {
     (c.is_control() && c != '\n' && c != '\t') || is_invisible(c)
 }
 
@@ -254,6 +255,24 @@ pub fn sanitize(s: &str) -> String {
         }
     }
     out
+}
+
+/// Sanitizes every string and object key of a JSON value in place (documents shown in the
+/// terminal: feature flag definitions, for one).
+pub fn sanitize_json(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::String(s) if s.chars().any(is_unsafe) => *s = sanitize(s),
+        Value::Array(items) => items.iter_mut().for_each(sanitize_json),
+        Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (k, mut v) in entries {
+                sanitize_json(&mut v);
+                map.insert(sanitize(&k), v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// For text that will run (hook commands): every control or invisible character is shown

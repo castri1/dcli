@@ -330,7 +330,7 @@ impl S3 {
         let Some((place, o)) = self.selected_object() else { return };
         let object = (place.bucket.clone(), o.key.clone());
         let items = LINK_TIMES.iter().map(|(label, _)| Item::new(*label, "")).collect();
-        let picker = Picker::new(format!("Download link · {}", s3::file_name(&o.key)), "create", items, false).with_cursor(1);
+        let picker = Picker::new(format!("Download link · {}", show_invisible(&s3::file_name(&o.key))), "create", items, false).with_cursor(1);
         self.link = Some((picker, object));
     }
 
@@ -541,7 +541,7 @@ impl S3 {
                     ("y", "copy URI"),
                     ("o", "console"),
                 ]));
-                format!(" {} ", s3::file_name(&o.key))
+                format!(" {} ", show_invisible(&s3::file_name(&o.key)))
             }
             Some(Entry::Up) => {
                 lines.push(Line::styled("Enter or ← goes up", theme::muted()));
@@ -653,6 +653,12 @@ impl Module for S3 {
             KeyCode::Char('d') => self.download(ctx),
             KeyCode::Char('y') => {
                 if let Some(uri) = self.selected_uri() {
+                    // Copying would change the key (the clipboard is sanitized) or carry escape
+                    // sequences into whatever it is pasted in: refuse instead.
+                    if uri.chars().any(crate::util::is_unsafe) {
+                        ctx.toast(Level::Warn, format!("Not copied: the key has control or invisible characters ({})", show_invisible(&uri)));
+                        return Handled::Yes;
+                    }
                     let ok = crate::platform::copy_to_clipboard(&uri);
                     ctx.toast(if ok { Level::Success } else { Level::Warn }, if ok { format!("Copied {uri}") } else { "Clipboard not available".into() });
                 }

@@ -304,8 +304,15 @@ pub struct EnvState {
 }
 
 impl EnvState {
-    pub fn of(deployments: &[Deployment], profile: &str) -> EnvState {
-        let mine = || deployments.iter().filter(|d| d.configuration_name == profile);
+    /// Matches deployments by profile id when AWS reports it, by name otherwise (two
+    /// profiles may share a name across applications' history).
+    pub fn of(deployments: &[Deployment], profile_id: &str, profile_name: &str) -> EnvState {
+        let mine = || {
+            deployments.iter().filter(|d| match d.configuration_profile_id.as_deref() {
+                Some(id) => id == profile_id,
+                None => d.configuration_name == profile_name,
+            })
+        };
         let deployed = mine().find(|d| d.is_deployed()).cloned();
         let floor = deployed.as_ref().map_or(i64::MIN, |d| d.deployment_number);
         let active = mine().find(|d| d.is_active() && d.deployment_number >= floor).cloned();
@@ -347,8 +354,11 @@ pub struct FlagsDoc {
 
 impl FlagsDoc {
     /// `None` when `text` is not a feature flags document.
+    /// Parses a document; its strings are sanitized, since names, descriptions and values
+    /// are shown in the terminal (an edit writes them back sanitized).
     pub fn parse(text: &str) -> Option<FlagsDoc> {
-        let doc: Value = serde_json::from_str(text).ok()?;
+        let mut doc: Value = serde_json::from_str(text).ok()?;
+        crate::util::sanitize_json(&mut doc);
         doc.get("flags")?.as_object()?;
         Some(FlagsDoc { doc })
     }
@@ -614,14 +624,20 @@ mod tests {
             deployment(6, "flags", "5", "COMPLETE"),
             deployment(5, "flags", "4", "COMPLETE"),
         ];
-        let state = EnvState::of(&deployments, "flags");
+        let state = EnvState::of(&deployments, "p1", "flags");
         assert_eq!(state.version(), Some(5));
         assert_eq!(state.active.as_ref().map(|d| d.deployment_number), Some(9));
         let baking = vec![deployment(3, "flags", "2", "BAKING"), deployment(2, "flags", "1", "COMPLETE")];
-        let state = EnvState::of(&baking, "flags");
+        let state = EnvState::of(&baking, "p1", "flags");
         assert_eq!(state.version(), Some(2));
         assert!(state.active.is_some());
-        assert!(EnvState::of(&[], "flags").deployed.is_none());
+        assert!(EnvState::of(&[], "p1", "flags").deployed.is_none());
+        // With profile ids, a same-named profile of another id is not mixed in.
+        let mut other = deployment(10, "flags", "9", "COMPLETE");
+        other.configuration_profile_id = Some("p2".into());
+        let mut mine = deployment(4, "flags", "3", "COMPLETE");
+        mine.configuration_profile_id = Some("p1".into());
+        assert_eq!(EnvState::of(&[other, mine], "p1", "flags").version(), Some(3));
     }
 
     #[test]
