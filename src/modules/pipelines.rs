@@ -1,0 +1,1525 @@
+//! CodePipeline dashboard: live status of every configured pipeline, stage progress
+//! estimated from recent runs, CodeBuild logs, history, and deploy / approve / stop.
+//! Pipelines are added by searching the account (`n`) and saved to the config file.
+
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+
+use crate::aws::{self, AwsError, codebuild, codepipeline as cp, logs};
+use crate::config::{Hook, PipelineConfig, is_production};
+use crate::pipeline::{self, Approval, StageView, Status};
+use crate::tui::module::{Ctx, Emitter, Handled, Level, Module, Payload, View};
+use crate::tui::picker::{Item, Outcome, Picker};
+use crate::tui::theme;
+use crate::tui::widgets::{self, InputEvent, TextInput};
+use crate::util::{display_path, ellipsize, fmt_ago, fmt_duration, strip_ansi};
+
+const MAX_LOG_LINES: usize = 10_000;
+const AVERAGES_TTL: Duration = Duration::from_secs(15 * 60);
+
+struct Row {
+    cfg: PipelineConfig,
+    state: Option<cp::PipelineState>,
+    latest: Option<cp::ExecutionSummary>,
+    error: Option<AwsError>,
+    loading: bool,
+}
+
+impl Row {
+    fn new(cfg: PipelineConfig) -> Row {
+        Row { cfg, state: None, latest: None, error: None, loading: false }
+    }
+
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+
+    fn exec_status(&self) -> Option<Status> {
+        self.latest.as_ref().map(|l| Status::parse(&l.status))
+    }
+}
+
+struct LogChunk {
+    stream: Option<(String, String)>,
+    lines: Vec<String>,
+    token: Option<String>,
+    build_done: bool,
+    phase: Option<String>,
+}
+
+enum LogsState {
+    Loading,
+    Live,
+    Done,
+    Error(String),
+}
+
+struct LogsPanel {
+    stage: String,
+    action: String,
+    build_id: String,
+    stream: Option<(String, String)>,
+    lines: Vec<String>,
+    token: Option<String>,
+    state: LogsState,
+    phase: Option<String>,
+    in_flight: bool,
+    last_fetch: Instant,
+    /// Lines scrolled up from the bottom; 0 follows the tail.
+    scroll: usize,
+}
+
+#[derive(PartialEq)]
+enum Lower {
+    None,
+    Logs,
+    History,
+}
+
+enum HookState {
+    Running,
+    Failed(String),
+}
+
+enum Dialog {
+    Deploy { name: String, input: TextInput, needs_typing: bool, running: bool, hooks: usize },
+    Approve { name: String, approval: Approval, approve: bool, input: TextInput },
+    Stop { name: String, execution: String, abandon: bool, input: TextInput },
+    Hooks { name: String, lines: Vec<String>, state: HookState },
+    Busy(String),
+    /// Searching the account's pipelines; the names match the picker's items.
+    Add(Picker, Vec<String>),
+    Remove { name: String },
+}
+
+enum Msg {
+    Polled { name: String, result: aws::Result<(cp::PipelineState, Option<cp::ExecutionSummary>)> },
+    Details { name: String, execution: String, result: aws::Result<Vec<cp::ActionExecutionDetail>> },
+    Averages { name: String, result: aws::Result<HashMap<String, f64>> },
+    History { name: String, result: aws::Result<Vec<cp::ExecutionSummary>> },
+    Logs { build_id: String, result: aws::Result<LogChunk> },
+    HookLine { name: String, line: String },
+    HooksDone { name: String, pre_deploy: bool, result: Result<(), String> },
+    Started { name: String, result: aws::Result<String> },
+    Acted { name: String, what: &'static str, result: aws::Result<()> },
+    Discovered(aws::Result<Vec<cp::PipelineSummary>>),
+}
+
+pub struct Pipelines {
+    rows: Vec<Row>,
+    selected: usize,
+    list_state: ListState,
+    /// Stage chosen with ←/→; `None` follows the most relevant stage.
+    stage_cursor: Option<usize>,
+    lower: Lower,
+    poll_every: Duration,
+    last_poll: Option<Instant>,
+    polling: usize,
+    details: HashMap<String, (String, Vec<cp::ActionExecutionDetail>)>,
+    details_loading: HashSet<String>,
+    averages: HashMap<String, (Instant, HashMap<String, f64>)>,
+    averages_loading: HashSet<String>,
+    history: HashMap<String, aws::Result<Vec<cp::ExecutionSummary>>>,
+    history_loading: HashSet<String>,
+    logs: Option<LogsPanel>,
+    dialog: Option<Dialog>,
+    env_name: String,
+    region: String,
+    /// Executions started from this UI → pipeline (for post-deploy hooks).
+    started_by_us: HashMap<String, String>,
+    last_seen: HashMap<String, (String, Status)>,
+    seen_approvals: HashSet<String>,
+    list_area: Rect,
+    logs_area: Rect,
+}
+
+impl Pipelines {
+    pub fn new() -> Pipelines {
+        Pipelines {
+            rows: Vec::new(),
+            selected: 0,
+            list_state: ListState::default(),
+            stage_cursor: None,
+            lower: Lower::History,
+            poll_every: Duration::from_secs(10),
+            last_poll: None,
+            polling: 0,
+            details: HashMap::new(),
+            details_loading: HashSet::new(),
+            averages: HashMap::new(),
+            averages_loading: HashSet::new(),
+            history: HashMap::new(),
+            history_loading: HashSet::new(),
+            logs: None,
+            dialog: None,
+            env_name: String::new(),
+            region: String::new(),
+            started_by_us: HashMap::new(),
+            last_seen: HashMap::new(),
+            seen_approvals: HashSet::new(),
+            list_area: Rect::default(),
+            logs_area: Rect::default(),
+        }
+    }
+
+    fn row(&self) -> Option<&Row> {
+        self.rows.get(self.selected)
+    }
+
+    fn row_by_name(&self, name: &str) -> Option<&Row> {
+        self.rows.iter().find(|r| r.name() == name)
+    }
+
+    fn details_for(&self, row: &Row) -> &[cp::ActionExecutionDetail] {
+        match (self.details.get(row.name()), &row.latest) {
+            (Some((exec, d)), Some(latest)) if *exec == latest.pipeline_execution_id => d,
+            _ => &[],
+        }
+    }
+
+    fn stages(&self, row: &Row) -> Vec<StageView> {
+        match &row.state {
+            Some(state) => pipeline::stages(state, row.latest.as_ref(), self.details_for(row)),
+            None => Vec::new(),
+        }
+    }
+
+    /// Exec status, upgraded to `Approval` when a gate is waiting.
+    fn row_status(&self, row: &Row) -> Option<Status> {
+        let status = row.exec_status()?;
+        if status == Status::InProgress && self.stages(row).iter().any(|s| s.status == Status::Approval) {
+            return Some(Status::Approval);
+        }
+        Some(status)
+    }
+
+    fn any_running(&self) -> bool {
+        self.rows.iter().any(|r| r.exec_status().is_some_and(Status::is_running))
+    }
+
+    /// The stage to highlight: chosen by the user, else running / waiting / failed, else the last.
+    fn current_stage(&self, stages: &[StageView]) -> usize {
+        if let Some(c) = self.stage_cursor {
+            return c.min(stages.len().saturating_sub(1));
+        }
+        stages
+            .iter()
+            .position(|s| matches!(s.status, Status::InProgress | Status::Approval | Status::Stopping))
+            .or_else(|| stages.iter().position(|s| matches!(s.status, Status::Failed | Status::Stopped)))
+            .unwrap_or(stages.len().saturating_sub(1))
+    }
+
+    // ---- loading --------------------------------------------------------------
+
+    fn poll_all(&mut self, ctx: &mut Ctx) {
+        self.last_poll = Some(Instant::now());
+        let aws = ctx.env().aws.clone();
+        for row in &mut self.rows {
+            row.loading = true;
+            self.polling += 1;
+            let aws = aws.clone();
+            let name = row.cfg.name.clone();
+            ctx.spawn(move || {
+                let result = cp::get_pipeline_state(&aws, &name)
+                    .and_then(|state| Ok((state, cp::list_executions(&aws, &name, 1)?.into_iter().next())));
+                Msg::Polled { name, result }
+            });
+        }
+    }
+
+    fn ensure_details(&mut self, ctx: &mut Ctx) {
+        let Some(row) = self.row() else { return };
+        let Some(latest) = &row.latest else { return };
+        let name = row.name().to_string();
+        let execution = latest.pipeline_execution_id.clone();
+        let fresh = self.details.get(&name).is_some_and(|(e, _)| *e == execution);
+        let running = Status::parse(&latest.status).is_running();
+        if (fresh && !running) || self.details_loading.contains(&name) {
+            return;
+        }
+        self.details_loading.insert(name.clone());
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || {
+            let result = cp::list_action_executions(&aws, &name, Some(&execution), 100);
+            Msg::Details { name, execution, result }
+        });
+    }
+
+    fn ensure_averages(&mut self, ctx: &mut Ctx) {
+        let Some(row) = self.row() else { return };
+        let name = row.name().to_string();
+        let fresh = self.averages.get(&name).is_some_and(|(t, _)| t.elapsed() < AVERAGES_TTL);
+        if fresh || self.averages_loading.contains(&name) {
+            return;
+        }
+        self.averages_loading.insert(name.clone());
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || {
+            let result = cp::list_action_executions(&aws, &name, None, 100).map(|d| pipeline::stage_averages(&d));
+            Msg::Averages { name, result }
+        });
+    }
+
+    fn load_history(&mut self, ctx: &mut Ctx) {
+        let Some(row) = self.row() else { return };
+        let name = row.name().to_string();
+        if !self.history_loading.insert(name.clone()) {
+            return;
+        }
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || {
+            let result = cp::list_executions(&aws, &name, 25);
+            Msg::History { name, result }
+        });
+    }
+
+    fn select(&mut self, index: usize, ctx: &mut Ctx) {
+        let index = index.min(self.rows.len().saturating_sub(1));
+        if index != self.selected {
+            self.selected = index;
+            self.stage_cursor = None;
+            if self.lower == Lower::Logs {
+                self.lower = Lower::History;
+                self.logs = None;
+            }
+        }
+        self.list_state.select(Some(index));
+        self.ensure_details(ctx);
+        self.ensure_averages(ctx);
+        if self.lower == Lower::History {
+            self.load_history(ctx);
+        }
+    }
+
+    // ---- logs -------------------------------------------------------------------
+
+    fn toggle_logs(&mut self, ctx: &mut Ctx) {
+        if self.lower == Lower::Logs {
+            self.lower = Lower::History;
+            self.logs = None;
+            return;
+        }
+        let Some(row) = self.row() else { return };
+        let stages = self.stages(row);
+        let current = self.current_stage(&stages);
+        let target = stages
+            .get(current)
+            .and_then(|s| s.build_action().map(|a| (s, a)))
+            .or_else(|| stages.iter().rev().find_map(|s| s.build_action().map(|a| (s, a))));
+        let Some((stage, action)) = target else {
+            ctx.toast(Level::Warn, "No CodeBuild action with logs in this execution");
+            return;
+        };
+        self.logs = Some(LogsPanel {
+            stage: stage.name.clone(),
+            action: action.name.clone(),
+            build_id: action.build_id.clone().unwrap_or_default(),
+            stream: None,
+            lines: Vec::new(),
+            token: None,
+            state: LogsState::Loading,
+            phase: None,
+            in_flight: false,
+            last_fetch: Instant::now(),
+            scroll: 0,
+        });
+        self.lower = Lower::Logs;
+        self.fetch_logs(ctx);
+    }
+
+    fn fetch_logs(&mut self, ctx: &mut Ctx) {
+        let Some(panel) = &mut self.logs else { return };
+        if panel.in_flight {
+            return;
+        }
+        panel.in_flight = true;
+        panel.last_fetch = Instant::now();
+        let aws = ctx.env().aws.clone();
+        let build_id = panel.build_id.clone();
+        let known_stream = panel.stream.clone();
+        let start_token = panel.token.clone();
+        ctx.spawn(move || {
+            let result = (|| -> aws::Result<LogChunk> {
+                let build = codebuild::get_build(&aws, &build_id)?;
+                let build_done = build.as_ref().is_none_or(|b| b.build_status != "IN_PROGRESS");
+                let phase = build.as_ref().and_then(|b| b.current_phase.clone());
+                let stream = known_stream.or_else(|| {
+                    let l = build.as_ref()?.logs.as_ref()?;
+                    Some((l.group_name.clone()?, l.stream_name.clone()?))
+                });
+                let mut chunk = LogChunk { stream: stream.clone(), lines: Vec::new(), token: start_token, build_done, phase };
+                let Some((group, name)) = stream else { return Ok(chunk) };
+                for _ in 0..20 {
+                    let page = match logs::get_log_events(&aws, &group, &name, chunk.token.as_deref()) {
+                        // The stream appears a few seconds after the build starts.
+                        Err(AwsError::Api { code, .. }) if code == "ResourceNotFoundException" => break,
+                        other => other?,
+                    };
+                    let empty = page.events.is_empty();
+                    for event in page.events {
+                        chunk.lines.extend(event.message.lines().map(|l| strip_ansi(l.trim_end())));
+                    }
+                    let same = page.next_forward_token == chunk.token;
+                    chunk.token = page.next_forward_token;
+                    if empty || same {
+                        break;
+                    }
+                }
+                Ok(chunk)
+            })();
+            Msg::Logs { build_id, result }
+        });
+    }
+
+    // ---- actions ----------------------------------------------------------------
+
+    fn open_deploy(&mut self, ctx: &mut Ctx) {
+        let Some(row) = self.row() else { return };
+        self.dialog = Some(Dialog::Deploy {
+            name: row.name().to_string(),
+            input: TextInput::default(),
+            needs_typing: is_production(&self.env_name),
+            running: row.exec_status().is_some_and(Status::is_running),
+            hooks: row.cfg.hooks.pre_deploy.len(),
+        });
+        let _ = ctx;
+    }
+
+    fn begin_deploy(&mut self, name: String, ctx: &mut Ctx) {
+        let hooks = self.row_by_name(&name).map(|r| r.cfg.hooks.pre_deploy.clone()).unwrap_or_default();
+        if hooks.is_empty() {
+            self.start_pipeline(name, ctx);
+            return;
+        }
+        self.dialog = Some(Dialog::Hooks { name: name.clone(), lines: Vec::new(), state: HookState::Running });
+        run_hooks(ctx, name, hooks, true);
+    }
+
+    fn start_pipeline(&mut self, name: String, ctx: &mut Ctx) {
+        self.dialog = Some(Dialog::Busy(format!("Starting {name}…")));
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || {
+            let result = cp::start(&aws, &name);
+            Msg::Started { name, result }
+        });
+    }
+
+    fn open_approve(&mut self, ctx: &mut Ctx) {
+        let Some(row) = self.row() else { return };
+        let approval = pipeline::approvals(&self.stages(row)).into_iter().next();
+        match approval {
+            Some(approval) => {
+                self.dialog = Some(Dialog::Approve {
+                    name: row.name().to_string(),
+                    approval,
+                    approve: true,
+                    input: TextInput::default(),
+                })
+            }
+            None => ctx.toast(Level::Info, format!("{} has no pending approval", row.name())),
+        }
+    }
+
+    fn open_stop(&mut self, ctx: &mut Ctx) {
+        let Some(row) = self.row() else { return };
+        match &row.latest {
+            Some(l) if Status::parse(&l.status) == Status::InProgress => {
+                self.dialog = Some(Dialog::Stop {
+                    name: row.name().to_string(),
+                    execution: l.pipeline_execution_id.clone(),
+                    abandon: false,
+                    input: TextInput::default(),
+                })
+            }
+            _ => ctx.toast(Level::Info, format!("{} is not running", row.name())),
+        }
+    }
+
+    fn dialog_key(&mut self, key: KeyEvent, ctx: &mut Ctx) {
+        let Some(dialog) = &mut self.dialog else { return };
+        match dialog {
+            Dialog::Deploy { name, input, needs_typing, .. } => match key.code {
+                KeyCode::Esc => self.dialog = None,
+                KeyCode::Enter => {
+                    if *needs_typing && input.value.trim() != self.env_name {
+                        ctx.toast(Level::Warn, format!("Type '{}' to confirm", self.env_name));
+                        return;
+                    }
+                    let name = name.clone();
+                    self.begin_deploy(name, ctx);
+                }
+                _ if *needs_typing => {
+                    input.handle(key);
+                }
+                _ => {}
+            },
+            Dialog::Approve { name, approval, approve, input } => match key.code {
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => *approve = !*approve,
+                _ => match input.handle(key) {
+                    InputEvent::Cancel => self.dialog = None,
+                    InputEvent::Submit => {
+                        let (name, a, ok) = (name.clone(), approval.clone(), *approve);
+                        let summary = match input.value.trim() {
+                            "" if ok => "Approved via dcli".to_string(),
+                            "" => "Rejected via dcli".to_string(),
+                            text => text.to_string(),
+                        };
+                        self.dialog = Some(Dialog::Busy(format!(
+                            "{} {}…",
+                            if ok { "Approving" } else { "Rejecting" },
+                            a.action
+                        )));
+                        let aws = ctx.env().aws.clone();
+                        ctx.spawn(move || {
+                            let result = cp::put_approval(&aws, &name, &a.stage, &a.action, &a.token, ok, &summary);
+                            Msg::Acted { name, what: if ok { "approved" } else { "rejected" }, result }
+                        });
+                    }
+                    _ => {}
+                },
+            },
+            Dialog::Stop { name, execution, abandon, input } => match key.code {
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => *abandon = !*abandon,
+                _ => match input.handle(key) {
+                    InputEvent::Cancel => self.dialog = None,
+                    InputEvent::Submit => {
+                        let (name, execution, abandon) = (name.clone(), execution.clone(), *abandon);
+                        let reason = match input.value.trim() {
+                            "" => "Stopped via dcli".to_string(),
+                            text => text.to_string(),
+                        };
+                        self.dialog = Some(Dialog::Busy(format!("Stopping {name}…")));
+                        let aws = ctx.env().aws.clone();
+                        ctx.spawn(move || {
+                            let result = cp::stop(&aws, &name, &execution, abandon, &reason);
+                            Msg::Acted { name, what: "stopped", result }
+                        });
+                    }
+                    _ => {}
+                },
+            },
+            Dialog::Hooks { .. } | Dialog::Busy(_) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    self.dialog = None;
+                }
+            }
+            Dialog::Add(picker, names) => match picker.handle(key) {
+                Outcome::Pending => {}
+                Outcome::Cancel => self.dialog = None,
+                Outcome::Done(chosen) => {
+                    let chosen = chosen.into_iter().map(|i| names[i].clone()).collect();
+                    self.dialog = None;
+                    self.add_pipelines(chosen, ctx);
+                }
+            },
+            Dialog::Remove { name } => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let name = name.clone();
+                    self.dialog = None;
+                    self.remove_pipeline(name, ctx);
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.dialog = None,
+                _ => {}
+            },
+        }
+    }
+
+    fn open_console(&self, ctx: &mut Ctx) {
+        let Some(row) = self.row() else { return };
+        let url = aws::console_url(
+            &self.region,
+            &format!("codesuite/codepipeline/pipelines/{}/view?region={}", row.name(), self.region),
+        );
+        if !crate::platform::open_url(&url) {
+            ctx.toast(Level::Warn, format!("Could not open a browser: {url}"));
+        }
+    }
+
+    fn open_add(&mut self, ctx: &mut Ctx) {
+        self.dialog = Some(Dialog::Busy(format!("Listing pipelines in {}…", self.region)));
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || Msg::Discovered(cp::list_pipelines(&aws)));
+    }
+
+    fn on_discovered(&mut self, result: aws::Result<Vec<cp::PipelineSummary>>, ctx: &mut Ctx) {
+        if !matches!(self.dialog, Some(Dialog::Busy(_))) {
+            return; // closed while loading
+        }
+        self.dialog = None;
+        let all = match result {
+            Ok(all) => all,
+            Err(e) => return self.report(ctx, "Could not list pipelines", e),
+        };
+        let available: Vec<cp::PipelineSummary> =
+            all.iter().filter(|p| self.row_by_name(&p.name).is_none()).cloned().collect();
+        if available.is_empty() {
+            let text = match all.len() {
+                0 => format!("No pipelines in this account ({})", self.region),
+                n => format!("All {n} pipelines in this account are already in {}", self.env_name),
+            };
+            ctx.toast(Level::Info, text);
+            return;
+        }
+        let items = available
+            .iter()
+            .map(|p| Item::new(p.name.as_str(), p.updated.map(|t| format!("updated {}", fmt_ago(t))).unwrap_or_default()))
+            .collect();
+        let title = format!("Add pipelines to {}", self.env_name);
+        let names = available.into_iter().map(|p| p.name).collect();
+        self.dialog = Some(Dialog::Add(Picker::new(title, "add", items, true), names));
+    }
+
+    fn add_pipelines(&mut self, names: Vec<String>, ctx: &mut Ctx) {
+        let (path, added) = match ctx.add_pipelines(&names) {
+            Ok(out) => out,
+            Err(e) => return ctx.toast(Level::Error, format!("Could not save the config: {e:#}")),
+        };
+        let env = ctx.env();
+        let first_new = self.rows.len();
+        for cfg in env.pipelines.iter().filter(|p| names.contains(&p.name)) {
+            if self.row_by_name(&cfg.name).is_none() {
+                self.rows.push(Row::new(cfg.clone()));
+            }
+        }
+        let plural = if added == 1 { "" } else { "s" };
+        ctx.toast(Level::Success, format!("Added {added} pipeline{plural} to {} · {}", self.env_name, display_path(&path)));
+        self.last_poll = None;
+        self.select(first_new, ctx);
+    }
+
+    fn remove_pipeline(&mut self, name: String, ctx: &mut Ctx) {
+        let path = match ctx.remove_pipeline(&name) {
+            Ok(path) => path,
+            Err(e) => return ctx.toast(Level::Error, format!("Could not save the config: {e:#}")),
+        };
+        self.rows.retain(|r| r.name() != name);
+        self.details.remove(&name);
+        self.history.remove(&name);
+        self.last_seen.remove(&name);
+        ctx.toast(Level::Success, format!("Removed {name} from {} · {}", self.env_name, display_path(&path)));
+        if !self.rows.is_empty() {
+            let index = self.selected.min(self.rows.len() - 1);
+            self.selected = usize::MAX; // force a fresh selection
+            self.select(index, ctx);
+        }
+    }
+
+    // ---- results ----------------------------------------------------------------
+
+    fn on_polled(
+        &mut self,
+        name: String,
+        result: aws::Result<(cp::PipelineState, Option<cp::ExecutionSummary>)>,
+        ctx: &mut Ctx,
+    ) {
+        self.polling = self.polling.saturating_sub(1);
+        let Some(index) = self.rows.iter().position(|r| r.name() == name) else { return };
+        let row = &mut self.rows[index];
+        row.loading = false;
+        match result {
+            Ok((state, latest)) => {
+                row.state = Some(state);
+                row.latest = latest;
+                row.error = None;
+            }
+            Err(e) => {
+                row.error = Some(e);
+                return;
+            }
+        }
+        let changed = self.detect_changes(index, ctx);
+        if index == self.selected {
+            self.ensure_details(ctx);
+            self.ensure_averages(ctx);
+            if changed && self.lower == Lower::History {
+                self.load_history(ctx);
+            }
+        }
+    }
+
+    /// Notifications on finished executions and new approvals; post-deploy hooks.
+    /// Returns true when the latest execution or its status changed.
+    fn detect_changes(&mut self, index: usize, ctx: &mut Ctx) -> bool {
+        let row = &self.rows[index];
+        let Some(latest) = row.latest.clone() else { return false };
+        let name = row.name().to_string();
+        let status = Status::parse(&latest.status);
+        let exec = latest.pipeline_execution_id.clone();
+        let approvals = pipeline::approvals(&self.stages(row));
+        let post_hooks = row.cfg.hooks.post_deploy.clone();
+        let seen_before = self.last_seen.contains_key(&name);
+
+        if let Some((prev_exec, prev_status)) = self.last_seen.get(&name)
+            && *prev_exec == exec
+            && prev_status.is_running()
+            && !status.is_running()
+        {
+            let level = if status == Status::Succeeded { Level::Success } else { Level::Error };
+            let took = latest
+                .start_time
+                .zip(latest.last_update_time)
+                .map(|(s, e)| format!(" in {}", fmt_duration(e - s)))
+                .unwrap_or_default();
+            ctx.notify(
+                level,
+                &format!("{name} {}", status.label().to_lowercase()),
+                &format!("{} · {}{took}", self.env_name, &exec[..8.min(exec.len())]),
+            );
+        }
+        for a in &approvals {
+            if self.seen_approvals.insert(a.token.clone()) && seen_before {
+                ctx.notify(Level::Warn, &format!("{name} needs approval"), &format!("{} / {}", a.stage, a.action));
+            }
+        }
+        if status == Status::Succeeded && self.started_by_us.remove(&exec).is_some() && !post_hooks.is_empty() {
+            ctx.toast(Level::Info, format!("Running post-deploy hooks for {name}"));
+            run_hooks(ctx, name.clone(), post_hooks, false);
+        } else if !status.is_running() {
+            self.started_by_us.remove(&exec);
+        }
+        let previous = self.last_seen.insert(name, (exec.clone(), status));
+        previous.is_none_or(|(e, s)| e != exec || s != status)
+    }
+
+    fn handle(&mut self, msg: Msg, ctx: &mut Ctx) {
+        match msg {
+            Msg::Polled { name, result } => self.on_polled(name, result, ctx),
+            Msg::Details { name, execution, result } => {
+                self.details_loading.remove(&name);
+                if let Ok(d) = result {
+                    self.details.insert(name, (execution, d));
+                }
+            }
+            Msg::Averages { name, result } => {
+                self.averages_loading.remove(&name);
+                if let Ok(avg) = result {
+                    self.averages.insert(name, (Instant::now(), avg));
+                }
+            }
+            Msg::History { name, result } => {
+                self.history_loading.remove(&name);
+                self.history.insert(name, result);
+            }
+            Msg::Logs { build_id, result } => {
+                let Some(panel) = self.logs.as_mut().filter(|p| p.build_id == build_id) else { return };
+                panel.in_flight = false;
+                match result {
+                    Ok(chunk) => {
+                        let got_lines = !chunk.lines.is_empty();
+                        panel.stream = chunk.stream.or(panel.stream.take());
+                        panel.lines.extend(chunk.lines);
+                        if panel.lines.len() > MAX_LOG_LINES {
+                            panel.lines.drain(..panel.lines.len() - MAX_LOG_LINES);
+                        }
+                        panel.token = chunk.token;
+                        panel.phase = chunk.phase;
+                        panel.state = if chunk.build_done && !got_lines && panel.stream.is_some() {
+                            LogsState::Done
+                        } else {
+                            LogsState::Live
+                        };
+                    }
+                    Err(e) => panel.state = LogsState::Error(e.short()),
+                }
+            }
+            Msg::HookLine { name, line } => {
+                if let Some(Dialog::Hooks { name: n, lines, .. }) = &mut self.dialog
+                    && *n == name
+                {
+                    lines.push(line);
+                    if lines.len() > 500 {
+                        lines.remove(0);
+                    }
+                }
+            }
+            Msg::HooksDone { name, pre_deploy: true, result: Ok(()) } => {
+                ctx.toast(Level::Success, format!("Pre-deploy hooks passed for {name}"));
+                if matches!(&self.dialog, Some(Dialog::Hooks { name: n, .. }) if *n == name) || self.dialog.is_none() {
+                    self.start_pipeline(name, ctx);
+                }
+            }
+            Msg::HooksDone { name, pre_deploy: true, result: Err(e) } => match &mut self.dialog {
+                Some(Dialog::Hooks { name: n, state, .. }) if *n == name => *state = HookState::Failed(e),
+                _ => ctx.toast(Level::Error, format!("Pre-deploy hook failed for {name}: {e}")),
+            },
+            Msg::HooksDone { name, pre_deploy: false, result } => match result {
+                Ok(()) => ctx.toast(Level::Success, format!("Post-deploy hooks passed for {name}")),
+                Err(e) => ctx.notify(Level::Error, &format!("{name}: post-deploy hook failed"), &e),
+            },
+            Msg::Started { name, result } => {
+                self.dialog = None;
+                match result {
+                    Ok(exec) => {
+                        ctx.toast(Level::Success, format!("Started {name} · {}", &exec[..8.min(exec.len())]));
+                        self.started_by_us.insert(exec, name);
+                        self.last_poll = None;
+                    }
+                    Err(e) => self.report(ctx, &format!("Could not start {name}"), e),
+                }
+            }
+            Msg::Acted { name, what, result } => {
+                self.dialog = None;
+                match result {
+                    Ok(()) => {
+                        ctx.toast(Level::Success, format!("{name} {what}"));
+                        self.last_poll = None;
+                    }
+                    Err(e) => self.report(ctx, &format!("{name}: action failed"), e),
+                }
+            }
+            Msg::Discovered(result) => self.on_discovered(result, ctx),
+        }
+    }
+
+    fn report(&self, ctx: &mut Ctx, what: &str, e: AwsError) {
+        ctx.toast(Level::Error, format!("{what}: {}", e.short()));
+    }
+
+    // ---- rendering --------------------------------------------------------------
+
+    fn render_list(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        self.list_area = area;
+        let inner_width = area.width.saturating_sub(4) as usize;
+        let items: Vec<ListItem> = self
+            .rows
+            .iter()
+            .map(|row| {
+                let status = self.row_status(row);
+                let (symbol, style) = match (status, &row.error) {
+                    (_, Some(_)) => ("!", Style::new().fg(theme::ERR)),
+                    (Some(s), None) => (theme::status_symbol(s, view.tick), theme::status_style(s)),
+                    (None, None) if row.loading => (theme::spinner(view.tick), theme::muted()),
+                    (None, None) => ("○", theme::muted()),
+                };
+                let right = match (&row.latest, status) {
+                    (Some(l), Some(s)) if s.is_running() => {
+                        l.start_time.map(|t| fmt_duration(view.now - t)).unwrap_or_default()
+                    }
+                    (Some(l), _) => l.last_update_time.map(fmt_ago).unwrap_or_default(),
+                    (None, _) if row.error.is_some() => "error".into(),
+                    _ => String::new(),
+                };
+                let name_width = inner_width.saturating_sub(right.chars().count() + 3);
+                let name = ellipsize(row.name(), name_width);
+                let pad = inner_width.saturating_sub(name.chars().count() + right.chars().count() + 2);
+                let subtitle = row
+                    .cfg
+                    .description
+                    .clone()
+                    .or_else(|| row.latest.as_ref().map(|l| pipeline::revision(l, &[]).one_line()))
+                    .unwrap_or_default();
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(format!("{symbol} "), style),
+                        Span::styled(name, theme::bold()),
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(right, theme::muted()),
+                    ]),
+                    Line::styled(format!("  {}", ellipsize(&subtitle, inner_width.saturating_sub(2))), theme::muted()),
+                ])
+            })
+            .collect();
+        let title = format!(" Pipelines · {} ", self.rows.len());
+        let list = List::new(items)
+            .block(widgets::panel(title, self.dialog.is_none()))
+            .highlight_style(theme::selected());
+        f.render_stateful_widget(list, area, &mut self.list_state);
+    }
+
+    fn render_detail(&self, f: &mut Frame, area: Rect, view: &View) {
+        let Some(row) = self.row() else { return };
+        let status = self.row_status(row);
+        let mut block = widgets::panel(Line::from(format!(" {} ", row.name())).bold(), false);
+        if let Some(s) = status {
+            let elapsed = row
+                .latest
+                .as_ref()
+                .and_then(|l| Some(l.last_update_time.filter(|_| !s.is_running()).unwrap_or(view.now) - l.start_time?))
+                .map(|d| format!(" · {}", fmt_duration(d)))
+                .unwrap_or_default();
+            block = block.title_top(
+                Line::from(vec![
+                    Span::styled(format!(" {} {}", theme::status_symbol(s, view.tick), s.label()), theme::status_style(s).bold()),
+                    Span::styled(format!("{elapsed} "), theme::muted()),
+                ])
+                .right_aligned(),
+            );
+        }
+
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(e) = &row.error {
+            let color = if e.is_login_required() { theme::WARN } else { theme::ERR };
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(format!(" {}", e.short()), Style::new().fg(color)));
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
+            return;
+        }
+        let (Some(_), Some(latest)) = (&row.state, &row.latest) else {
+            let text = if row.loading || row.state.is_none() {
+                Line::from(vec![Span::styled(theme::spinner(view.tick), theme::accent()), Span::raw(" Loading…")])
+            } else {
+                Line::styled("No executions yet — press d to deploy", theme::muted())
+            };
+            f.render_widget(widgets::placeholder(text).block(block), area);
+            return;
+        };
+
+        if let Some(d) = &row.cfg.description {
+            lines.push(Line::styled(format!(" {d}"), theme::muted()));
+        }
+        let revision = pipeline::revision(latest, self.details_for(row));
+        let short_exec = &latest.pipeline_execution_id[..8.min(latest.pipeline_execution_id.len())];
+        lines.push(Line::from(vec![
+            Span::styled(" ▸ ", theme::accent()),
+            Span::raw(short_exec.to_string()),
+            Span::styled(
+                format!(
+                    " · {} · started {}",
+                    pipeline::trigger_label(latest),
+                    latest.start_time.map(fmt_ago).unwrap_or_else(|| "—".into())
+                ),
+                theme::muted(),
+            ),
+        ]));
+        if revision.commit.is_some() || revision.message.is_some() {
+            let mut spans = vec![Span::raw("   ")];
+            if let Some(c) = &revision.commit {
+                spans.push(Span::styled(format!("{c} "), Style::new().fg(theme::WARN)));
+            }
+            if let Some(m) = &revision.message {
+                spans.push(Span::raw(format!("\"{}\" ", ellipsize(m, 70))));
+            }
+            if let Some(b) = &revision.branch {
+                spans.push(Span::styled(format!("({b}) "), Style::new().fg(theme::APPROVAL)));
+            }
+            if let Some(r) = &revision.repo {
+                spans.push(Span::styled(r.clone(), theme::muted()));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::raw(""));
+
+        let stages = self.stages(row);
+        let cursor = self.current_stage(&stages);
+        let mut chain = vec![Span::raw(" ")];
+        for (i, s) in stages.iter().enumerate() {
+            if i > 0 {
+                chain.push(Span::styled(" ─ ", theme::muted()));
+            }
+            let mut style = theme::status_style(s.status);
+            if i == cursor {
+                style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            }
+            chain.push(Span::styled(format!("{} {}", theme::status_symbol(s.status, view.tick), s.name), style));
+        }
+        lines.push(Line::from(chain));
+        lines.push(Line::raw(""));
+
+        let name_w = stages.iter().map(|s| s.name.chars().count()).max().unwrap_or(5).clamp(5, 22);
+        let detail_w = (area.width as usize).saturating_sub(name_w + 34).max(10);
+        let averages = self.averages.get(row.name()).map(|(_, a)| a);
+        for (i, s) in stages.iter().enumerate() {
+            let marker = if i == cursor { "▶ " } else { "  " };
+            let time = s.elapsed(view.now).map(fmt_duration).unwrap_or_default();
+            let mut spans = vec![
+                Span::styled(format!(" {marker}"), theme::accent()),
+                Span::styled(format!("{:<name_w$} ", ellipsize(&s.name, name_w)), if i == cursor { theme::bold() } else { Style::new() }),
+                Span::styled(
+                    format!("{} {:<14}", theme::status_symbol(s.status, view.tick), s.status.label()),
+                    theme::status_style(s.status),
+                ),
+                Span::styled(format!("{time:>8}  "), theme::muted()),
+            ];
+            spans.extend(stage_detail(s, averages.and_then(|a| a.get(&s.name)).copied(), view, detail_w));
+            lines.push(Line::from(spans));
+        }
+        if let Some((text, color)) = stages.get(cursor).and_then(stage_note) {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(format!(" {text}"), Style::new().fg(color)));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
+    }
+
+    /// Height of the top panel: header, stage chain, one row per stage, plus the note.
+    fn detail_height(&self, width: u16) -> u16 {
+        let Some(row) = self.row() else { return 0 };
+        let stages = self.stages(row);
+        let note = stages
+            .get(self.current_stage(&stages))
+            .and_then(stage_note)
+            .map_or(0, |(text, _)| 2 + text.chars().count() as u16 / width.saturating_sub(4).max(1));
+        stages.len() as u16 + 9 + note
+    }
+
+    fn render_logs(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        self.logs_area = area;
+        let Some(panel) = &self.logs else { return };
+        let (state_text, state_style) = match &panel.state {
+            LogsState::Loading => (format!("{} loading", theme::spinner(view.tick)), theme::accent()),
+            LogsState::Live if panel.scroll > 0 => (format!("↑ {} lines · End to follow", panel.scroll), theme::muted()),
+            LogsState::Live => (
+                format!("{} following{}", theme::spinner(view.tick), panel.phase.as_deref().map(|p| format!(" · {p}")).unwrap_or_default()),
+                Style::new().fg(theme::RUNNING),
+            ),
+            LogsState::Done => ("build finished".to_string(), theme::muted()),
+            LogsState::Error(e) => (ellipsize(e, 60), Style::new().fg(theme::ERR)),
+        };
+        let block = widgets::panel(format!(" Logs · {} / {} ", panel.stage, panel.action), false)
+            .title_top(Line::styled(format!(" {state_text} "), state_style).right_aligned());
+        let height = area.height.saturating_sub(2) as usize;
+        let end = panel.lines.len().saturating_sub(panel.scroll);
+        let start = end.saturating_sub(height);
+        let lines: Vec<Line> = panel.lines[start..end].iter().map(|l| log_line(l)).collect();
+        if lines.is_empty() {
+            let text = match panel.state {
+                LogsState::Loading | LogsState::Live => "Waiting for log output…",
+                _ => "No log output",
+            };
+            f.render_widget(widgets::placeholder(Line::styled(text, theme::muted())).block(block), area);
+        } else {
+            f.render_widget(Paragraph::new(lines).block(block), area);
+        }
+    }
+
+    fn render_history(&self, f: &mut Frame, area: Rect, view: &View) {
+        let Some(row) = self.row() else { return };
+        let block = widgets::panel(" History ", false);
+        let lines: Vec<Line> = match self.history.get(row.name()) {
+            None => vec![Line::from(vec![
+                Span::styled(format!(" {} ", theme::spinner(view.tick)), theme::accent()),
+                Span::raw("Loading…"),
+            ])],
+            Some(Err(e)) => vec![Line::styled(format!(" {}", e.short()), Style::new().fg(theme::ERR))],
+            Some(Ok(execs)) if execs.is_empty() => vec![Line::styled(" No executions", theme::muted())],
+            Some(Ok(execs)) => execs
+                .iter()
+                .map(|e| {
+                    let s = Status::parse(&e.status);
+                    let duration = e.start_time.zip(e.last_update_time).map(|(a, b)| fmt_duration(b - a)).unwrap_or_default();
+                    let rev = pipeline::revision(e, &[]);
+                    Line::from(vec![
+                        Span::styled(format!(" {} ", theme::status_symbol(s, view.tick)), theme::status_style(s)),
+                        Span::raw(format!("{:<9}", &e.pipeline_execution_id[..8.min(e.pipeline_execution_id.len())])),
+                        Span::styled(format!("{:<12}", s.label()), theme::status_style(s)),
+                        Span::styled(format!("{:<9}", pipeline::trigger_label(e)), theme::muted()),
+                        Span::styled(format!("{:<10}", e.start_time.map(fmt_ago).unwrap_or_default()), theme::muted()),
+                        Span::raw(format!("{duration:<9}")),
+                        Span::styled(rev.commit.unwrap_or_default(), Style::new().fg(theme::WARN)),
+                        Span::raw(format!(" {}", ellipsize(&rev.message.unwrap_or_default(), 60))),
+                    ])
+                })
+                .collect(),
+        };
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_dialog(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        if let Some(Dialog::Add(picker, _)) = &mut self.dialog {
+            let rect = widgets::popup_area(area, 84, picker.height(area.height.saturating_sub(4)));
+            picker.render(f, rect, theme::ACCENT);
+            return;
+        }
+        let Some(dialog) = &self.dialog else { return };
+        match dialog {
+            Dialog::Deploy { name, input, needs_typing, running, hooks } => {
+                let env_color = theme::env_color(&self.env_name);
+                let mut lines = vec![
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::raw("Start "),
+                        Span::styled(name.clone(), theme::bold()),
+                        Span::raw(" in "),
+                        Span::styled(self.env_name.to_uppercase(), Style::new().fg(env_color).bold()),
+                        Span::raw("?"),
+                    ]),
+                    Line::raw(""),
+                ];
+                if *running {
+                    lines.push(Line::styled(
+                        "! It is running now; a new execution will supersede it.",
+                        Style::new().fg(theme::WARN),
+                    ));
+                }
+                if *hooks > 0 {
+                    lines.push(Line::styled(format!("Runs {hooks} pre-deploy hook(s) first."), theme::muted()));
+                }
+                let mut cursor = None;
+                if *needs_typing {
+                    if *running || *hooks > 0 {
+                        lines.push(Line::raw(""));
+                    }
+                    lines.push(Line::raw(format!("Type '{}' to confirm:", self.env_name)));
+                    let (line, col) = input.line("› ", "");
+                    cursor = Some((lines.len() as u16, col));
+                    lines.push(line);
+                }
+                lines.push(Line::raw(""));
+                lines.push(widgets::hints_line(&[("Enter", "deploy"), ("Esc", "cancel")]));
+                let rect = widgets::popup_area(area, 64, lines.len() as u16 + 2);
+                widgets::popup(f, rect, "Deploy", env_color, Text::from(lines));
+                if let Some((row, col)) = cursor {
+                    f.set_cursor_position((rect.x + 1 + col, rect.y + 1 + row));
+                }
+            }
+            Dialog::Approve { name, approval, approve, input } => {
+                let choice = |label: &'static str, on: bool, color| {
+                    if on {
+                        Span::styled(format!(" {label} "), Style::new().fg(ratatui::style::Color::Black).bg(color).bold())
+                    } else {
+                        Span::styled(format!(" {label} "), theme::muted())
+                    }
+                };
+                let mut lines = vec![
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled(name.clone(), theme::bold()),
+                        Span::styled(format!(" · {} / {}", approval.stage, approval.action), theme::muted()),
+                    ]),
+                ];
+                if let Some(s) = &approval.summary {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::raw(s.clone()));
+                }
+                if let Some(u) = &approval.url {
+                    lines.push(Line::styled(u.clone(), theme::accent()));
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    choice("✓ Approve", *approve, theme::OK),
+                    Span::raw("  "),
+                    choice("✗ Reject", !*approve, theme::ERR),
+                    Span::styled("   Tab to switch", theme::muted()),
+                ]));
+                lines.push(Line::raw(""));
+                let (line, col) = input.line("Comment › ", "optional");
+                let input_row = lines.len() as u16;
+                lines.push(line);
+                lines.push(Line::raw(""));
+                lines.push(widgets::hints_line(&[("Enter", "submit"), ("Esc", "cancel")]));
+                let rect = widgets::popup_area(area, 72, lines.len() as u16 + 2);
+                widgets::popup(f, rect, "Manual approval", theme::APPROVAL, Text::from(lines));
+                f.set_cursor_position((rect.x + 1 + col, rect.y + 1 + input_row));
+            }
+            Dialog::Stop { name, execution, abandon, input } => {
+                let mode = if *abandon {
+                    Span::styled("Abandon: stop now, without waiting for running actions", Style::new().fg(theme::ERR))
+                } else {
+                    Span::styled("Stop and wait: let running actions finish", Style::new().fg(theme::WARN))
+                };
+                let mut lines = vec![
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::raw("Stop "),
+                        Span::styled(name.clone(), theme::bold()),
+                        Span::styled(format!(" · {}", &execution[..8.min(execution.len())]), theme::muted()),
+                    ]),
+                    Line::raw(""),
+                    Line::from(vec![mode, Span::styled("   Tab to switch", theme::muted())]),
+                    Line::raw(""),
+                ];
+                let (line, col) = input.line("Reason › ", "optional");
+                let input_row = lines.len() as u16;
+                lines.push(line);
+                lines.push(Line::raw(""));
+                lines.push(widgets::hints_line(&[("Enter", "stop"), ("Esc", "cancel")]));
+                let rect = widgets::popup_area(area, 72, lines.len() as u16 + 2);
+                widgets::popup(f, rect, "Stop execution", theme::WARN, Text::from(lines));
+                f.set_cursor_position((rect.x + 1 + col, rect.y + 1 + input_row));
+            }
+            Dialog::Hooks { name, lines, state } => {
+                let height = area.height.saturating_sub(6).min(24);
+                let mut text = vec![match state {
+                    HookState::Running => Line::from(vec![
+                        Span::styled(format!("{} ", theme::spinner(view.tick)), theme::accent()),
+                        Span::raw(format!("Running pre-deploy hooks for {name}…")),
+                    ]),
+                    HookState::Failed(e) => Line::styled(
+                        format!("✗ Pre-deploy hook failed ({e}). Deployment aborted."),
+                        Style::new().fg(theme::ERR),
+                    ),
+                }];
+                text.push(Line::raw(""));
+                let room = height.saturating_sub(5) as usize;
+                for l in lines.iter().skip(lines.len().saturating_sub(room)) {
+                    let style = if l.starts_with('✓') {
+                        Style::new().fg(theme::OK)
+                    } else if l.starts_with('✗') {
+                        Style::new().fg(theme::ERR)
+                    } else if l.starts_with('▸') {
+                        theme::accent()
+                    } else {
+                        theme::muted()
+                    };
+                    text.push(Line::styled(l.clone(), style));
+                }
+                let color = if matches!(state, HookState::Failed(_)) { theme::ERR } else { theme::ACCENT };
+                widgets::popup(f, widgets::popup_area(area, 100, height), "Hooks", color, Text::from(text));
+            }
+            Dialog::Busy(text) => {
+                let body = Text::from(vec![
+                    Line::raw(""),
+                    Line::from(vec![Span::styled(format!("{} ", theme::spinner(view.tick)), theme::accent()), Span::raw(text.clone())]),
+                ]);
+                widgets::popup(f, widgets::popup_area(area, 50, 5), "Working", theme::ACCENT, body);
+            }
+            Dialog::Add(..) => {}
+            Dialog::Remove { name } => {
+                let lines = vec![
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::raw("Remove "),
+                        Span::styled(name.clone(), theme::bold()),
+                        Span::raw(" from "),
+                        Span::styled(self.env_name.to_uppercase(), Style::new().fg(theme::env_color(&self.env_name)).bold()),
+                        Span::raw(" in your config?"),
+                    ]),
+                    Line::styled("The pipeline in AWS is not touched; add it back with n.", theme::muted()),
+                    Line::raw(""),
+                    widgets::hints_line(&[("Enter", "remove"), ("Esc", "cancel")]),
+                ];
+                let rect = widgets::popup_area(area, 72, lines.len() as u16 + 2);
+                widgets::popup(f, rect, "Remove from config", theme::WARN, Text::from(lines));
+            }
+        }
+    }
+}
+
+/// Last column of a stage row: progress, approval prompt, error or provider.
+fn stage_detail(s: &StageView, average: Option<f64>, view: &View, width: usize) -> Vec<Span<'static>> {
+    match s.status {
+        Status::InProgress => {
+            let elapsed = s.elapsed(view.now).unwrap_or(0.0);
+            let bar_w = 16.min(width.saturating_sub(4)).max(4);
+            if let Some(pct) = s.actions.iter().find_map(|a| a.percent) {
+                let mut spans = widgets::progress_bar(f64::from(pct) / 100.0, bar_w, theme::RUNNING);
+                spans.push(Span::styled(format!(" {pct}%"), theme::muted()));
+                return spans;
+            }
+            match average {
+                Some(avg) if avg > 0.0 && elapsed <= avg => {
+                    let mut spans = widgets::progress_bar(elapsed / avg, bar_w, theme::RUNNING);
+                    spans.push(Span::styled(
+                        format!(" ~{}% · ≈{} left", ((elapsed / avg) * 100.0) as u32, fmt_duration(avg - elapsed)),
+                        theme::muted(),
+                    ));
+                    spans
+                }
+                Some(avg) if avg > 0.0 => {
+                    let mut spans = widgets::progress_bar(1.0, bar_w, theme::WARN);
+                    spans.push(Span::styled(format!(" slower than usual (avg {})", fmt_duration(avg)), Style::new().fg(theme::WARN)));
+                    spans
+                }
+                _ => widgets::indeterminate_bar(view.tick, bar_w, theme::RUNNING),
+            }
+        }
+        Status::Approval => vec![Span::styled("waiting for approval · press a", Style::new().fg(theme::APPROVAL))],
+        Status::Failed => {
+            vec![Span::styled(ellipsize(s.error().unwrap_or("failed"), width), Style::new().fg(theme::ERR))]
+        }
+        _ => {
+            let providers: Vec<&str> = s.actions.iter().filter_map(|a| a.provider.as_deref()).collect();
+            let text = if !providers.is_empty() {
+                providers.join(", ")
+            } else if s.actions.len() > 1 {
+                format!("{} actions", s.actions.len())
+            } else {
+                String::new()
+            };
+            vec![Span::styled(ellipsize(&text, width), theme::muted())]
+        }
+    }
+}
+
+/// Full text worth showing under the stage table: the error or the approval request.
+fn stage_note(s: &StageView) -> Option<(String, ratatui::style::Color)> {
+    match s.status {
+        Status::Failed => s.error().map(|e| (format!("✗ {e}"), theme::ERR)),
+        Status::Approval => s
+            .actions
+            .iter()
+            .find_map(|a| a.summary.clone())
+            .map(|summary| (format!("◆ {summary}"), theme::APPROVAL)),
+        _ => None,
+    }
+}
+
+fn log_line(l: &str) -> Line<'static> {
+    let lower = l.to_ascii_lowercase();
+    let style = if lower.contains("error") || lower.contains("failed") || lower.contains("exception") {
+        Style::new().fg(theme::ERR)
+    } else if lower.contains("warn") {
+        Style::new().fg(theme::WARN)
+    } else if l.starts_with("[Container]") {
+        theme::accent()
+    } else {
+        Style::new()
+    };
+    Line::styled(format!(" {l}"), style)
+}
+
+fn run_hooks(ctx: &mut Ctx, name: String, hooks: Vec<Hook>, pre_deploy: bool) {
+    ctx.spawn_stream(move |em: Emitter<Msg>| {
+        let line = |em: &Emitter<Msg>, line: String| em.emit(Msg::HookLine { name: name.clone(), line });
+        for hook in &hooks {
+            line(&em, format!("▸ {}", hook.label()));
+            let outcome = crate::hooks::run_captured(hook, |l| {
+                line(&em, format!("  {l}"));
+            });
+            let took = fmt_duration(outcome.duration.as_secs_f64());
+            if !outcome.success {
+                line(&em, format!("✗ {} — {} ({took})", hook.label(), outcome.detail));
+                em.emit(Msg::HooksDone {
+                    name: name.clone(),
+                    pre_deploy,
+                    result: Err(format!("{}: {}", hook.label(), outcome.detail)),
+                });
+                return;
+            }
+            line(&em, format!("✓ {} ({took})", hook.label()));
+        }
+        em.emit(Msg::HooksDone { name: name.clone(), pre_deploy, result: Ok(()) });
+    });
+}
+
+impl Module for Pipelines {
+    fn title(&self) -> &'static str {
+        "Pipelines"
+    }
+
+    fn description(&self) -> &'static str {
+        "CodePipeline · status, deploy, approve, logs, history"
+    }
+
+    fn reset(&mut self, ctx: &mut Ctx) {
+        let env = ctx.env();
+        let poll = ctx.config().defaults.poll_interval_seconds.max(3);
+        *self = Pipelines::new();
+        self.poll_every = Duration::from_secs(poll);
+        self.env_name = env.name.clone();
+        self.region = env.region.clone();
+        self.rows = env.pipelines.iter().cloned().map(Row::new).collect();
+        self.list_state.select(Some(0));
+    }
+
+    fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
+        if self.dialog.is_some() {
+            self.dialog_key(key, ctx);
+            return Handled::Yes;
+        }
+        let stage_count = self.row().map(|r| self.stages(r).len()).unwrap_or(0);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1), ctx),
+            KeyCode::Down | KeyCode::Char('j') => self.select(self.selected + 1, ctx),
+            KeyCode::Left | KeyCode::Right if stage_count > 0 => {
+                let stages = self.row().map(|r| self.stages(r)).unwrap_or_default();
+                let current = self.current_stage(&stages);
+                self.stage_cursor = Some(if key.code == KeyCode::Left {
+                    current.saturating_sub(1)
+                } else {
+                    (current + 1).min(stage_count - 1)
+                });
+            }
+            KeyCode::Char('d') => self.open_deploy(ctx),
+            KeyCode::Char('a') => self.open_approve(ctx),
+            KeyCode::Char('s') => self.open_stop(ctx),
+            KeyCode::Char('l') => self.toggle_logs(ctx),
+            KeyCode::Char('h') => {
+                if self.lower == Lower::History {
+                    self.lower = Lower::None;
+                } else {
+                    self.lower = Lower::History;
+                    self.logs = None;
+                    self.load_history(ctx);
+                }
+            }
+            KeyCode::Char('o') => self.open_console(ctx),
+            KeyCode::Char('r') => {
+                self.last_poll = None;
+                self.averages.clear();
+                if self.lower == Lower::History {
+                    self.load_history(ctx);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('+') => self.open_add(ctx),
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if let Some(row) = self.row() {
+                    self.dialog = Some(Dialog::Remove { name: row.name().to_string() });
+                }
+            }
+            KeyCode::Esc if self.lower != Lower::None => {
+                self.lower = Lower::None;
+                self.logs = None;
+            }
+            KeyCode::PageUp => {
+                if let Some(p) = &mut self.logs {
+                    p.scroll = (p.scroll + 10).min(p.lines.len().saturating_sub(1));
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(p) = &mut self.logs {
+                    p.scroll = p.scroll.saturating_sub(10);
+                }
+            }
+            KeyCode::End => {
+                if let Some(p) = &mut self.logs {
+                    p.scroll = 0;
+                }
+            }
+            _ => return Handled::No,
+        }
+        Handled::Yes
+    }
+
+    fn mouse(&mut self, event: MouseEvent, ctx: &mut Ctx) -> Handled {
+        if self.dialog.is_some() {
+            return Handled::No;
+        }
+        let pos = (event.column, event.row).into();
+        let in_logs = self.lower == Lower::Logs && self.logs_area.contains(pos);
+        match event.kind {
+            MouseEventKind::ScrollUp if in_logs => {
+                if let Some(p) = &mut self.logs {
+                    p.scroll = (p.scroll + 3).min(p.lines.len().saturating_sub(1));
+                }
+            }
+            MouseEventKind::ScrollDown if in_logs => {
+                if let Some(p) = &mut self.logs {
+                    p.scroll = p.scroll.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollUp if self.list_area.contains(pos) => self.select(self.selected.saturating_sub(1), ctx),
+            MouseEventKind::ScrollDown if self.list_area.contains(pos) => self.select(self.selected + 1, ctx),
+            MouseEventKind::Down(MouseButton::Left) if self.list_area.contains(pos) => {
+                let offset = self.list_state.offset();
+                let index = offset + (event.row.saturating_sub(self.list_area.y + 1) / 2) as usize;
+                if index < self.rows.len() {
+                    self.select(index, ctx);
+                }
+            }
+            _ => return Handled::No,
+        }
+        Handled::Yes
+    }
+
+    fn task(&mut self, payload: Payload, ctx: &mut Ctx) {
+        if let Ok(msg) = payload.downcast::<Msg>() {
+            self.handle(*msg, ctx);
+        }
+    }
+
+    fn tick(&mut self, ctx: &mut Ctx, active: bool) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let every = if self.any_running() { self.poll_every.min(Duration::from_secs(5)) } else { self.poll_every };
+        if self.polling == 0 && self.last_poll.is_none_or(|t| t.elapsed() >= every) {
+            self.poll_all(ctx);
+        }
+        let follow = self.logs.as_ref().is_some_and(|p| {
+            matches!(p.state, LogsState::Live) && !p.in_flight && p.last_fetch.elapsed() >= Duration::from_secs(2)
+        });
+        if active && follow {
+            self.fetch_logs(ctx);
+        }
+        let history_missing = self.row().is_some_and(|r| !self.history.contains_key(r.name()));
+        if active && self.lower == Lower::History && history_missing {
+            self.load_history(ctx);
+        }
+    }
+
+    fn render(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        if self.rows.is_empty() {
+            let text = Text::from(vec![
+                Line::raw(""),
+                Line::styled("No pipelines configured for this environment.", theme::bold()).centered(),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled("Press ", theme::muted()),
+                    Span::styled("n", theme::key()),
+                    Span::styled(" to search this AWS account's pipelines and add them.", theme::muted()),
+                ])
+                .centered(),
+            ]);
+            f.render_widget(Paragraph::new(text).block(widgets::panel(" Pipelines ", true)), area);
+            self.render_dialog(f, area, view);
+            return;
+        }
+        let narrow = area.width < 90;
+        let (list_area, detail_area) = if narrow {
+            let list_h = (self.rows.len() as u16 * 2 + 2).min(area.height / 3).max(4);
+            let [a, b] = area.layout(&Layout::vertical([Constraint::Length(list_h), Constraint::Fill(1)]));
+            (a, b)
+        } else {
+            let list_w = (area.width / 3).clamp(30, 46);
+            let [a, b] = area.layout(&Layout::horizontal([Constraint::Length(list_w), Constraint::Fill(1)]));
+            (a, b)
+        };
+        self.render_list(f, list_area, view);
+
+        let top_h = self.detail_height(detail_area.width).min(detail_area.height);
+        if self.lower == Lower::None {
+            self.render_detail(f, detail_area, view);
+        } else {
+            let [top, bottom] =
+                detail_area.layout(&Layout::vertical([Constraint::Length(top_h), Constraint::Fill(1)]));
+            self.render_detail(f, top, view);
+            match self.lower {
+                Lower::Logs => self.render_logs(f, bottom, view),
+                Lower::History => self.render_history(f, bottom, view),
+                Lower::None => {}
+            }
+        }
+        self.render_dialog(f, area, view);
+    }
+
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        match &self.dialog {
+            Some(Dialog::Deploy { .. }) => vec![("Enter", "deploy"), ("Esc", "cancel")],
+            Some(Dialog::Approve { .. }) | Some(Dialog::Stop { .. }) => {
+                vec![("Tab", "switch"), ("Enter", "submit"), ("Esc", "cancel")]
+            }
+            Some(Dialog::Add(..)) => vec![("Space", "mark"), ("Enter", "add"), ("Esc", "cancel")],
+            Some(Dialog::Remove { .. }) => vec![("Enter", "remove"), ("Esc", "cancel")],
+            Some(_) => vec![("Esc", "close")],
+            None if self.rows.is_empty() => vec![("n", "add pipelines")],
+            None => {
+                let mut h = vec![
+                    ("↑↓", "pipeline"),
+                    ("←→", "stage"),
+                    ("d", "deploy"),
+                    ("a", "approve"),
+                    ("s", "stop"),
+                    ("l", "logs"),
+                    ("h", "history"),
+                    ("o", "console"),
+                    ("r", "refresh"),
+                    ("n", "add"),
+                    ("x", "remove"),
+                ];
+                if self.lower == Lower::Logs {
+                    h.push(("PgUp/PgDn", "scroll"));
+                }
+                h
+            }
+        }
+    }
+
+    fn animating(&self) -> bool {
+        self.any_running()
+            || self.rows.iter().any(|r| r.loading && r.state.is_none())
+            || matches!(self.dialog, Some(Dialog::Busy(_)) | Some(Dialog::Hooks { state: HookState::Running, .. }))
+            || self.logs.as_ref().is_some_and(|p| matches!(p.state, LogsState::Loading | LogsState::Live))
+            || (self.lower == Lower::History && self.row().is_some_and(|r| !self.history.contains_key(r.name())))
+    }
+
+    fn capturing(&self) -> bool {
+        self.dialog.is_some()
+    }
+}

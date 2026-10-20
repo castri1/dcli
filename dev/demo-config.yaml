@@ -1,0 +1,23 @@
+environments:
+  dev:
+    profile: ""
+    region: us-east-1
+    pipelines:
+      - name: app-dev
+        description: "Main application - Dev"
+        hooks:
+          pre-deploy:
+            - command: echo "running unit tests" && echo "42 passed"
+              description: Run unit tests
+      - name: api-dev
+        description: "Public API - Dev"
+      - name: worker-dev
+  prod:
+    profile: ""
+    region: us-east-1
+    pipelines:
+      - name: app-prod
+        description: "Main application - Production"
+defaults:
+  pollIntervalSeconds: 5
+  notifications: false
