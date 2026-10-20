@@ -41,6 +41,8 @@ pub struct Lambda {
     detail_scroll: u16,
     region: String,
     list_area: Rect,
+    /// Function another module asked to show, selected once the list has it.
+    open_target: Option<String>,
 }
 
 impl Lambda {
@@ -59,7 +61,27 @@ impl Lambda {
             detail_scroll: 0,
             region: String::new(),
             list_area: Rect::default(),
+            open_target: None,
         }
+    }
+
+    /// Selects the function in `open_target` if it is loaded (clearing a filter that
+    /// hides it). True when done.
+    fn try_open(&mut self) -> bool {
+        let Some(name) = self.open_target.clone() else { return false };
+        if !self.functions.iter().any(|f| f.function_name == name) {
+            return false;
+        }
+        if !self.visible.iter().any(|&i| self.functions[i].function_name == name) {
+            self.filter.clear();
+            self.filtering = false;
+            self.rebuild();
+        }
+        if let Some(pos) = self.visible.iter().position(|&i| self.functions[i].function_name == name) {
+            self.select(pos);
+        }
+        self.open_target = None;
+        true
     }
 
     fn load(&mut self, ctx: &mut Ctx) {
@@ -441,6 +463,12 @@ impl Module for Lambda {
         Handled::Yes
     }
 
+    /// Selects function `target` (from an EventBridge target, say), now or once loaded.
+    fn open(&mut self, target: &str, _ctx: &mut Ctx) {
+        self.open_target = Some(target.to_string());
+        self.try_open();
+    }
+
     fn task(&mut self, payload: Payload, _ctx: &mut Ctx) {
         let Ok(msg) = payload.downcast::<Msg>() else { return };
         match *msg {
@@ -448,7 +476,7 @@ impl Module for Lambda {
                 let first = self.functions.is_empty();
                 self.functions.extend(page);
                 self.rebuild();
-                if first {
+                if !self.try_open() && first {
                     self.select(0);
                 }
             }
