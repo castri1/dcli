@@ -33,11 +33,15 @@ def new_run(name, offset, mode="run", trigger="Webhook"):
 
 COMMITS = [("3f9e1a2b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f", "fix(payments): retry on timeout"),
            ("9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b", "chore: bump queue client"),
-           ("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "feat: earlier change")]
+           ("5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c", "feat(orders): split shipments"),
+           ("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "feat: earlier change"),
+           ("0f1e2d3c4b5a69788796a5b4c3d2e1f0a9b8c7d6", "chore: initial pipeline")]
 
 
 def revision(name, k):
-    """Source revision of the current run (k=0) or the k-th history entry."""
+    """Source revision of the current run (k=0) or the k-th history entry. A pipeline's
+    "lag" makes it run older commits, like a later environment of the same app."""
+    k += PIPES.get(name, {}).get("lag", 0)
     sha, msg = COMMITS[min(k, len(COMMITS) - 1)]
     return [{"actionName": "Source", "revisionId": sha,
              "revisionUrl": f"https://github.com/acme/{name}/commit/{sha}",
@@ -51,6 +55,10 @@ PIPES["worker-dev"]["history"][0] = (eid(), "Failed", time.time() - 86400 - 3600
 new_run("infra-dev", 900, "cfnfail")
 new_run("app-prod", 0, "idle")
 PIPES["app-prod"]["exec"] = None
+PIPES["app-prod"]["lag"] = 2
+new_run("app-qa", 0, "idle")
+PIPES["app-qa"]["exec"] = None
+PIPES["app-qa"]["lag"] = 1
 # In the account but not in demo-config.yaml: found with `n` (add pipelines); they get a
 # finished run when first looked at.
 UNLISTED = ["legacy-batch", "billing-dev", "billing-prod", "search-indexer-dev", "notifications-v2-dev",

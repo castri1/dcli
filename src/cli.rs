@@ -56,6 +56,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// What is deployed where: the commit each environment runs, per application
+    Matrix {
+        #[arg(long)]
+        json: bool,
+    },
     /// Status of a pipeline's latest execution
     Status {
         /// Environment (default: the current one, see `use`)
@@ -470,6 +475,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Remove { env, pipeline } => remove(&mut loaded, env, pipeline),
         Command::Login { env } => login(config, env.as_deref()),
         Command::List { json } => list(config, &loaded.source, json),
+        Command::Matrix { json } => matrix(config, json),
         Command::Status { env, pipeline, json } => status(&target(config, env, pipeline)?, json),
         Command::History { env, pipeline, limit, json } => history(&target(config, env, pipeline)?, limit, json),
         Command::Deploy { env, pipeline, skip_hooks, yes, no_wait } => {
@@ -672,6 +678,137 @@ fn list(config: &Config, source: &config::Source, json: bool) -> Result<ExitCode
             );
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn matrix(config: &Config, json: bool) -> Result<ExitCode> {
+    use crate::matrix::{Cell, Drift, drift, layout};
+    let (envs, apps) = layout(config);
+    // Every cell in parallel; an expired session marks its environment, without prompting.
+    let cells: Vec<Vec<Option<std::result::Result<Cell, AwsError>>>> = std::thread::scope(|scope| {
+        let handles: Vec<Vec<_>> = apps
+            .iter()
+            .map(|app| {
+                app.pipelines
+                    .iter()
+                    .zip(&envs)
+                    .map(|(pipeline, env_name)| {
+                        let pipeline = pipeline.clone()?;
+                        let env = &config.environments[env_name];
+                        let aws = Aws::new(&env.profile, &env.region);
+                        Some(scope.spawn(move || Cell::fetch(&aws, &pipeline)))
+                    })
+                    .collect()
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|row| row.into_iter().map(|h| h.map(|h| h.join().unwrap_or_else(|_| Err(AwsError::Network("panicked".into()))))).collect())
+            .collect()
+    });
+    let ok = |r: usize, c: usize| cells[r][c].as_ref().and_then(|x| x.as_ref().ok());
+    let left_of = |r: usize, c: usize| (0..c).rev().find(|&l| apps[r].pipelines[l].is_some());
+    let drift_of = |r: usize, c: usize| {
+        let l = left_of(r, c)?;
+        Some((l, drift(ok(r, l)?, ok(r, c)?)?))
+    };
+
+    if json {
+        let rows: Vec<Value> = apps
+            .iter()
+            .enumerate()
+            .map(|(r, app)| {
+                let mut per_env = serde_json::Map::new();
+                for (c, env_name) in envs.iter().enumerate() {
+                    let value = match (&app.pipelines[c], &cells[r][c]) {
+                        (None, _) | (_, None) => Value::Null,
+                        (Some(p), Some(Err(e))) => json!({ "pipeline": p, "error": e.short(), "loginRequired": e.is_login_required() }),
+                        (Some(p), Some(Ok(cell))) => {
+                            let exec = |e: &cp::ExecutionSummary| {
+                                let rev = pipeline::revision(e, &[]);
+                                json!({
+                                    "execution": e.pipeline_execution_id,
+                                    "status": Status::parse(&e.status).label(),
+                                    "commit": crate::matrix::commit_of(e),
+                                    "message": rev.message,
+                                    "time": e.last_update_time.or(e.start_time),
+                                })
+                            };
+                            let drift = drift_of(r, c).map(|(l, d)| match d {
+                                Drift::InSync => json!({ "against": envs[l], "status": "in_sync" }),
+                                Drift::Behind(n) => json!({ "against": envs[l], "status": "behind", "deploys": n }),
+                                Drift::Differs => json!({ "against": envs[l], "status": "differs" }),
+                            });
+                            json!({ "pipeline": p, "deployed": cell.deployed().map(exec), "now": cell.activity().map(exec), "drift": drift })
+                        }
+                    };
+                    per_env.insert(env_name.clone(), value);
+                }
+                json!({ "app": app.name, "environments": per_env })
+            })
+            .collect();
+        print_json(&json!({ "environments": envs, "apps": rows }));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let app_w = apps.iter().map(|a| a.name.chars().count()).max().unwrap_or(3).max(3) + 2;
+    let col_w = 22;
+    let mut header = format!("{:<app_w$}", "");
+    for e in &envs {
+        header.push_str(&paint(&format!("{e:<col_w$}"), if config::is_production(e) { "31;1" } else { "32;1" }));
+    }
+    println!("{header}");
+    let mut notes = Vec::new();
+    let mut login_needed = std::collections::BTreeSet::new();
+    for (r, app) in apps.iter().enumerate() {
+        let mut line = paint(&format!("{:<app_w$}", app.name), "1");
+        for c in 0..envs.len() {
+            let (text, code) = match &cells[r][c] {
+                None => ("—".to_string(), "90"),
+                Some(Err(e)) if e.is_login_required() => {
+                    login_needed.insert(envs[c].clone());
+                    ("sign in".to_string(), "33")
+                }
+                Some(Err(_)) => ("! error".to_string(), "31"),
+                Some(Ok(cell)) => match cell.deployed() {
+                    None => ("no success yet".to_string(), "90"),
+                    Some(d) => {
+                        let commit = pipeline::revision(d, &[]).commit.unwrap_or_default();
+                        let when = d.last_update_time.map(fmt_ago).unwrap_or_default().replace(" ago", "");
+                        let symbol = match cell.activity().map(|a| Status::parse(&a.status)) {
+                            Some(s) if s.is_running() => "↻",
+                            Some(Status::Failed) => "✗",
+                            _ => "✓",
+                        };
+                        match drift_of(r, c) {
+                            Some((l, Drift::Behind(n))) => {
+                                notes.push(format!("{}: {} is {n} deploy{} behind {}", app.name, envs[c], if n == 1 { "" } else { "s" }, envs[l]));
+                                (format!("{symbol} {commit} {when} ↓{n}"), "33")
+                            }
+                            Some((l, Drift::Differs)) => {
+                                notes.push(format!("{}: {} runs a commit not in {}'s recent history", app.name, envs[c], envs[l]));
+                                (format!("{symbol} {commit} {when} ≠"), "33")
+                            }
+                            _ => (format!("{symbol} {commit} {when}"), "0"),
+                        }
+                    }
+                },
+            };
+            line.push_str(&paint(&format!("{text:<col_w$}"), code));
+        }
+        println!("{line}");
+    }
+    if !notes.is_empty() {
+        println!();
+        for n in notes {
+            println!("{}", paint(&n, "33"));
+        }
+    }
+    if !login_needed.is_empty() {
+        let list: Vec<String> = login_needed.into_iter().collect();
+        println!("\n{}", paint(&format!("Session expired for {}: {} login <env>", list.join(", "), program()), "33"));
+    }
+    println!("{}", paint("✓ deployed · ↻ deploying now · ✗ last run failed · ↓n deploys behind the environment to the left", "90"));
     Ok(ExitCode::SUCCESS)
 }
 

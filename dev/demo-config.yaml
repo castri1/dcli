@@ -14,6 +14,12 @@ environments:
       - name: worker-dev
       - name: infra-dev
         description: "Infrastructure (CloudFormation) - Dev"
+  qa:
+    profile: ""
+    region: us-east-1
+    pipelines:
+      - name: app-qa
+        description: "Main application - QA"
   prod:
     profile: ""
     region: us-east-1

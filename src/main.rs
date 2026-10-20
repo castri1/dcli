@@ -2,6 +2,7 @@ mod aws;
 mod cli;
 mod config;
 mod hooks;
+mod matrix;
 mod modules;
 mod pipeline;
 mod platform;

@@ -60,6 +60,7 @@ pub struct App {
     started: Instant,
     tab_hits: Vec<(Rect, usize)>,
     login_running: bool,
+    login_profile: String,
     pub quit: bool,
 }
 
@@ -94,11 +95,21 @@ impl App {
             modules,
             active: 0,
             activated: vec![false; count],
-            shared: Shared { env, loaded, tx, generation: 0, toasts: Vec::new(), jump: None },
+            shared: Shared {
+                env,
+                loaded,
+                tx,
+                generation: 0,
+                toasts: Vec::new(),
+                jump: None,
+                switch_env: None,
+                login: None,
+            },
             overlay: None,
             started: Instant::now(),
             tab_hits: Vec::new(),
             login_running: false,
+            login_profile: String::new(),
             quit: false,
         };
         app.reset_modules();
@@ -185,11 +196,17 @@ impl App {
                 }
             }
         }
+        if let Some(name) = self.shared.switch_env.take() {
+            self.switch_env(&name);
+        }
         if let Some((title, target)) = self.shared.jump.take()
             && let Some(i) = self.modules.iter().position(|m| m.title() == title)
         {
             self.select_module(i);
             self.with_module(i, |m, ctx| m.open(&target, ctx));
+        }
+        if let Some(profile) = self.shared.login.take() {
+            self.start_login_for(profile);
         }
     }
 
@@ -213,7 +230,7 @@ impl App {
             KeyCode::Char(':') => self.open_palette(true),
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => self.open_palette(true),
             KeyCode::Char('e') => self.open_palette(false),
-            KeyCode::Char('L') => self.start_login(),
+            KeyCode::Char('L') => self.start_login_for(self.shared.env.profile.clone()),
             KeyCode::Tab => self.select_module((active + 1) % self.modules.len()),
             KeyCode::BackTab => self.select_module((active + self.modules.len() - 1) % self.modules.len()),
             KeyCode::Char(c @ '1'..='9') => self.select_module(c as usize - '1' as usize),
@@ -302,17 +319,18 @@ impl App {
 
     // ---- SSO login --------------------------------------------------------------
 
-    fn start_login(&mut self) {
-        let env = self.shared.env.clone();
-        self.overlay = Some(Overlay::Login { profile: effective_profile(&env.profile), lines: Vec::new(), error: None });
+    /// SSO sign-in for `profile` (the current environment's, or another one's).
+    fn start_login_for(&mut self, profile: String) {
+        self.overlay = Some(Overlay::Login { profile: effective_profile(&profile), lines: Vec::new(), error: None });
         if self.login_running {
             return;
         }
         self.login_running = true;
+        self.login_profile = profile.clone();
         let tx = self.shared.tx.clone();
         std::thread::spawn(move || {
             let send = |m: LoginMsg| tx.send(AppEvent::Task { module: APP, generation: 0, payload: Box::new(m) });
-            let child = sso_login_command(&env.profile)
+            let child = sso_login_command(&profile)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -386,9 +404,11 @@ impl App {
                 if matches!(self.overlay, Some(Overlay::Login { .. })) {
                     self.overlay = None;
                 }
+                // Credentials are cached per profile: drop the signed-in one's.
+                crate::aws::CredentialProvider::for_profile(&self.login_profile).invalidate();
                 self.shared.env.aws.reset_credentials();
                 let mut ctx = Ctx { shared: &mut self.shared, module: APP };
-                ctx.toast(Level::Success, "Signed in to AWS");
+                ctx.toast(Level::Success, format!("Signed in to AWS ({})", effective_profile(&self.login_profile)));
                 self.reset_modules();
             }
             LoginMsg::Done(Err(e)) => {

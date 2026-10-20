@@ -1,7 +1,7 @@
 # dcli
 
-Terminal UI and CLI to deploy and explore AWS: **CodePipeline**, **Parameter Store**, **Secrets
-Manager**, **Lambda** and **CloudWatch Logs**.
+Terminal UI and CLI to deploy and explore AWS: **CodePipeline** (with a matrix of what is deployed
+where), **Parameter Store**, **Secrets Manager**, **Lambda** and **CloudWatch Logs**.
 A single ~3 MB binary for macOS, Linux and Windows. No Node.js, no AWS SDK, no runtime.
 
 It reads the same config as the Node.js `deploy-cli` it replaces (`~/.deployment-cli/config.yaml`),
@@ -66,6 +66,7 @@ dcli remove dev app-dev   # remove from the config (the pipeline in AWS is untou
 dcli login                # AWS SSO sign-in for the current environment
 dcli status app-dev       # --json for scripts
 dcli history dev app-dev -n 20
+dcli matrix               # what is deployed where: commit per environment, drift (--json)
 dcli deploy               # picks a pipeline, runs hooks, starts and follows it (exit code = result)
 dcli approve dev app-dev  # --reject, -m "comment"
 dcli stop dev app-dev     # --abandon
@@ -97,6 +98,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 |---|---|
 | Everywhere | `:` / `Ctrl+K` go to a module or environment · `Tab` / `1`-`9` switch module · `e` environment · `L` SSO login · `?` help · `q` quit |
 | Pipelines | `↑↓` pipeline · `←→` stage · `d` deploy · `a` approve/reject · `s` stop · `l` logs · `h` history · `o` open in console · `r` refresh · `n` search the account and add pipelines · `x` remove from config · `c` copy a failure report · `C` save it with the full log |
+| Matrix | `↑↓←→` move · `Enter` open the pipeline in that environment (or sign in) · `g` compare with the environment to the left · `r` refresh |
 | Pipelines (logs) | `l` build log · `z` full screen · `g` compare the commits since the last success |
 | Full-screen logs | `/` search · `n`/`N` next/previous match · `e`/`E` next/previous error · `y` copy every line · `Esc` back. The mouse is left to the terminal: drag to select and copy |
 | Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name · `n` new parameter · `u` new value |
@@ -132,6 +134,31 @@ The detail panel and `dcli status` also show what changed since the last success
 
 Production-looking environments (`prod`, `prd`, `live`) ask you to type the environment name
 before deploying and before creating or changing parameters and secrets.
+
+### What is deployed where
+
+The Matrix module (and `dcli matrix`) shows one row per application and one column per
+environment, in the order of your config, which is read as the promotion order (dev → qa →
+prod, or uat → prod…). Each cell is the commit of that pipeline's last successful run, with
+what is deploying now and how many deploys it trails the environment to its left. Pipelines
+are grouped into applications when they share a name across environments, or when their names
+only differ by the environment (`orders-uat`, `orders-prod`); otherwise set the same `app:` on
+them:
+
+```yaml
+environments:
+  uat:
+    pipelines:
+      - name: billing-v2-uat
+        app: billing
+  prod:
+    pipelines:
+      - name: legacy-billing-live
+        app: billing
+```
+
+Every environment is queried, so each needs a valid AWS session: an expired one shows
+"sign in" in its cells, and Enter there signs in.
 
 ### Updates
 
@@ -183,8 +210,9 @@ src/
     picker.rs     searchable list, in the UI and inline in the shell
     logview.rs    log viewer with full screen, search and error jumps (Pipelines, Logs)
     form.rs       modal forms (new parameter, new secret…)
-  modules/        one file per module: pipelines, parameters, secrets, lambda, cwlogs
+  modules/        one file per module: pipelines, matrix, parameters, secrets, lambda, cwlogs
   pipeline.rs     CodePipeline domain logic shared by the UI and the CLI
+  matrix.rs       applications × environments: grouping, deployed commit, drift
   cli.rs          non-interactive commands
   report.rs       failure reports
   update.rs       self-update and the daily new-version check

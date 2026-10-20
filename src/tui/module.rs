@@ -59,6 +59,10 @@ pub struct Shared {
     pub toasts: Vec<Toast>,
     /// A module asked to show another one: (module title, what to open there).
     pub jump: Option<(&'static str, String)>,
+    /// A module asked to switch to this environment (before the jump, if any).
+    pub switch_env: Option<String>,
+    /// A module asked for an SSO sign-in with this profile.
+    pub login: Option<String>,
 }
 
 /// Per-frame values for rendering.
@@ -177,6 +181,16 @@ impl Ctx<'_> {
     /// (Lambda → its log group in Logs, for example).
     pub fn jump(&mut self, module: &'static str, target: impl Into<String>) {
         self.shared.jump = Some((module, target.into()));
+    }
+
+    /// Switches the whole app to environment `name` (the matrix opening a cell, say).
+    pub fn switch_env(&mut self, name: impl Into<String>) {
+        self.shared.switch_env = Some(name.into());
+    }
+
+    /// Starts an SSO sign-in for `profile`, which may belong to another environment.
+    pub fn login(&mut self, profile: impl Into<String>) {
+        self.shared.login = Some(profile.into());
     }
 
     /// Toast plus a desktop notification when enabled in the config.

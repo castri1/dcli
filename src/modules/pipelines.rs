@@ -1442,6 +1442,13 @@ impl Module for Pipelines {
         self.list_state.select(Some(0));
     }
 
+    /// Selects pipeline `target` (from the matrix, say).
+    fn open(&mut self, target: &str, ctx: &mut Ctx) {
+        if let Some(i) = self.rows.iter().position(|r| r.name() == target) {
+            self.select(i, ctx);
+        }
+    }
+
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
         if self.dialog.is_some() {
             self.dialog_key(key, ctx);

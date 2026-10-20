@@ -36,6 +36,10 @@ pub struct PipelineConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Groups pipelines of different environments into one row of the matrix when their
+    /// names do not already match (`orders-uat` and `orders-prod` match as `orders`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
     #[serde(default, skip_serializing_if = "Hooks::is_empty")]
     pub hooks: Hooks,
 }
@@ -195,6 +199,7 @@ impl Config {
                 for p in &mut env.pipelines {
                     p.name = sanitize(&p.name);
                     p.description = p.description.as_deref().map(sanitize);
+                    p.app = p.app.as_deref().map(sanitize);
                     for h in p.hooks.pre_deploy.iter_mut().chain(&mut p.hooks.post_deploy) {
                         h.description = h.description.as_deref().map(sanitize);
                     }
