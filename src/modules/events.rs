@@ -243,6 +243,10 @@ impl EventBridge {
             Some((name, _, _)) => format!("Prefilled from rule {name}. Enter checks it against the rule's pattern first."),
             None => "No rule with a pattern selected: Enter sends it as is.".into(),
         });
+        form = form.enter_submits().submit_label(if rule.is_some() { "check / send" } else { "send" });
+        if rule.is_some() {
+            form = form.focus_on("Detail");
+        }
         if is_production(&self.env_name) {
             form = form.confirm_with(&self.env_name);
         }
@@ -473,7 +477,7 @@ impl EventBridge {
                     let name_style = if selected { theme::selected() } else { theme::bold() };
                     lines.push(Line::from(vec![
                         Span::styled(marker, theme::accent()),
-                        Span::styled(format!("{:<15}", t.kind()), Style::new().fg(theme::APPROVAL)),
+                        Span::styled(format!("{:<15} ", t.kind()), Style::new().fg(theme::APPROVAL)),
                         Span::styled(t.name(), name_style),
                     ]));
                     let mut extra = vec![format!("id {}", t.id), format!("input: {}", t.input_summary())];
@@ -485,7 +489,7 @@ impl EventBridge {
                     {
                         extra.push(format!("retries {n}"));
                     }
-                    lines.push(Line::styled(format!("                 {}", extra.join(" · ")), theme::muted()));
+                    lines.push(Line::styled(format!("{:18}{}", "", extra.join(" · ")), theme::muted()));
                 }
             }
         }

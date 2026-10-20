@@ -410,7 +410,7 @@ impl DynamoDb {
                 ". The partition key is the whole key: it reads that one item (GetItem)."
             });
         }
-        let mut form = Form::new(format!("Query · {}", desc.table_name), fields);
+        let mut form = Form::new(format!("Query · {}", desc.table_name), fields).enter_submits().submit_label("query");
         form.note = Some(note);
         self.dialog = Some(Dialog::Query { form, index });
     }

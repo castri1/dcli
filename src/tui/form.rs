@@ -88,12 +88,37 @@ pub struct Form {
     error: Option<String>,
     /// Shown under the fields.
     pub note: Option<String>,
+    /// What submitting does, for the hints.
+    submit_label: &'static str,
+    /// Enter submits from any field instead of moving to the next one.
+    enter_submits: bool,
 }
 
 impl Form {
     pub fn new(title: impl Into<String>, fields: Vec<Field>) -> Form {
         let focus = fields.iter().position(Field::editable).unwrap_or(0);
-        Form { title: title.into(), fields, focus, confirm: None, error: None, note: None }
+        Form { title: title.into(), fields, focus, confirm: None, error: None, note: None, submit_label: "save", enter_submits: false }
+    }
+
+    /// Names what submitting does in the hints ("save" by default).
+    pub fn submit_label(mut self, label: &'static str) -> Form {
+        self.submit_label = label;
+        self
+    }
+
+    /// Enter submits from any field (search-like forms whose later fields are optional
+    /// or prefilled); Tab still moves between fields.
+    pub fn enter_submits(mut self) -> Form {
+        self.enter_submits = true;
+        self
+    }
+
+    /// Starts on the field `label` instead of the first editable one.
+    pub fn focus_on(mut self, label: &str) -> Form {
+        if let Some(i) = self.fields.iter().position(|f| f.label == label && f.editable()) {
+            self.focus = i;
+        }
+        self
     }
 
     /// Requires typing `env_name` before submitting.
@@ -161,7 +186,7 @@ impl Form {
                 }
             }
             KeyCode::Enter => {
-                if self.focus + 1 < self.stops() {
+                if self.focus + 1 < self.stops() && !self.enter_submits {
                     self.step(true);
                 } else if self.validate() {
                     return FormEvent::Submit;
@@ -257,7 +282,7 @@ impl Form {
             lines.push(Line::styled(format!("✗ {e}"), Style::new().fg(theme::ERR)));
         }
         lines.push(Line::raw(""));
-        let mut hints = vec![("Tab", "next field"), ("Enter", "save"), ("Esc", "cancel")];
+        let mut hints = vec![("Tab", "next field"), ("Enter", self.submit_label), ("Esc", "cancel")];
         if self.fields.iter().any(|f| matches!(f.kind, Kind::Choice(_))) {
             hints.insert(1, ("←→", "choose"));
         }
@@ -319,6 +344,15 @@ mod tests {
         assert_eq!(form.get("Type"), "SecureString");
         assert_eq!(form.get("Value"), "line1\nline2");
         assert_eq!(form.get("Description"), "");
+    }
+
+    #[test]
+    fn enter_can_submit_from_any_field() {
+        let mut form = Form::new("Find", vec![Field::text("Key", "c-1"), Field::text("Sort", "").optional("")]).enter_submits();
+        assert!(matches!(press(&mut form, KeyCode::Enter), FormEvent::Submit));
+        let mut form = form.confirm_with("prod");
+        assert!(matches!(press(&mut form, KeyCode::Enter), FormEvent::Pending));
+        assert_eq!(form.error.as_deref(), Some("Type 'prod' to confirm"));
     }
 
     #[test]

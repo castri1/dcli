@@ -352,7 +352,8 @@ impl StepFunctions {
         let mut form = Form::new(
             format!("Start execution · {}", machine.name),
             vec![Field::fixed("Machine", machine.name.clone()), Field::text("Name", "").optional("generated"), value],
-        );
+        )
+        .submit_label("start");
         form.note = Some(if self.screen == Screen::Executions {
             "Input copied from the selected execution; edit it before starting.".into()
         } else {
@@ -374,7 +375,8 @@ impl StepFunctions {
                 Field::text("Error", "").optional("e.g. Manual.Stop"),
                 Field::text("Cause", "").optional("why it was stopped"),
             ],
-        );
+        )
+        .submit_label("stop");
         let form = if is_production(&self.env_name) { form.confirm_with(&self.env_name) } else { form };
         self.dialog = Some(Dialog::Form { form, action: Action::Stop { execution_arn: e.execution_arn }, busy: false });
     }

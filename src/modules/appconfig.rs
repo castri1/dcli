@@ -357,7 +357,7 @@ impl AppConfig {
                 Field::text(name, current.map(ac::value_text).unwrap_or_default()).optional(kind_hint(attr.kind.as_deref()))
             });
         }
-        let mut form = Form::new(format!("Edit flag · {} · {}", profile.name, env.name), fields);
+        let mut form = Form::new(format!("Edit flag · {} · {}", profile.name, env.name), fields).submit_label("review");
         form.note = Some("Next: review the change and pick a deployment strategy.".into());
         self.dialog = Some(Dialog::Edit { form, env: self.col, flag, base });
     }
