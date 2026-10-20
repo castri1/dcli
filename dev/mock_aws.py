@@ -481,9 +481,141 @@ def lambda_rest(path):
 
 
 # ---- S3 (restXml, path-style) --------------------------------------------------------------
+import gzip  # noqa: E402  (S3 mock data)
+import re  # noqa: E402
+from email.utils import formatdate  # noqa: E402
+from urllib.parse import unquote  # noqa: E402
+from xml.sax.saxutils import escape as xml_escape  # noqa: E402
+
+
+def s3_obj(body, ctype="text/plain", meta=None, storage="STANDARD", age=86400.0):
+    data = body if isinstance(body, bytes) else body.encode()
+    return {"body": data, "type": ctype, "meta": meta or {}, "storage": storage, "modified": time.time() - age}
+
+
+# Bucket → region. acme-logs-archive gets no BucketRegion in ListBuckets, like older APIs,
+# so dcli has to ask GetBucketLocation.
+S3_BUCKETS = {"acme-app-assets": "us-east-1", "acme-reports.eu": "eu-west-1", "acme-logs-archive": "us-west-2"}
+S3_OBJECTS = {
+    "acme-app-assets": {
+        "index.html": s3_obj("<!doctype html>\n<html><body><h1>Acme</h1></body></html>\n", "text/html"),
+        "config/app.json": s3_obj(json.dumps({"api": "https://api.acme.dev", "retries": 3, "regions": ["us-east-1", "eu-west-1"]}),
+                                  "application/json", {"owner": "platform", "deployed-by": "pipeline"}),
+        "config/feature-flags.json": s3_obj(json.dumps({"newCheckout": True, "betaSearch": False}), "application/json"),
+        "images/logo.png": s3_obj(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(256)) * 8, "image/png"),
+        "docs/READ ME.md": s3_obj("# Acme assets\n\nStatic files served by the CDN.\n", "text/markdown", {"owner": "web"}),
+        "exports/": s3_obj(b"", "application/x-directory"),
+        **{f"exports/orders-{i:04}.csv": s3_obj(f"id,total\n{i},{i * 3.5:.2f}\n", "text/csv", age=3600.0 * (i % 48))
+           for i in range(2500)},
+    },
+    "acme-reports.eu": {
+        **{f"2026/10/sales-2026-10-{d:02}.csv": s3_obj("day,store,amount\n" + "".join(f"{d},store-{s},{s * 97 % 1000}\n" for s in range(40)),
+                                                      "text/csv", storage="STANDARD_IA") for d in range(1, 20)},
+        "2026/09/summary.json": s3_obj(json.dumps({"month": "2026-09", "total": 1234567.89}), "application/json"),
+    },
+    "acme-logs-archive": {
+        "app/2026-10-19.log": s3_obj("".join(f"2026-10-19T{i // 3600 % 24:02}:{i // 60 % 60:02}:{i % 60:02}Z INFO request {i} handled in {i % 300} ms\n"
+                                             for i in range(3000)), "text/plain", storage="GLACIER_IR"),
+        "app/2026-10-18.log.gz": s3_obj(gzip.compress(b"compressed log line\n" * 200), "application/gzip"),
+    },
+}
+
+
+def s3_error(status, code, message, extra=None):
+    body = f"<Error><Code>{code}</Code><Message>{xml_escape(message)}</Message></Error>".encode()
+    return status, {"content-type": "application/xml", **(extra or {})}, body
+
+
+def s3_signed_region(query, headers):
+    """The region the request was signed for (header or presigned query)."""
+    cred = query.get("X-Amz-Credential") or headers.get("authorization", "")
+    m = re.search(r"/\d{8}/([a-z0-9-]+)/s3/", cred)
+    return m.group(1) if m else None
+
+
+def s3_iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+
 def s3_rest(method, path, query, headers):
     """S3 requests: GET/HEAD on /, /{bucket}, /{bucket}/{key}. Returns (status, headers, body bytes)."""
-    return 404, {"content-type": "application/xml"}, b"<Error><Code>NotImplemented</Code><Message>mock</Message></Error>"
+    xml = {"content-type": "application/xml"}
+    bucket, _, key = unquote(path.lstrip("/")).partition("/")
+    if not bucket:  # ListBuckets
+        with_region = "max-buckets" in query
+        items = "".join(
+            f"<Bucket><Name>{b}</Name><CreationDate>{s3_iso(T0 - 86400 * 400)}</CreationDate>"
+            + (f"<BucketRegion>{r}</BucketRegion>" if with_region and b != "acme-logs-archive" else "") + "</Bucket>"
+            for b, r in S3_BUCKETS.items())
+        return 200, xml, f"<ListAllMyBucketsResult><Owner><ID>abc</ID></Owner><Buckets>{items}</Buckets></ListAllMyBucketsResult>".encode()
+    if bucket not in S3_BUCKETS:
+        return s3_error(404, "NoSuchBucket", f"The specified bucket does not exist: {bucket}")
+    region = S3_BUCKETS[bucket]
+    if not key and "location" in query:  # GetBucketLocation: answered from any region
+        value = {"us-east-1": "", "eu-west-1": "EU"}.get(region, region)
+        ns = 'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"'
+        body = f"<LocationConstraint {ns}/>" if not value else f"<LocationConstraint {ns}>{value}</LocationConstraint>"
+        return 200, xml, body.encode()
+    if s3_signed_region(query, headers) not in (None, region):
+        return s3_error(301, "PermanentRedirect", "The bucket you are attempting to access must be addressed using the specified endpoint.",
+                        {"x-amz-bucket-region": region})
+    objects = S3_OBJECTS[bucket]
+    if not key:
+        if method == "HEAD":  # HeadBucket
+            return 200, {"x-amz-bucket-region": region}, b""
+        if query.get("list-type") != "2":
+            return s3_error(400, "InvalidRequest", "mock only supports ListObjectsV2")
+        prefix, delim = query.get("prefix", ""), query.get("delimiter", "")
+        max_keys = int(query.get("max-keys", "1000"))
+        entries = []  # (sort key, kind, value)
+        seen = set()
+        for k in sorted(objects):
+            if not k.startswith(prefix):
+                continue
+            rest = k[len(prefix):]
+            if delim and delim in rest:
+                folder = prefix + rest[:rest.index(delim) + len(delim)]
+                if folder not in seen:
+                    seen.add(folder)
+                    entries.append((folder, "prefix", folder))
+            else:
+                entries.append((k, "key", k))
+        entries.sort()
+        start = int(query.get("continuation-token") or 0)
+        page = entries[start:start + max_keys]
+        truncated = start + max_keys < len(entries)
+        out = [f"<ListBucketResult><Name>{bucket}</Name><Prefix>{xml_escape(prefix)}</Prefix><KeyCount>{len(page)}</KeyCount>",
+               f"<MaxKeys>{max_keys}</MaxKeys><IsTruncated>{'true' if truncated else 'false'}</IsTruncated>"]
+        if truncated:
+            out.append(f"<NextContinuationToken>{start + max_keys}</NextContinuationToken>")
+        for _, kind, value in page:
+            if kind == "prefix":
+                out.append(f"<CommonPrefixes><Prefix>{xml_escape(value)}</Prefix></CommonPrefixes>")
+            else:
+                o = objects[value]
+                out.append(f"<Contents><Key>{xml_escape(value)}</Key><LastModified>{s3_iso(o['modified'])}</LastModified>"
+                           f"<ETag>&quot;{uuid.uuid5(uuid.NAMESPACE_URL, value).hex}&quot;</ETag><Size>{len(o['body'])}</Size>"
+                           f"<StorageClass>{o['storage']}</StorageClass></Contents>")
+        out.append("</ListBucketResult>")
+        return 200, xml, "".join(out).encode()
+    o = objects.get(key)
+    if o is None:
+        return s3_error(404, "NoSuchKey", "The specified key does not exist.")
+    head = {"content-type": o["type"], "last-modified": formatdate(o["modified"], usegmt=True),
+            "etag": f'"{uuid.uuid5(uuid.NAMESPACE_URL, key).hex}"', "accept-ranges": "bytes",
+            "x-amz-server-side-encryption": "AES256", **{f"x-amz-meta-{k}": v for k, v in o["meta"].items()}}
+    if o["storage"] != "STANDARD":
+        head["x-amz-storage-class"] = o["storage"]
+    body = o["body"]
+    if method == "HEAD":
+        return 200, {**head, "content-length": str(len(body))}, b""
+    m = re.match(r"bytes=(\d+)-(\d*)", headers.get("range", "") or "")
+    if m:
+        first = int(m.group(1))
+        last = min(int(m.group(2)) if m.group(2) else len(body) - 1, len(body) - 1)
+        part = body[first:last + 1]
+        return 206, {**head, "content-range": f"bytes {first}-{first + len(part) - 1}/{len(body)}"}, part
+    return 200, head, body
 
 
 # ---- Step Functions (awsJson1_0) ------------------------------------------------------------
