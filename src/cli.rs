@@ -483,7 +483,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Report { env, pipeline, full } => {
             let t = target(config, env, pipeline)?;
             let report = crate::report::failure_report(&t.aws, &t.env_name, &t.pipeline.name, full)?;
-            print!("{}", report.markdown);
+            print!("{}", crate::util::sanitize(&report.markdown));
             Ok(ExitCode::SUCCESS)
         }
         Command::Param { env, name, decrypt, json, set, kind, description, yes } => {

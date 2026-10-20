@@ -273,13 +273,14 @@ pub fn strip_ansi(s: &str) -> String {
 // Encodings
 // ---------------------------------------------------------------------------
 
-/// Text of the first `<tag>…</tag>` in `xml`, entities decoded. Enough for the flat
-/// responses of AWS query APIs; not a general XML parser.
+/// Text of the first `<tag>…</tag>` in `xml`, entities decoded, then sanitized: `&#x1b;`
+/// must not turn into a terminal escape. Enough for the flat responses of AWS query APIs;
+/// not a general XML parser.
 pub fn xml_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let start = xml.find(&open)? + open.len();
     let end = start + xml[start..].find(&format!("</{tag}>"))?;
-    Some(xml_unescape(&xml[start..end]))
+    Some(sanitize(&xml_unescape(&xml[start..end])))
 }
 
 /// The `<tag>…</tag>` blocks of `xml`, in order (list members are `<member>`).
@@ -442,7 +443,8 @@ mod tests {
                    <member><Id>2</Id></member></StackEvents><NextToken>t</NextToken></R>";
         let members = xml_blocks(xml, "member");
         assert_eq!(members.len(), 2);
-        assert_eq!(xml_text(members[0], "Reason").as_deref(), Some("a & b <c> \nx\r"));
+        assert_eq!(xml_text(members[0], "Reason").as_deref(), Some("a & b <c> \nx"));
+        assert_eq!(xml_text("<M>a&#x1b;]52;c;aGk=&#7;b&#27;[2J</M>", "M").as_deref(), Some("ab"));
         assert_eq!(xml_text(members[1], "Reason"), None);
         assert_eq!(xml_text(xml, "NextToken").as_deref(), Some("t"));
         assert_eq!(xml_unescape("AT&T &bogus; ok"), "AT&T &bogus; ok");
