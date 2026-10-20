@@ -835,7 +835,141 @@ def stepfunctions(op, body):
 
 
 # ---- DynamoDB (awsJson1_0) -----------------------------------------------------------------
+def ddb_value(v):
+    """Plain Python value → DynamoDB JSON."""
+    if isinstance(v, bool):
+        return {"BOOL": v}
+    if v is None:
+        return {"NULL": True}
+    if isinstance(v, (int, float)):
+        return {"N": str(v)}
+    if isinstance(v, str):
+        return {"S": v}
+    if isinstance(v, set):
+        return {"NS": sorted(str(x) for x in v)} if all(isinstance(x, (int, float)) for x in v) else {"SS": sorted(v)}
+    if isinstance(v, dict):
+        return {"M": {k: ddb_value(x) for k, x in v.items()}}
+    if isinstance(v, list):
+        return {"L": [ddb_value(x) for x in v]}
+    raise TypeError(v)
+
+
+def ddb_plain(av):
+    """DynamoDB JSON key value → comparable Python value."""
+    kind, v = next(iter(av.items()))
+    if kind == "N":
+        return float(v) if "." in v else int(v)
+    return v
+
+
+DDB_USERS = [
+    {"userId": f"u-{n:03d}", "email": f"user{n}@example.com", "name": name, "active": n % 3 != 0,
+     "age": 20 + n * 3, "nickname": None, "roles": ["viewer"] + (["admin"] if n == 1 else []),
+     "tags": {"beta", "early"} if n % 2 else {"standard"}, "address": {"city": city, "zip": 110110 + n},
+     "lastLogin": f"2026-10-{10 + n:02d}T08:{n:02d}:00Z"}
+    for n, (name, city) in enumerate([("Ana", "Bogotá"), ("Luis", "Medellín"), ("Sofía", "Cali"), ("Diego", "Bogotá"),
+                                      ("Valentina", "Barranquilla"), ("Mateo", "Cartagena"), ("Camila", "Bogotá"),
+                                      ("Juan", "Pereira")], start=1)]
+DDB_ORDERS = [
+    {"customerId": f"c-{1000 + c}", "createdAt": f"2026-{1 + (k % 10):02d}-{1 + (k * 7) % 27:02d}T{(k * 5) % 24:02d}:15:00Z",
+     "orderId": f"o-{c}{k:03d}", "status": ["PENDING", "SHIPPED", "DELIVERED", "CANCELLED"][(c + k) % 4],
+     "total": round(19.9 + (c * 31 + k * 17) % 400 + 0.5, 2), "currency": "COP",
+     "items": [{"sku": f"SKU-{(k + i) % 9}", "qty": 1 + i, "price": 9.95 + i} for i in range(1 + k % 3)],
+     "shipping": {"carrier": "Servientrega", "tracking": f"ST{c}{k:05d}"} if (c + k) % 4 else None,
+     "gift": k % 5 == 0, "labels": {"vip"} if c == 1 else {"web", "mobile"} if k % 2 else {"web"}}
+    for c in range(1, 5) for k in range(30)]
+DDB_INVOICES = [{"invoiceNo": 1000 + n, "amount": 120.5 * n, "paid": n % 2 == 0, "issued": f"2026-09-{n:02d}"} for n in range(1, 16)]
+DDB_TABLES = {
+    "users": {"keys": [("userId", "S", "HASH")], "items": DDB_USERS, "gsis": []},
+    "orders": {"keys": [("customerId", "S", "HASH"), ("createdAt", "S", "RANGE")], "items": DDB_ORDERS,
+               "gsis": [("status-index", [("status", "S", "HASH"), ("createdAt", "S", "RANGE")])]},
+    "invoices": {"keys": [("invoiceNo", "N", "HASH")], "items": DDB_INVOICES, "gsis": []},
+}
+
+
+def ddb_table(name):
+    if name not in DDB_TABLES:
+        raise KeyError(f"ResourceNotFoundException: Requested resource not found: Table: {name} not found")
+    return DDB_TABLES[name]
+
+
+def ddb_describe(name, t):
+    types = {a: k for keys in [t["keys"]] + [g[1] for g in t["gsis"]] for a, k, _ in keys}
+    return {"Table": {
+        "TableName": name, "TableStatus": "ACTIVE", "TableArn": f"arn:aws:dynamodb:us-east-1:123456789012:table/{name}",
+        "KeySchema": [{"AttributeName": a, "KeyType": r} for a, _, r in t["keys"]],
+        "AttributeDefinitions": [{"AttributeName": a, "AttributeType": k} for a, k in types.items()],
+        "GlobalSecondaryIndexes": [{"IndexName": g, "KeySchema": [{"AttributeName": a, "KeyType": r} for a, _, r in ks],
+                                    "Projection": {"ProjectionType": "ALL"}, "IndexStatus": "ACTIVE",
+                                    "ItemCount": len(t["items"])} for g, ks in t["gsis"]],
+        "ItemCount": len(t["items"]), "TableSizeBytes": len(json.dumps(t["items"], default=sorted)),
+        "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"} if name != "invoices" else None,
+        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+        "StreamSpecification": {"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"} if name == "orders" else None,
+        "CreationDateTime": T0 - 86400 * 400, "DeletionProtectionEnabled": name == "orders"}}
+
+
+def ddb_page(t, items, key_names, body):
+    """Pagination by ExclusiveStartKey/Limit; LastEvaluatedKey carries the table and index keys."""
+    start = 0
+    if body.get("ExclusiveStartKey"):
+        want = {k: ddb_plain(v) for k, v in body["ExclusiveStartKey"].items()}
+        start = next(i + 1 for i, it in enumerate(items) if all(it.get(k) == v for k, v in want.items()))
+    limit = body.get("Limit", 1000)
+    page = items[start:start + limit]
+    out = {"Items": [{k: ddb_value(v) for k, v in it.items()} for it in page], "Count": len(page), "ScannedCount": len(page)}
+    if start + limit < len(items) and page:
+        out["LastEvaluatedKey"] = {k: ddb_value(page[-1][k]) for k in key_names}
+    return out
+
+
 def dynamodb(op, body):
+    import re
+    if op == "ListTables":
+        names = sorted(DDB_TABLES)
+        start = names.index(body["ExclusiveStartTableName"]) + 1 if body.get("ExclusiveStartTableName") else 0
+        limit = body.get("Limit", 100)
+        out = {"TableNames": names[start:start + limit]}
+        if start + limit < len(names):
+            out["LastEvaluatedTableName"] = names[start + limit - 1]
+        return out
+    t = ddb_table(body["TableName"])
+    table_keys = [a for a, _, _ in t["keys"]]
+    if op == "DescribeTable":
+        return ddb_describe(body["TableName"], t)
+    if op == "GetItem":
+        want = {k: ddb_plain(v) for k, v in body["Key"].items()}
+        hit = next((it for it in t["items"] if all(it.get(k) == v for k, v in want.items())), None)
+        return {"Item": {k: ddb_value(v) for k, v in hit.items()}} if hit else {}
+    if op == "Scan":
+        return ddb_page(t, t["items"], table_keys, body)
+    if op == "Query":
+        keys = t["keys"]
+        if body.get("IndexName"):
+            keys = dict(t["gsis"])[body["IndexName"]]
+        pk = keys[0][0]
+        sk = keys[1][0] if len(keys) > 1 else None
+        values = {k: ddb_plain(v) for k, v in body["ExpressionAttributeValues"].items()}
+        expr = body["KeyConditionExpression"]
+        assert body["ExpressionAttributeNames"]["#pk"] == pk, "#pk must name the partition key"
+        tests = {
+            r"#pk = :pk": lambda v: True,
+            r"#pk = :pk AND #sk = :sk": lambda v: v == values[":sk"],
+            r"#pk = :pk AND begins_with\(#sk, :sk\)": lambda v: str(v).startswith(str(values[":sk"])),
+            r"#pk = :pk AND #sk BETWEEN :sk1 AND :sk2": lambda v: values[":sk1"] <= v <= values[":sk2"],
+            r"#pk = :pk AND #sk < :sk": lambda v: v < values[":sk"],
+            r"#pk = :pk AND #sk <= :sk": lambda v: v <= values[":sk"],
+            r"#pk = :pk AND #sk > :sk": lambda v: v > values[":sk"],
+            r"#pk = :pk AND #sk >= :sk": lambda v: v >= values[":sk"],
+        }
+        test = next((f for pattern, f in tests.items() if re.fullmatch(pattern, expr)), None)
+        if test is None:
+            raise KeyError(f"ValidationException: unsupported KeyConditionExpression {expr}")
+        hits = [it for it in t["items"] if it.get(pk) == values[":pk"] and (sk is None or (sk in it and test(it[sk])))]
+        if sk:
+            hits.sort(key=lambda it: it[sk], reverse=body.get("ScanIndexForward") is False)
+        names = list(dict.fromkeys(table_keys + [a for a, _, _ in keys]))
+        return ddb_page(t, hits, names, body)
     raise KeyError(op)
 
 
