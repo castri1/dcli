@@ -487,7 +487,218 @@ def s3_rest(method, path, query, headers):
 
 
 # ---- Step Functions (awsJson1_0) ------------------------------------------------------------
+SFN_ARN = "arn:aws:states:us-east-1:123456789012"
+SFN_MACHINES = [
+    {"name": "order-fulfillment", "type": "STANDARD", "created": T0 - 86400 * 120, "logging": None,
+     "description": "Validates, charges and ships an order"},
+    {"name": "invoice-generation", "type": "STANDARD", "created": T0 - 86400 * 60, "logging": None,
+     "description": "Monthly invoices (legacy Lambda tasks)"},
+    {"name": "events-ingest", "type": "EXPRESS", "created": T0 - 86400 * 30,
+     "logging": f"arn:aws:logs:us-east-1:123456789012:log-group:/aws/vendedlogs/states/events-ingest-Logs:*",
+     "description": "High-volume event ingestion"},
+]
+# Each state: (name, lambda function or None). The optimized integration ("lambda:invoke")
+# for order-fulfillment, the legacy Lambda resource for invoice-generation.
+SFN_STATES = {
+    "order-fulfillment": [("ValidateOrder", "orders-sync"), ("ChargePayment", "payments-webhook"),
+                          ("ShipOrder", "report-builder"), ("NotifyCustomer", None)],
+    "invoice-generation": [("CollectUsage", "report-builder"), ("RenderPdf", "image-resizer"), ("SendInvoice", "users-auth")],
+}
+SFN_INPUT = {"orderId": "ORD-1042", "customerId": "C-77", "amount": 129.9, "currency": "USD",
+             "items": [{"sku": "SKU-1", "qty": 2}, {"sku": "SKU-9", "qty": 1}]}
+SFN_CAUSE = json.dumps({"errorType": "TimeoutError", "errorMessage": "payment provider did not answer in 3000 ms",
+                        "trace": ["TimeoutError: payment provider did not answer in 3000 ms",
+                                  "    at charge (/var/task/payments.js:42:11)",
+                                  "    at handler (/var/task/index.js:17:5)"]})
+# scenario: success, fail (fails at the 2nd state after a retry), running (in the 2nd state),
+# aborted (stopped in the 3rd state). Started executions run for 20 s, then succeed.
+SFN_EXECUTIONS = []
+for _k, (_scenario, _ago) in enumerate([("running", 40), ("fail", 3600), ("success", 7200), ("success", 3 * 3600),
+                                         ("aborted", 5 * 3600), ("fail", 86400), ("success", 2 * 86400)]):
+    SFN_EXECUTIONS.append({"machine": "order-fulfillment", "name": f"ord-{1042 - _k}-{uuid.uuid4().hex[:6]}",
+                           "scenario": _scenario, "start": time.time() - _ago, "redrives": 0,
+                           "input": json.dumps({**SFN_INPUT, "orderId": f"ORD-{1042 - _k}"})})
+for _k, _scenario in enumerate(["success", "fail", "success"]):
+    SFN_EXECUTIONS.append({"machine": "invoice-generation", "name": f"invoices-2026-{9 - _k:02d}",
+                           "scenario": _scenario, "start": time.time() - 86400 * (1 + 30 * _k), "redrives": 0,
+                           "input": json.dumps({"month": f"2026-{9 - _k:02d}", "customers": 412})})
+
+
+def sfn_exec_arn(e):
+    return f"{SFN_ARN}:execution:{e['machine']}:{e['name']}"
+
+
+def sfn_status(e):
+    if e["scenario"] == "started":
+        return "SUCCEEDED" if time.time() - e["start"] > 20 else "RUNNING"
+    return {"success": "SUCCEEDED", "fail": "FAILED", "running": "RUNNING", "aborted": "ABORTED",
+            "redriven": "SUCCEEDED"}[e["scenario"]]
+
+
+def sfn_history(e):
+    """Events of an execution, oldest first."""
+    states = SFN_STATES[e["machine"]]
+    legacy = e["machine"] == "invoice-generation"
+    events, t = [], e["start"]
+
+    def add(kind, prev, **details):
+        nonlocal t
+        events.append({"id": len(events) + 1, "previousEventId": prev, "timestamp": t, "type": kind, **details})
+        t += 0.05
+        return len(events)
+
+    add("ExecutionStarted", 0, executionStartedEventDetails={"input": e["input"], "roleArn": "arn:aws:iam::123456789012:role/sfn"})
+    scenario = e["scenario"]
+    if scenario == "started":
+        scenario = "success" if sfn_status(e) == "SUCCEEDED" else "running"
+    stop_at = {"fail": 1, "running": 1, "aborted": 2}.get(scenario, len(states))
+    prev = 1
+    for i, (name, fn) in enumerate(states):
+        kind = "Pass" if fn is None else "Task"
+        entered = add(f"{kind}StateEntered", prev, stateEnteredEventDetails={"name": name, "input": e["input"]})
+        if fn is None:
+            prev = add(f"{kind}StateExited", entered, stateExitedEventDetails={"name": name, "output": e["input"]})
+            continue
+        arn = f"arn:aws:lambda:us-east-1:123456789012:function:{fn}"
+        attempts = 2 if (scenario == "fail" and i == stop_at) else 1
+        last = entered
+        for attempt in range(attempts):
+            if legacy:
+                last = add("LambdaFunctionScheduled", last, lambdaFunctionScheduledEventDetails={"resource": arn, "input": e["input"]})
+                last = add("LambdaFunctionStarted", last)
+            else:
+                params = json.dumps({"FunctionName": f"{arn}:live", "Payload": json.loads(e["input"])})
+                last = add("TaskScheduled", last, taskScheduledEventDetails={"resourceType": "lambda", "resource": "invoke",
+                                                                              "region": "us-east-1", "parameters": params})
+                last = add("TaskStarted", last, taskStartedEventDetails={"resourceType": "lambda", "resource": "invoke"})
+            t += 1.5 + i
+            if scenario == "running" and i == stop_at:
+                return events
+            if scenario == "aborted" and i == stop_at:
+                add("ExecutionAborted", last, executionAbortedEventDetails={"error": "Manual.Stop", "cause": "Stopped from the console"})
+                return events
+            if scenario == "fail" and i == stop_at:
+                failed = {"error": "TimeoutError", "cause": SFN_CAUSE}
+                if legacy:
+                    last = add("LambdaFunctionFailed", last, lambdaFunctionFailedEventDetails=failed)
+                else:
+                    last = add("TaskFailed", last, taskFailedEventDetails={"resourceType": "lambda", "resource": "invoke", **failed})
+                if attempt == attempts - 1:
+                    add("ExecutionFailed", last, executionFailedEventDetails=failed)
+                    return events
+                t += 2
+                continue
+            ok = json.dumps({"ok": True, "state": name})
+            if legacy:
+                last = add("LambdaFunctionSucceeded", last, lambdaFunctionSucceededEventDetails={"output": ok})
+            else:
+                last = add("TaskSucceeded", last, taskSucceededEventDetails={"resourceType": "lambda", "resource": "invoke", "output": ok})
+        prev = add(f"{kind}StateExited", last, stateExitedEventDetails={"name": name, "output": json.dumps({"ok": True})})
+        if scenario == "redriven" and i == 1:
+            add("ExecutionRedriven", prev, executionRedrivenEventDetails={"redriveCount": e["redrives"]})
+    add("ExecutionSucceeded", prev, executionSucceededEventDetails={"output": json.dumps({"status": "DONE"})})
+    return events
+
+
+def sfn_summary(e):
+    status = sfn_status(e)
+    hist = sfn_history(e)
+    out = {"executionArn": sfn_exec_arn(e), "stateMachineArn": f"{SFN_ARN}:stateMachine:{e['machine']}",
+           "name": e["name"], "status": status, "startDate": e["start"]}
+    if status != "RUNNING":
+        out["stopDate"] = hist[-1]["timestamp"]
+    if e["redrives"]:
+        out["redriveCount"] = e["redrives"]
+    return out
+
+
+def sfn_find_exec(arn):
+    e = next((x for x in SFN_EXECUTIONS if sfn_exec_arn(x) == arn), None)
+    if e is None:
+        raise KeyError(f"ExecutionDoesNotExist: {arn}")
+    return e
+
+
 def stepfunctions(op, body):
+    if op == "ListStateMachines":
+        return {"stateMachines": [{"stateMachineArn": f"{SFN_ARN}:stateMachine:{m['name']}", "name": m["name"],
+                                   "type": m["type"], "creationDate": m["created"]} for m in SFN_MACHINES]}
+    if op == "DescribeStateMachine":
+        name = body["stateMachineArn"].rsplit(":", 1)[-1]
+        m = next((x for x in SFN_MACHINES if x["name"] == name), None)
+        if m is None:
+            raise KeyError(f"StateMachineDoesNotExist: {name}")
+        out = {"stateMachineArn": body["stateMachineArn"], "name": name, "status": "ACTIVE", "type": m["type"],
+               "roleArn": f"arn:aws:iam::123456789012:role/service-role/{name}-role", "creationDate": m["created"],
+               "description": m["description"], "definition": json.dumps({"StartAt": "Start", "States": {}})}
+        if m["logging"]:
+            out["loggingConfiguration"] = {"level": "ALL", "includeExecutionData": True,
+                                           "destinations": [{"cloudWatchLogsLogGroup": {"logGroupArn": m["logging"]}}]}
+        else:
+            out["loggingConfiguration"] = {"level": "OFF", "includeExecutionData": False}
+        return out
+    if op == "ListExecutions":
+        name = body["stateMachineArn"].rsplit(":", 1)[-1]
+        if next((x for x in SFN_MACHINES if x["name"] == name), {}).get("type") == "EXPRESS":
+            raise KeyError("StateMachineTypeNotSupported: ListExecutions does not support EXPRESS state machines")
+        items = sorted((sfn_summary(e) for e in SFN_EXECUTIONS if e["machine"] == name), key=lambda x: -x["startDate"])
+        if body.get("statusFilter"):
+            items = [x for x in items if x["status"] == body["statusFilter"]]
+        start = int(body.get("nextToken") or 0)
+        size = body.get("maxResults") or 100
+        out = {"executions": items[start:start + size]}
+        if start + size < len(items):
+            out["nextToken"] = str(start + size)
+        return out
+    if op == "DescribeExecution":
+        e = sfn_find_exec(body["executionArn"])
+        out = sfn_summary(e)
+        out["input"] = e["input"]
+        status = out["status"]
+        if status == "SUCCEEDED":
+            out["output"] = json.dumps({"status": "DONE", "orderId": json.loads(e["input"]).get("orderId")})
+        if status == "FAILED":
+            out.update({"error": "TimeoutError", "cause": SFN_CAUSE, "redriveStatus": "REDRIVABLE"})
+        elif status == "ABORTED":
+            out.update({"error": "Manual.Stop", "cause": "Stopped from the console", "redriveStatus": "REDRIVABLE"})
+        else:
+            out.update({"redriveStatus": "NOT_REDRIVABLE",
+                        "redriveStatusReason": "Execution is RUNNING and cannot be redriven" if status == "RUNNING"
+                        else "Execution is SUCCEEDED and cannot be redriven"})
+        return out
+    if op == "GetExecutionHistory":
+        events = sfn_history(sfn_find_exec(body["executionArn"]))
+        if body.get("reverseOrder"):
+            events = events[::-1]
+        start = int(body.get("nextToken") or 0)
+        size = body.get("maxResults") or 1000
+        out = {"events": events[start:start + size]}
+        if start + size < len(events):
+            out["nextToken"] = str(start + size)
+        return out
+    if op == "RedriveExecution":
+        e = sfn_find_exec(body["executionArn"])
+        if sfn_status(e) not in ("FAILED", "ABORTED", "TIMED_OUT"):
+            raise KeyError(f"ExecutionNotRedrivable: {sfn_status(e)}")
+        e["scenario"], e["redrives"] = "redriven", e["redrives"] + 1
+        return {"redriveDate": time.time()}
+    if op == "StartExecution":
+        name = body["stateMachineArn"].rsplit(":", 1)[-1]
+        if name not in SFN_STATES:
+            raise KeyError(f"StateMachineDoesNotExist: {name}")
+        json.loads(body.get("input") or "{}")
+        e = {"machine": name, "name": body.get("name") or uuid.uuid4().hex[:12], "scenario": "started",
+             "start": time.time(), "redrives": 0, "input": body.get("input") or "{}"}
+        if any(sfn_exec_arn(x) == sfn_exec_arn(e) for x in SFN_EXECUTIONS):
+            raise KeyError(f"ExecutionAlreadyExists: {e['name']}")
+        SFN_EXECUTIONS.append(e)
+        return {"executionArn": sfn_exec_arn(e), "startDate": e["start"]}
+    if op == "StopExecution":
+        e = sfn_find_exec(body["executionArn"])
+        if sfn_status(e) != "RUNNING":
+            raise KeyError("ValidationException: execution is not running")
+        e["scenario"] = "aborted"
+        return {"stopDate": time.time()}
     raise KeyError(op)
 
 
