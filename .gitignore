@@ -1,0 +1,5 @@
+node_modules/
+dist/
+deployment-cli.yaml
+.deployment-cli.yaml
+*.tgz
