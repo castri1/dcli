@@ -122,6 +122,12 @@ impl Aws {
         Aws::new(&self.profile, region)
     }
 
+    /// When the current credentials expire (Unix seconds); `None` for long-lived keys.
+    /// Presigned URLs stop working then, whatever expiry they were given.
+    pub fn credentials_expiry(&self) -> Option<f64> {
+        self.creds.get().ok()?.expires_at
+    }
+
     /// `restJson1` call. `segments` are raw path segments, encoded here.
     pub fn rest<T: DeserializeOwned>(
         &self,
