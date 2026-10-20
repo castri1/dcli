@@ -1,5 +1,6 @@
 mod aws;
 mod cli;
+mod clicmd;
 mod config;
 mod hooks;
 mod matrix;

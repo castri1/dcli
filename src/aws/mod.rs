@@ -4,16 +4,21 @@
 //! its own file. Most AWS APIs speak either `awsJson1_1` (`Aws::call`) or `restJson1`
 //! (`Aws::rest`), so no per-service SDK crate is needed.
 
+pub mod appconfig;
 pub mod cloudformation;
 pub mod codebuild;
 pub mod codepipeline;
 pub mod credentials;
+pub mod dynamodb;
 pub mod error;
+pub mod events;
 pub mod http;
 pub mod lambda;
 pub mod logs;
 pub mod profile;
+pub mod s3;
 pub mod secrets;
+pub mod sfn;
 pub mod sigv4;
 pub mod ssm;
 pub mod sso;
@@ -81,13 +86,23 @@ impl Aws {
 
     /// `awsJson1_1` call: `POST /` with `X-Amz-Target: {prefix}.{operation}`.
     pub fn call<T: DeserializeOwned>(&self, svc: &Service, operation: &str, input: &Value) -> Result<T> {
+        self.json_call(svc, operation, input, "application/x-amz-json-1.1")
+    }
+
+    /// `awsJson1_0` call (DynamoDB, Step Functions): same as [`call`](Self::call), another
+    /// content type.
+    pub fn call_json10<T: DeserializeOwned>(&self, svc: &Service, operation: &str, input: &Value) -> Result<T> {
+        self.json_call(svc, operation, input, "application/x-amz-json-1.0")
+    }
+
+    fn json_call<T: DeserializeOwned>(&self, svc: &Service, operation: &str, input: &Value, content_type: &str) -> Result<T> {
         let headers = vec![
-            ("content-type".to_string(), "application/x-amz-json-1.1".to_string()),
+            ("content-type".to_string(), content_type.to_string()),
             ("x-amz-target".to_string(), format!("{}.{operation}", svc.target_prefix)),
         ];
         let body = serde_json::to_vec(input).unwrap_or_default();
-        let bytes = self.send(svc, "POST", &[], &[], headers, body)?;
-        parse(&bytes)
+        let resp = self.send(svc, "POST", &[], &[], headers, body)?;
+        parse(&resp.body)
     }
 
     /// `awsQuery` call (CloudFormation and other older APIs): a form-encoded `POST /`;
@@ -98,8 +113,8 @@ impl Aws {
             body.push_str(&format!("&{}={}", uri_encode(k), uri_encode(v)));
         }
         let headers = vec![("content-type".to_string(), "application/x-www-form-urlencoded; charset=utf-8".to_string())];
-        let bytes = self.send(svc, "POST", &[], &[], headers, body.into_bytes())?;
-        Ok(crate::util::sanitize(&String::from_utf8_lossy(&bytes)))
+        let resp = self.send(svc, "POST", &[], &[], headers, body.into_bytes())?;
+        Ok(crate::util::sanitize(&String::from_utf8_lossy(&resp.body)))
     }
 
     /// The same profile in another region (an action that deploys elsewhere, say).
@@ -124,8 +139,64 @@ impl Aws {
             }
             None => Vec::new(),
         };
-        let bytes = self.send(svc, method, segments, query, headers, payload)?;
-        parse(&bytes)
+        let resp = self.send(svc, method, segments, query, headers, payload)?;
+        parse(&resp.body)
+    }
+
+    /// Any request, returning status, headers and the raw body of a successful response:
+    /// S3 (XML, object bytes), AppConfig hosted configurations (the document as stored).
+    pub fn raw(
+        &self,
+        svc: &Service,
+        method: &str,
+        segments: &[&str],
+        query: &[(String, String)],
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Result<http::RawResponse> {
+        self.send(svc, method, segments, query, headers, body)
+    }
+
+    /// A URL anyone can GET until `expires` seconds from now, or until the credentials
+    /// that signed it expire, whichever comes first (SSO sessions last hours).
+    pub fn presign(&self, svc: &Service, segments: &[&str], expires: u64) -> Result<String> {
+        let (base, host) = self.endpoint(svc);
+        let (path, canonical_uri) = paths(svc, segments);
+        let creds = self.creds.get()?;
+        let (_, amz_date) = amz_dates(now_secs() as i64);
+        let query = sigv4::presign_query("GET", &host, &canonical_uri, &creds, &self.region, svc.signing_name, &amz_date, expires);
+        Ok(format!("{base}{path}?{query}"))
+    }
+
+    /// Streams a GET to the file at `path`; returns the bytes written.
+    pub fn download(&self, svc: &Service, segments: &[&str], path: &std::path::Path) -> Result<u64> {
+        let (url, headers) = self.signed(svc, "GET", segments, &[], Vec::new(), &[])?;
+        http::download(&url, &headers, path)
+    }
+
+    /// URL and signed headers for a request.
+    fn signed(
+        &self,
+        svc: &Service,
+        method: &str,
+        segments: &[&str],
+        query: &[(String, String)],
+        mut headers: Vec<(String, String)>,
+        body: &[u8],
+    ) -> Result<(String, Vec<(String, String)>)> {
+        let (base, host) = self.endpoint(svc);
+        let (path, canonical_uri) = paths(svc, segments);
+        let query_string = sigv4::canonical_query(query);
+        let url = if query_string.is_empty() { format!("{base}{path}") } else { format!("{base}{path}?{query_string}") };
+        if svc.signing_name == "s3" {
+            headers.push(("x-amz-content-sha256".to_string(), sigv4::sha256_hex(body)));
+        }
+        let creds = self.creds.get()?;
+        let (_, amz_date) = amz_dates(now_secs() as i64);
+        let signable = sigv4::Signable { method, host: &host, canonical_uri: &canonical_uri, query, headers: &headers, payload: body };
+        let mut all = headers.clone();
+        all.extend(sigv4::sign(&signable, &creds, &self.region, svc.signing_name, &amz_date));
+        Ok((url, all))
     }
 
     fn send(
@@ -136,41 +207,16 @@ impl Aws {
         query: &[(String, String)],
         headers: Vec<(String, String)>,
         body: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        let (base, host) = self.endpoint(svc);
-        // Non-S3 services sign the path encoded twice.
-        let path = format!("/{}", segments.iter().map(|s| uri_encode(s)).collect::<Vec<_>>().join("/"));
-        let canonical_uri =
-            format!("/{}", segments.iter().map(|s| uri_encode(&uri_encode(s))).collect::<Vec<_>>().join("/"));
-        let query_string = sigv4::canonical_query(query);
-        let url = if query_string.is_empty() {
-            format!("{base}{path}")
-        } else {
-            format!("{base}{path}?{query_string}")
-        };
-
+    ) -> Result<http::RawResponse> {
         let mut refreshed = false;
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let creds = self.creds.get()?;
-            let (_, amz_date) = amz_dates(now_secs() as i64);
-            let signable = sigv4::Signable {
-                method,
-                host: &host,
-                canonical_uri: &canonical_uri,
-                query,
-                headers: &headers,
-                payload: &body,
-            };
-            let mut all_headers = headers.clone();
-            all_headers.extend(sigv4::sign(&signable, &creds, &self.region, svc.signing_name, &amz_date));
-
-            let result = http::send(method, &url, &all_headers, body.clone()).and_then(|resp| {
-                if resp.ok() { Ok(resp.body) } else { Err(http::api_error(&resp)) }
-            });
+            let (url, all_headers) = self.signed(svc, method, segments, query, headers.clone(), &body)?;
+            let result = http::send(method, &url, &all_headers, body.clone())
+                .and_then(|resp| if resp.ok() { Ok(resp) } else { Err(http::api_error(&resp)) });
             match result {
-                Ok(bytes) => return Ok(bytes),
+                Ok(resp) => return Ok(resp),
                 Err(e) if e.is_expired_credentials() && !refreshed => {
                     // Cached role credentials were revoked or expired early: resolve again once.
                     refreshed = true;
@@ -186,6 +232,17 @@ impl Aws {
             }
         }
     }
+}
+
+/// `(request path, canonical path)`. Every service but S3 signs the path encoded twice.
+fn paths(svc: &Service, segments: &[&str]) -> (String, String) {
+    let path = format!("/{}", segments.iter().map(|s| uri_encode(s)).collect::<Vec<_>>().join("/"));
+    let canonical = if svc.signing_name == "s3" {
+        path.clone()
+    } else {
+        format!("/{}", segments.iter().map(|s| uri_encode(&uri_encode(s))).collect::<Vec<_>>().join("/"))
+    };
+    (path, canonical)
 }
 
 /// Deserializes a response body. Some services (Lambda, for one) send absent fields as

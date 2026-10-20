@@ -188,6 +188,16 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// S3: list buckets and objects, presigned download links, downloads
+    S3(crate::clicmd::s3::Args),
+    /// Step Functions: executions of a state machine, failure reports
+    Sfn(crate::clicmd::sfn::Args),
+    /// DynamoDB: query a table by key, or scan it
+    Ddb(crate::clicmd::dynamodb::Args),
+    /// EventBridge: buses and rules, send a test event
+    Events(crate::clicmd::events::Args),
+    /// AppConfig feature flags per environment
+    Flags(crate::clicmd::appconfig::Args),
     /// Update dcli to the latest release (through npm when installed with npm)
     Update {
         /// Only tell whether a newer version exists
@@ -204,11 +214,11 @@ pub enum Command {
 
 // ---- output helpers ----------------------------------------------------------------
 
-fn color_enabled() -> bool {
+pub(crate) fn color_enabled() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
-fn paint(text: &str, code: &str) -> String {
+pub(crate) fn paint(text: &str, code: &str) -> String {
     if color_enabled() { format!("\u{1b}[{code}m{text}\u{1b}[0m") } else { text.to_string() }
 }
 
@@ -232,11 +242,11 @@ fn padded_status(s: Status, width: usize) -> String {
     paint(&format!("{:<width$}", format!("{} {}", s.symbol(), s.label())), status_code(s))
 }
 
-fn print_json(v: &Value) {
+pub(crate) fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
 
-fn confirm(question: &str) -> bool {
+pub(crate) fn confirm(question: &str) -> bool {
     print!("{question} [y/N] ");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
@@ -244,7 +254,7 @@ fn confirm(question: &str) -> bool {
     matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-fn ask(question: &str) -> String {
+pub(crate) fn ask(question: &str) -> String {
     print!("{question} ");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
@@ -260,24 +270,24 @@ struct Target<'a> {
     aws: Arc<Aws>,
 }
 
-fn aws_for(config: &Config, env_name: &str) -> Result<Arc<Aws>> {
+pub(crate) fn aws_for(config: &Config, env_name: &str) -> Result<Arc<Aws>> {
     let env = config.env(env_name)?;
     let aws = Aws::new(&env.profile, &env.region);
     ensure_session(&aws, env_name)?;
     Ok(aws)
 }
 
-fn interactive() -> bool {
+pub(crate) fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-fn current_env(config: &Config) -> Result<String> {
+pub(crate) fn current_env(config: &Config) -> Result<String> {
     config.default_env().map(str::to_string).ok_or_else(|| anyhow!("no environments configured"))
 }
 
 /// `[ENV] [ITEM]` → environment and item. The environment defaults to the current one,
 /// so a single argument that is not an environment name is the item.
-fn env_and(config: &Config, env: Option<String>, item: Option<String>) -> Result<(String, Option<String>)> {
+pub(crate) fn env_and(config: &Config, env: Option<String>, item: Option<String>) -> Result<(String, Option<String>)> {
     match (env, item) {
         (Some(env), Some(item)) => Ok((env, Some(item))),
         (Some(env), None) if config.environments.contains_key(&env) => Ok((env, None)),
@@ -389,7 +399,7 @@ fn define_env(loaded: &mut Loaded, name: &str) -> Result<()> {
 }
 
 /// Validates credentials; on an interactive terminal, offers an SSO login when needed.
-fn ensure_session(aws: &Aws, env_name: &str) -> Result<()> {
+pub(crate) fn ensure_session(aws: &Aws, env_name: &str) -> Result<()> {
     match aws.check_credentials() {
         Err(e) if e.is_login_required() && std::io::stdin().is_terminal() => {
             eprintln!("{}", paint(&format!("! {}", e.short().replace(" — press L to sign in", "")), "33"));
@@ -512,6 +522,11 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             let (env, Some(group)) = env_and(config, env, group)? else { bail!("which log group? {} tail [ENV] GROUP", program()) };
             tail(aws_for(config, &env)?.as_ref(), &group, &since, filter.as_deref().unwrap_or(""), follow)
         }
+        Command::S3(args) => crate::clicmd::s3::run(config, args),
+        Command::Sfn(args) => crate::clicmd::sfn::run(config, args),
+        Command::Ddb(args) => crate::clicmd::dynamodb::run(config, args),
+        Command::Events(args) => crate::clicmd::events::run(config, args),
+        Command::Flags(args) => crate::clicmd::appconfig::run(config, args),
         Command::Lambda { env, name, json } => {
             let (env, Some(name)) = env_and(config, env, name)? else { bail!("which function? {} lambda [ENV] NAME", program()) };
             lambda_show(aws_for(config, &env)?.as_ref(), &name, json)
@@ -1196,7 +1211,7 @@ fn tail(aws: &Aws, group: &str, since: &str, pattern: &str, follow: bool) -> Res
 
 /// A `--set` value; `-` reads it from stdin (without the final newline). Stdin then cannot
 /// answer the confirmation, so `--yes` is needed.
-fn read_value(value: &str) -> Result<String> {
+pub(crate) fn read_value(value: &str) -> Result<String> {
     if value != "-" {
         return Ok(value.to_string());
     }
@@ -1212,7 +1227,7 @@ fn read_value(value: &str) -> Result<String> {
 }
 
 /// Asks before a write: y/N, or typing the environment name for production-looking ones.
-fn confirm_write(env_name: &str, question: &str, yes: bool) -> Result<bool> {
+pub(crate) fn confirm_write(env_name: &str, question: &str, yes: bool) -> Result<bool> {
     if yes {
         return Ok(true);
     }

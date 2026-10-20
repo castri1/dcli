@@ -82,11 +82,7 @@ pub fn sign(
         sha256_hex(canonical_request.as_bytes())
     );
 
-    let k_date = hmac(format!("AWS4{}", creds.secret_access_key).as_bytes(), date.as_bytes());
-    let k_region = hmac(&k_date, region.as_bytes());
-    let k_service = hmac(&k_region, service.as_bytes());
-    let k_signing = hmac(&k_service, b"aws4_request");
-    let signature = hex(&hmac(&k_signing, string_to_sign.as_bytes()));
+    let signature = hex(&hmac(&signing_key(creds, date, region, service), string_to_sign.as_bytes()));
 
     let mut out = vec![("x-amz-date".to_string(), amz_date.to_string())];
     if let Some(token) = &creds.session_token {
@@ -100,6 +96,48 @@ pub fn sign(
         ),
     ));
     out
+}
+
+fn signing_key(creds: &Credentials, date: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_date = hmac(format!("AWS4{}", creds.secret_access_key).as_bytes(), date.as_bytes());
+    let k_region = hmac(&k_date, region.as_bytes());
+    let k_service = hmac(&k_region, service.as_bytes());
+    hmac(&k_service, b"aws4_request")
+}
+
+/// Query-string signing (a presigned URL): returns the query string, signature included,
+/// for `method` on `host` + `canonical_uri`, valid `expires` seconds from `amz_date`. The
+/// payload is not signed, so anyone with the URL can use it until it expires (or until
+/// the credentials that signed it do).
+#[allow(clippy::too_many_arguments)]
+pub fn presign_query(
+    method: &str,
+    host: &str,
+    canonical_uri: &str,
+    creds: &Credentials,
+    region: &str,
+    service: &str,
+    amz_date: &str,
+    expires: u64,
+) -> String {
+    let date = &amz_date[..8];
+    let scope = format!("{date}/{region}/{service}/aws4_request");
+    let mut query: Vec<(String, String)> = vec![
+        ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
+        ("X-Amz-Credential".into(), format!("{}/{scope}", creds.access_key_id)),
+        ("X-Amz-Date".into(), amz_date.into()),
+        ("X-Amz-Expires".into(), expires.to_string()),
+        ("X-Amz-SignedHeaders".into(), "host".into()),
+    ];
+    if let Some(token) = &creds.session_token {
+        query.push(("X-Amz-Security-Token".into(), token.clone()));
+    }
+    let query_string = canonical_query(&query);
+    let canonical_request = format!("{method}\n{canonical_uri}\n{query_string}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
+    let string_to_sign =
+        format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
+    let signature = hex(&hmac(&signing_key(creds, date, region, service), string_to_sign.as_bytes()));
+    format!("{query_string}&X-Amz-Signature={signature}")
 }
 
 #[cfg(test)]
@@ -198,5 +236,20 @@ mod tests {
             signature(&req, None),
             "652487583200325589f1fba4c7e578f72c47cb61beeca81406b39ddec1366741"
         );
+    }
+
+    /// The presigned GET example of the S3 documentation ("Authenticating Requests: Using
+    /// Query Parameters").
+    #[test]
+    fn presigned_url_matches_the_s3_documentation() {
+        let creds = Credentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            session_token: None,
+            expires_at: None,
+        };
+        let query =
+            presign_query("GET", "examplebucket.s3.amazonaws.com", "/test.txt", &creds, "us-east-1", "s3", "20130524T000000Z", 86400);
+        assert!(query.ends_with("X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"), "{query}");
     }
 }

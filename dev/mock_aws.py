@@ -480,6 +480,37 @@ def lambda_rest(path):
             "Concurrency": {"ReservedConcurrentExecutions": 50}}
 
 
+# ---- S3 (restXml, path-style) --------------------------------------------------------------
+def s3_rest(method, path, query, headers):
+    """S3 requests: GET/HEAD on /, /{bucket}, /{bucket}/{key}. Returns (status, headers, body bytes)."""
+    return 404, {"content-type": "application/xml"}, b"<Error><Code>NotImplemented</Code><Message>mock</Message></Error>"
+
+
+# ---- Step Functions (awsJson1_0) ------------------------------------------------------------
+def stepfunctions(op, body):
+    raise KeyError(op)
+
+
+# ---- DynamoDB (awsJson1_0) -----------------------------------------------------------------
+def dynamodb(op, body):
+    raise KeyError(op)
+
+
+# ---- EventBridge (awsJson1_1) --------------------------------------------------------------
+def eventbridge(op, body):
+    raise KeyError(op)
+
+
+# ---- AppConfig (restJson1; hosted configurations are raw documents) --------------------------
+def appconfig_rest(method, path, query, headers, body):
+    """Returns (status, headers, body bytes)."""
+    return 404, {"content-type": "application/json"}, json.dumps({"Message": "mock: not implemented"}).encode()
+
+
+def is_appconfig(path):
+    return path.startswith("/applications") or path.startswith("/deploymentstrategies")
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -496,14 +527,49 @@ class H(BaseHTTPRequestHandler):
         auth = self.headers.get("authorization", "")
         SIGNED["ok" if auth.startswith("AWS4-HMAC-SHA256 Credential=AKIDTEST/") and "Signature=" in auth else "unsigned"] += 1
 
+    def reply_raw(self, code, headers, data):
+        self.send_response(code)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        if "content-length" not in {k.lower() for k in headers}:
+            self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def raw_body(self):
+        return self.rfile.read(int(self.headers.get("content-length", 0) or 0))
+
+    def route_rest(self, method, body=b""):
+        """S3 and AppConfig requests (anything that is not Lambda or a JSON target)."""
+        path, _, qs = self.path.partition("?")
+        query = {k: v[0] for k, v in parse_qs(qs, keep_blank_values=True).items()}
+        if is_appconfig(path):
+            return self.reply_raw(*appconfig_rest(method, path, query, self.headers, body))
+        return self.reply_raw(*s3_rest(method, path, query, self.headers))
+
     def do_GET(self):
         self.check_sig()
         if self.path.startswith("/__stats"):
             return self.reply(200, SIGNED)
+        if not self.path.startswith("/2015-03-31/"):
+            return self.route_rest("GET")
         try:
             self.reply(200, lambda_rest(self.path))
         except Exception as e:
             self.reply(404, {"Type": "User", "message": f"Function not found: {e}"})
+
+    def do_HEAD(self):
+        self.check_sig()
+        return self.route_rest("HEAD")
+
+    def do_DELETE(self):
+        self.check_sig()
+        return self.route_rest("DELETE", self.raw_body())
+
+    def do_PATCH(self):
+        self.check_sig()
+        return self.route_rest("PATCH", self.raw_body())
 
     def reply_xml(self, code, text):
         data = text.encode()
@@ -515,14 +581,17 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.check_sig()
-        raw = self.rfile.read(int(self.headers.get("content-length", 0)))
+        raw = self.raw_body()
+        if is_appconfig(self.path):
+            return self.route_rest("POST", raw)
         if self.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
             return self.reply_xml(*cloudformation(parse_qs(raw.decode())))
         body = json.loads(raw or b"{}")
         target = self.headers.get("x-amz-target", "")
         prefix, _, op = target.partition(".")
         handler = {"CodePipeline_20150709": codepipeline, "CodeBuild_20161006": codebuild,
-                   "Logs_20140328": cwlogs, "AmazonSSM": ssm, "secretsmanager": secretsmanager}.get(prefix)
+                   "Logs_20140328": cwlogs, "AmazonSSM": ssm, "secretsmanager": secretsmanager,
+                   "AWSStepFunctions": stepfunctions, "DynamoDB_20120810": dynamodb, "AWSEvents": eventbridge}.get(prefix)
         try:
             self.reply(200, handler(op, body))
         except Exception as e:
