@@ -1236,8 +1236,127 @@ def eventbridge(op, body):
 
 
 # ---- CloudWatch alarms (awsQuery, Version 2010-08-01) ----------------------------------------
+CW_SNS = "arn:aws:sns:us-east-1:123456789012:ops-alerts"
+
+
+def cw_alarm_defs():
+    """The same alarms in every environment (the mock cannot tell them apart). `history`:
+    (seconds ago, old state, new state), newest first."""
+    now = time.time()
+    fn = lambda name: [("FunctionName", name)]
+    return [
+        {"name": "payments-webhook-errors", "state": "ALARM", "since": now - 720, "desc": "The payment webhook is failing",
+         "ns": "AWS/Lambda", "metric": "Errors", "dims": fn("payments-webhook"), "stat": "Sum", "period": 60,
+         "evals": 3, "dta": 3, "threshold": 2.0, "op": "GreaterThanThreshold", "missing": "notBreaching", "actions": [CW_SNS],
+         "reason": "Threshold Crossed: 3 out of the last 3 datapoints [3.0 (21/10/26 15:40:00), 3.0 (21/10/26 15:39:00), "
+                   "3.0 (21/10/26 15:38:00)] were greater than the threshold (2.0) (minimum 3 datapoints for OK -> ALARM transition).",
+         "history": [(720, "OK", "ALARM"), (3 * 3600, "ALARM", "OK"), (3.5 * 3600, "OK", "ALARM"), (2 * 86400, "INSUFFICIENT_DATA", "OK")]},
+        {"name": "orders-dlq-not-empty", "state": "ALARM", "since": now - 7200, "desc": "Orders failed and wait in the DLQ",
+         "ns": "AWS/SQS", "metric": "ApproximateNumberOfMessagesVisible", "dims": [("QueueName", "orders-dlq")], "stat": "Maximum",
+         "period": 300, "evals": 1, "dta": 1, "threshold": 0.0, "op": "GreaterThanThreshold", "missing": "missing", "actions": [CW_SNS],
+         "reason": "Threshold Crossed: 1 datapoint [12.0 (21/10/26 13:50:00)] was greater than the threshold (0.0).",
+         "history": [(7200, "OK", "ALARM"), (5 * 86400, "INSUFFICIENT_DATA", "OK")]},
+        {"name": "orders-table-read-throttles", "state": "OK", "since": now - 3 * 86400,
+         "ns": "AWS/DynamoDB", "metric": "ReadThrottleEvents", "dims": [("TableName", "orders")], "stat": "Sum", "period": 300,
+         "evals": 2, "dta": 2, "threshold": 50.0, "op": "GreaterThanOrEqualToThreshold", "missing": "notBreaching", "actions": [CW_SNS],
+         "reason": "Threshold Crossed: 2 out of the last 2 datapoints were not greater than or equal to the threshold (50.0).",
+         "history": [(3 * 86400, "ALARM", "OK"), (3 * 86400 + 900, "OK", "ALARM")]},
+        {"name": "users-auth-throttles", "state": "OK", "since": now - 10 * 86400,
+         "ns": "AWS/Lambda", "metric": "Throttles", "dims": fn("users-auth"), "stat": "Sum", "period": 60,
+         "evals": 5, "dta": 5, "threshold": 10.0, "op": "GreaterThanThreshold", "missing": "notBreaching", "actions": [],
+         "reason": "Threshold Crossed: no datapoints were greater than the threshold (10.0).",
+         "history": [(10 * 86400, "INSUFFICIENT_DATA", "OK")]},
+        {"name": "order-fulfillment-failures", "state": "INSUFFICIENT_DATA", "since": now - 86400,
+         "ns": "AWS/States", "metric": "ExecutionsFailed", "stat": "Sum", "period": 300,
+         "dims": [("StateMachineArn", "arn:aws:states:us-east-1:123456789012:stateMachine:order-fulfillment")],
+         "evals": 1, "dta": 1, "threshold": 0.0, "op": "GreaterThanThreshold", "missing": "missing", "actions": [CW_SNS],
+         "reason": "Insufficient Data: 1 datapoint was unknown.", "history": [(86400, "OK", "INSUFFICIENT_DATA")]},
+        {"name": "orders-sync-error-rate", "state": "OK", "since": now - 6 * 3600, "desc": "Errors per 100 calls",
+         "math": [("errors", "Errors", False), ("calls", "Invocations", False)], "expr": ("rate", "100 * errors / calls"),
+         "dims": fn("orders-sync"), "period": 300, "evals": 3, "dta": 2, "threshold": 5.0, "op": "GreaterThanThreshold",
+         "missing": "notBreaching", "actions": [CW_SNS], "reason": "Threshold Crossed: 2 out of the last 3 datapoints were not greater than the threshold (5.0).",
+         "history": [(6 * 3600, "ALARM", "OK"), (7 * 3600, "OK", "ALARM")]},
+        {"name": "checkout-degraded", "state": "ALARM", "since": now - 720, "composite": True, "desc": "Payments or orders broken",
+         "rule": 'ALARM("payments-webhook-errors") OR ALARM("orders-dlq-not-empty")', "actions": [CW_SNS],
+         "reason": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:payments-webhook-errors transitioned to ALARM",
+         "history": [(720, "OK", "ALARM")]},
+    ]
+
+
+def cw_esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def cw_dims_xml(dims):
+    return "".join(f"<member><Name>{cw_esc(k)}</Name><Value>{cw_esc(v)}</Value></member>" for k, v in dims)
+
+
+def cw_alarm_xml(a):
+    arn = f"arn:aws:cloudwatch:us-east-1:123456789012:alarm:{a['name']}"
+    when = cw_iso(a["since"])
+    parts = [f"<AlarmName>{cw_esc(a['name'])}</AlarmName>", f"<AlarmArn>{cw_esc(arn)}</AlarmArn>",
+             f"<StateValue>{a['state']}</StateValue>", f"<StateReason>{cw_esc(a['reason'])}</StateReason>",
+             f"<StateUpdatedTimestamp>{when}</StateUpdatedTimestamp>",
+             f"<StateTransitionedTimestamp>{when}</StateTransitionedTimestamp>",
+             "<ActionsEnabled>true</ActionsEnabled>",
+             "<AlarmActions>" + "".join(f"<member>{cw_esc(x)}</member>" for x in a["actions"]) + "</AlarmActions>",
+             "<OKActions/><InsufficientDataActions/>"]
+    if a.get("desc"):
+        parts.append(f"<AlarmDescription>{cw_esc(a['desc'])}</AlarmDescription>")
+    if a.get("composite"):
+        parts.append(f"<AlarmRule>{cw_esc(a['rule'])}</AlarmRule>")
+        return "<member>" + "".join(parts) + "</member>"
+    if a.get("math"):
+        queries = "".join(
+            f"<member><Id>{qid}</Id><MetricStat><Metric><Namespace>AWS/Lambda</Namespace><MetricName>{metric}</MetricName>"
+            f"<Dimensions>{cw_dims_xml(a['dims'])}</Dimensions></Metric><Period>{a['period']}</Period><Stat>Sum</Stat>"
+            f"</MetricStat><ReturnData>{str(ret).lower()}</ReturnData></member>" for qid, metric, ret in a["math"])
+        queries += (f"<member><Id>{a['expr'][0]}</Id><Expression>{cw_esc(a['expr'][1])}</Expression>"
+                    f"<Label>Error rate</Label><ReturnData>true</ReturnData></member>")
+        parts.append(f"<Metrics>{queries}</Metrics>")
+    else:
+        parts += [f"<Namespace>{a['ns']}</Namespace>", f"<MetricName>{a['metric']}</MetricName>",
+                  f"<Statistic>{a['stat']}</Statistic>", f"<Dimensions>{cw_dims_xml(a['dims'])}</Dimensions>",
+                  f"<Period>{a['period']}</Period>"]
+    parts += [f"<EvaluationPeriods>{a['evals']}</EvaluationPeriods>", f"<DatapointsToAlarm>{a['dta']}</DatapointsToAlarm>",
+              f"<Threshold>{a['threshold']}</Threshold>", f"<ComparisonOperator>{a['op']}</ComparisonOperator>",
+              f"<TreatMissingData>{a['missing']}</TreatMissingData>"]
+    return "<member>" + "".join(parts) + "</member>"
+
+
 def cw_alarms(action, params):
-    """DescribeAlarms…: XML response (status, body)."""
+    """DescribeAlarms and DescribeAlarmHistory: XML response (status, body)."""
+    get = lambda k, d="": params.get(k, [d])[0]
+    members = lambda prefix: [v for k, v in sorted(params.items()) if k.startswith(prefix + ".member.") for v in v]
+    types = members("AlarmTypes") or ["MetricAlarm"]
+    alarms = [a for a in cw_alarm_defs() if ("CompositeAlarm" if a.get("composite") else "MetricAlarm") in types]
+    if action == "DescribeAlarms":
+        names = members("AlarmNames")
+        alarms = [a for a in alarms if (not names or a["name"] in names) and a["name"].startswith(get("AlarmNamePrefix"))
+                  and (not get("StateValue") or a["state"] == get("StateValue"))]
+        start, size = int(get("NextToken") or 0), 3  # small pages, to exercise NextToken
+        page = alarms[start:start + size]
+        token = f"<NextToken>{start + size}</NextToken>" if start + size < len(alarms) else ""
+        metric = "".join(cw_alarm_xml(a) for a in page if not a.get("composite"))
+        composite = "".join(cw_alarm_xml(a) for a in page if a.get("composite"))
+        return 200, (f'<DescribeAlarmsResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/"><DescribeAlarmsResult>'
+                     f"<MetricAlarms>{metric}</MetricAlarms><CompositeAlarms>{composite}</CompositeAlarms>{token}"
+                     f"</DescribeAlarmsResult><ResponseMetadata><RequestId>mock</RequestId></ResponseMetadata></DescribeAlarmsResponse>")
+    if action == "DescribeAlarmHistory":
+        now, items = time.time(), []
+        for a in alarms:
+            if get("AlarmName") and a["name"] != get("AlarmName"):
+                continue
+            for ago, old, new in a["history"]:
+                data = json.dumps({"version": "1.0", "oldState": {"stateValue": old}, "newState": {"stateValue": new, "stateReason": a["reason"]}})
+                items.append((now - ago, f"<member><AlarmName>{cw_esc(a['name'])}</AlarmName><Timestamp>{cw_iso(now - ago)}</Timestamp>"
+                                         f"<HistoryItemType>StateUpdate</HistoryItemType>"
+                                         f"<HistorySummary>Alarm updated from {old} to {new}</HistorySummary>"
+                                         f"<HistoryData>{cw_esc(data)}</HistoryData></member>"))
+        items.sort(key=lambda x: -x[0])
+        body = "".join(x for _, x in items[:int(get("MaxRecords") or 100)])
+        return 200, (f"<DescribeAlarmHistoryResponse><DescribeAlarmHistoryResult><AlarmHistoryItems>{body}</AlarmHistoryItems>"
+                     f"</DescribeAlarmHistoryResult></DescribeAlarmHistoryResponse>")
     return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
 
 

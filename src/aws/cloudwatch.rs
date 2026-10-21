@@ -3,7 +3,5 @@
 
 use super::Service;
 
-#[allow(dead_code)] // used by alarms.rs and metrics.rs
 pub const SERVICE: Service = Service { endpoint: "monitoring", signing_name: "monitoring", target_prefix: "" };
-#[allow(dead_code)]
 pub const VERSION: &str = "2010-08-01";
