@@ -3,7 +3,10 @@
 //!   2. implement `tui::module::Module` in `src/modules/<name>.rs`,
 //!   3. register it below. The header and the `:` palette list modules in this order.
 
+mod alarms;
 mod appconfig;
+mod approvals;
+mod cfn;
 mod common;
 mod cwlogs;
 mod dynamodb;
@@ -16,6 +19,7 @@ mod s3;
 mod secrets;
 mod sfn;
 mod sfn_flow;
+mod sqs;
 
 use crate::tui::module::Module;
 
@@ -23,12 +27,16 @@ pub fn all() -> Vec<Box<dyn Module>> {
     vec![
         Box::new(pipelines::Pipelines::new()),
         Box::new(matrix::Matrix::new()),
+        Box::new(approvals::Approvals::new()),
+        Box::new(alarms::Alarms::new()),
         Box::new(parameters::Parameters::new()),
         Box::new(secrets::Secrets::new()),
         Box::new(lambda::Lambda::new()),
         Box::new(cwlogs::CwLogs::new()),
+        Box::new(cfn::CloudFormation::new()),
         Box::new(s3::S3::new()),
         Box::new(sfn::StepFunctions::new()),
+        Box::new(sqs::Sqs::new()),
         Box::new(dynamodb::DynamoDb::new()),
         Box::new(events::EventBridge::new()),
         Box::new(appconfig::AppConfig::new()),

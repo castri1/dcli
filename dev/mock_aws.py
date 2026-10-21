@@ -1232,6 +1232,35 @@ def eventbridge(op, body):
     raise KeyError(op)
 
 
+# ---- CloudWatch alarms (awsQuery, Version 2010-08-01) ----------------------------------------
+def cw_alarms(action, params):
+    """DescribeAlarms…: XML response (status, body)."""
+    return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
+
+
+# ---- CloudWatch metrics (awsQuery, Version 2010-08-01) ---------------------------------------
+def cw_metrics(action, params):
+    """GetMetricData…: XML response (status, body)."""
+    return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
+
+
+def cloudwatch(params):
+    action = params.get("Action", [""])[0]
+    if "Alarm" in action:
+        return cw_alarms(action, params)
+    return cw_metrics(action, params)
+
+
+def query_error(code, message):
+    return (f"<ErrorResponse><Error><Type>Sender</Type><Code>{code}</Code><Message>{message}</Message></Error>"
+            f"<RequestId>mock</RequestId></ErrorResponse>")
+
+
+# ---- SQS (awsJson1_0, X-Amz-Target AmazonSQS.*) ----------------------------------------------
+def sqs(op, body):
+    raise KeyError(op)
+
+
 # ---- AppConfig (restJson1; hosted configurations are raw documents) --------------------------
 AC_APPS = [{"Id": "ckout01", "Name": "checkout", "Description": "Checkout service"},
            {"Id": "store02", "Name": "storefront", "Description": "Web storefront"}]
@@ -1485,13 +1514,17 @@ class H(BaseHTTPRequestHandler):
         if is_appconfig(self.path):
             return self.route_rest("POST", raw)
         if self.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
-            return self.reply_xml(*cloudformation(parse_qs(raw.decode())))
+            # awsQuery services, told apart by their API version.
+            params = parse_qs(raw.decode())
+            service = {"2010-08-01": cloudwatch}.get(params.get("Version", [""])[0], cloudformation)
+            return self.reply_xml(*service(params))
         body = json.loads(raw or b"{}")
         target = self.headers.get("x-amz-target", "")
         prefix, _, op = target.partition(".")
         handler = {"CodePipeline_20150709": codepipeline, "CodeBuild_20161006": codebuild,
                    "Logs_20140328": cwlogs, "AmazonSSM": ssm, "secretsmanager": secretsmanager,
-                   "AWSStepFunctions": stepfunctions, "DynamoDB_20120810": dynamodb, "AWSEvents": eventbridge}.get(prefix)
+                   "AWSStepFunctions": stepfunctions, "DynamoDB_20120810": dynamodb, "AWSEvents": eventbridge,
+                   "AmazonSQS": sqs}.get(prefix)
         try:
             self.reply(200, handler(op, body))
         except Exception as e:

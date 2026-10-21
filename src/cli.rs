@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::aws::credentials::effective_profile;
 use crate::aws::profile::AwsFiles;
-use crate::aws::{Aws, AwsError, codebuild, codepipeline as cp, lambda, logs, secrets, ssm};
+use crate::aws::{Aws, AwsError, codebuild, codepipeline as cp, logs, secrets, ssm};
 use crate::config::{self, Config, Environment, Loaded, PipelineConfig};
 use crate::pipeline::{self, StageView, Status};
 use crate::tui::picker::{self, Item, Picker};
@@ -182,12 +182,7 @@ pub enum Command {
         yes: bool,
     },
     /// Show a Lambda function's configuration: lambda [ENV] NAME
-    Lambda {
-        env: Option<String>,
-        name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Lambda(crate::clicmd::lambda::Args),
     /// S3: list buckets and objects, presigned download links, downloads
     S3(crate::clicmd::s3::Args),
     /// Step Functions: executions of a state machine, failure reports
@@ -198,6 +193,20 @@ pub enum Command {
     Events(crate::clicmd::events::Args),
     /// AppConfig feature flags per environment
     Flags(crate::clicmd::appconfig::Args),
+    /// Manual approvals waiting in every environment
+    Approvals(crate::clicmd::approvals::Args),
+    /// Deploy the commit an environment runs to the next environment of an application
+    Promote(crate::clicmd::promote::Args),
+    /// Go back to the last commit that deployed successfully
+    Rollback(crate::clicmd::promote::RollbackArgs),
+    /// CloudWatch alarms, those firing first
+    Alarms(crate::clicmd::alarms::Args),
+    /// SQS queues, dead-letter queues and redrive
+    Sqs(crate::clicmd::sqs::Args),
+    /// Run a CloudWatch Logs Insights query
+    Insights(crate::clicmd::insights::Args),
+    /// CloudFormation stacks: events, resources, outputs, drift, failure reports
+    Cfn(crate::clicmd::cfn::Args),
     /// Update dcli to the latest release (through npm when installed with npm)
     Update {
         /// Only tell whether a newer version exists
@@ -527,10 +536,14 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Ddb(args) => crate::clicmd::dynamodb::run(config, args),
         Command::Events(args) => crate::clicmd::events::run(config, args),
         Command::Flags(args) => crate::clicmd::appconfig::run(config, args),
-        Command::Lambda { env, name, json } => {
-            let (env, Some(name)) = env_and(config, env, name)? else { bail!("which function? {} lambda [ENV] NAME", program()) };
-            lambda_show(aws_for(config, &env)?.as_ref(), &name, json)
-        }
+        Command::Approvals(args) => crate::clicmd::approvals::run(config, args),
+        Command::Promote(args) => crate::clicmd::promote::run(config, args),
+        Command::Rollback(args) => crate::clicmd::promote::rollback(config, args),
+        Command::Alarms(args) => crate::clicmd::alarms::run(config, args),
+        Command::Sqs(args) => crate::clicmd::sqs::run(config, args),
+        Command::Insights(args) => crate::clicmd::insights::run(config, args),
+        Command::Cfn(args) => crate::clicmd::cfn::run(config, args),
+        Command::Lambda(args) => crate::clicmd::lambda::run(config, args),
     }
 }
 
@@ -1308,26 +1321,3 @@ fn param(aws: &Aws, name: &str, decrypt: bool, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn lambda_show(aws: &Aws, name: &str, json: bool) -> Result<ExitCode> {
-    let f = lambda::get_function(aws, name)?;
-    if json {
-        print_json(&serde_json::to_value(&f)?);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let c = &f.configuration;
-    let row = |k: &str, v: String| println!("  {:<14} {v}", paint(k, "90"));
-    println!("{}", paint(&c.function_name, "1"));
-    row("ARN", c.function_arn.clone());
-    row("Runtime", c.runtime.clone().unwrap_or_else(|| "—".into()));
-    row("Handler", c.handler.clone().unwrap_or_default());
-    row("Memory", c.memory_size.map(|m| format!("{m} MB")).unwrap_or_default());
-    row("Timeout", c.timeout.map(|t| format!("{t} s")).unwrap_or_default());
-    row("Architecture", c.architectures.join(", "));
-    row("State", c.state.clone().unwrap_or_default());
-    row("Modified", c.last_modified.clone().unwrap_or_default());
-    row("Role", c.role.clone().unwrap_or_default());
-    if let Some(env) = &c.environment {
-        row("Env vars", env.variables.keys().cloned().collect::<Vec<_>>().join(", "));
-    }
-    Ok(ExitCode::SUCCESS)
-}

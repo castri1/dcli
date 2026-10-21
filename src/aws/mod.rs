@@ -4,8 +4,10 @@
 //! its own file. Most AWS APIs speak either `awsJson1_1` (`Aws::call`) or `restJson1`
 //! (`Aws::rest`), so no per-service SDK crate is needed.
 
+pub mod alarms;
 pub mod appconfig;
 pub mod cloudformation;
+pub mod cloudwatch;
 pub mod codebuild;
 pub mod codepipeline;
 pub mod credentials;
@@ -15,11 +17,13 @@ pub mod events;
 pub mod http;
 pub mod lambda;
 pub mod logs;
+pub mod metrics;
 pub mod profile;
 pub mod s3;
 pub mod secrets;
 pub mod sfn;
 pub mod sigv4;
+pub mod sqs;
 pub mod ssm;
 pub mod sso;
 

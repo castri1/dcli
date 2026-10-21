@@ -16,6 +16,7 @@ use std::time::Instant;
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 
 use crate::aws::Aws;
 use crate::config::{Config, Loaded, PipelineConfig};
@@ -233,6 +234,12 @@ pub trait Module {
 
     /// Key hints for the footer and the help screen.
     fn hints(&self) -> Vec<(&'static str, &'static str)>;
+
+    /// A short count for the header (alarms firing, approvals waiting) and its colour. It
+    /// shows next to the module's name even while another module is open.
+    fn badge(&self) -> Option<(String, Color)> {
+        None
+    }
 
     /// True while something animates, so the app redraws at 10 fps instead of 1.
     fn animating(&self) -> bool {

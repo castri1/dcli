@@ -449,24 +449,44 @@ impl App {
         let active = Style::new().fg(ratatui::style::Color::Black).bg(theme::ACCENT).bold();
         let labels: Vec<String> =
             self.modules.iter().enumerate().map(|(i, m)| format!(" {} {} ", i + 1, m.title())).collect();
-        let tabs_width: usize = labels.iter().map(|l| l.chars().count() + 1).sum();
+        let badges: Vec<Option<(String, ratatui::style::Color)>> = self.modules.iter().map(|m| m.badge()).collect();
+        let badge_width = |b: &Option<(String, ratatui::style::Color)>| b.as_ref().map_or(0, |(t, _)| t.chars().count() + 2);
+        let tabs_width: usize = labels.iter().zip(&badges).map(|(l, b)| l.chars().count() + badge_width(b) + 1).sum();
         let fits = logo.chars().count() + 1 + tabs_width + badge.width() + 2 <= area.width as usize;
 
         let mut spans = vec![Span::styled(logo.clone(), theme::accent().bold()), Span::raw(" ")];
         let mut x = area.x + logo.chars().count() as u16 + 1;
         self.tab_hits.clear();
         if fits {
-            for (i, label) in labels.into_iter().enumerate() {
-                let width = label.chars().count() as u16;
+            for (i, (label, badge)) in labels.into_iter().zip(&badges).enumerate() {
+                let width = (label.chars().count() + badge_width(badge)) as u16;
                 self.tab_hits.push((Rect::new(x, area.y, width, 1), i));
                 spans.push(Span::styled(label, if i == self.active { active } else { theme::muted() }));
+                if let Some((text, color)) = badge {
+                    spans.push(Span::styled(format!(" {text} "), Style::new().fg(*color).bold()));
+                }
                 spans.push(Span::raw(" "));
                 x += width + 1;
             }
         } else {
-            // Too many modules (or a narrow terminal): the current one, and the palette key.
-            spans.push(Span::styled(format!(" {} ", self.modules[self.active].title()), active));
+            // Too many modules (or a narrow terminal): the current one, the palette key, and
+            // the modules with something to say (clickable).
+            let current = format!(" {} ", self.modules[self.active].title());
+            x += (current.chars().count() + "  : modules".len()) as u16;
+            spans.push(Span::styled(current, active));
             spans.push(Span::styled("  : modules", theme::muted()));
+            let env_width = badge.width() as u16;
+            for (i, count) in badges.iter().enumerate() {
+                let Some((text, color)) = count else { continue };
+                let label = format!("   {} {text}", self.modules[i].title());
+                let width = label.chars().count() as u16;
+                if x + width + env_width > area.right() {
+                    break;
+                }
+                self.tab_hits.push((Rect::new(x + 3, area.y, width - 3, 1), i));
+                spans.push(Span::styled(label, Style::new().fg(*color).bold()));
+                x += width;
+            }
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
         f.render_widget(Paragraph::new(badge), area);
