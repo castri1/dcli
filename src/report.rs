@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use crate::aws::{self, Aws, cloudformation, codebuild, codepipeline as cp, logs};
 use crate::pipeline::{self, ActionView, StageView, Status};
-use crate::util::{first_line, fmt_ago, fmt_duration, fmt_utc, looks_like_error};
+use crate::util::{first_line, fmt_ago, fmt_duration, fmt_utc, looks_like_error, md_code};
 
 /// Recent executions searched for the last failure.
 const LOOKBACK: u32 = 10;
@@ -75,18 +75,19 @@ pub fn failure_report(aws: &Aws, env_name: &str, pipeline: &str, full_log: bool)
         );
     }
     if let Some(summary) = exec.status_summary.as_deref().filter(|s| !s.is_empty()) {
-        let _ = writeln!(md, "- **Status summary:** {}", one_line(summary));
+        let _ = writeln!(md, "- **Status summary:** {}", md_code(&one_line(summary)));
     }
     if revision.commit.is_some() || revision.message.is_some() {
-        let mut text = revision.commit.as_deref().map(|c| format!("`{c}`")).unwrap_or_default();
+        // Commit messages and branch names are anyone's text: quoted, never loose Markdown.
+        let mut text = revision.commit.as_deref().map(md_code).unwrap_or_default();
         if let Some(m) = &revision.message {
-            let _ = write!(text, " {}", first_line(m));
+            let _ = write!(text, " {}", md_code(first_line(m)));
         }
         if let Some(b) = &revision.branch {
-            let _ = write!(text, " · branch `{b}`");
+            let _ = write!(text, " · branch {}", md_code(b));
         }
         if let Some(r) = &revision.repo {
-            let _ = write!(text, " · repo `{r}`");
+            let _ = write!(text, " · repo {}", md_code(r));
         }
         let _ = writeln!(md, "- **Commit:** {}", text.trim());
     }
@@ -130,7 +131,7 @@ pub fn failure_report(aws: &Aws, env_name: &str, pipeline: &str, full_log: bool)
         let provider = action.provider.as_deref().map(|p| format!(" ({p})")).unwrap_or_default();
         let _ = writeln!(md, "\n### Failed: stage `{}`, action `{}`{provider}\n", stage.name, action.name);
         if let Some(e) = &action.error {
-            let _ = writeln!(md, "- **Error:** {}", one_line(e));
+            let _ = writeln!(md, "- **Error:** {}", md_code(&one_line(e)));
         }
         if let Some(u) = &action.url {
             let _ = writeln!(md, "- **Console:** {u}");
@@ -171,7 +172,8 @@ pub fn failure_report(aws: &Aws, env_name: &str, pipeline: &str, full_log: bool)
                 })
                 .collect();
             let status = phase.phase_status.as_deref().unwrap_or("?");
-            let _ = writeln!(md, "- **Phase `{}`:** {status}{}", phase.phase_type, prefixed(" — ", &contexts.join("; ")));
+            let context = if contexts.is_empty() { String::new() } else { md_code(&contexts.join("; ")) };
+            let _ = writeln!(md, "- **Phase `{}`:** {status}{}", phase.phase_type, prefixed(" — ", &context));
         }
         let Some(location) = &build.logs else { continue };
         if let Some(link) = &location.deep_link {
@@ -227,7 +229,7 @@ fn write_stack_events(md: &mut String, stack: &str, events: &[cloudformation::St
     }
     let _ = writeln!(md, "- **Stack `{stack}` — failed resources** (oldest first):");
     for e in failed {
-        let reason = e.reason.as_deref().map(|r| format!(": {}", one_line(r))).unwrap_or_default();
+        let reason = e.reason.as_deref().map(|r| format!(": {}", md_code(&one_line(r)))).unwrap_or_default();
         let _ = writeln!(md, "  - `{}` ({}) {}{reason}", e.logical_id, e.resource_type, e.status);
     }
 }

@@ -10,7 +10,7 @@ use serde_json::json;
 
 use super::{Aws, Result, Service};
 use crate::pipeline::Status;
-use crate::util::{fmt_ago, fmt_duration, fmt_utc, pretty_json};
+use crate::util::{fmt_ago, fmt_duration, fmt_utc, md_code, pretty_json};
 
 pub const SERVICE: Service = Service { endpoint: "states", signing_name: "states", target_prefix: "AWSStepFunctions" };
 
@@ -574,10 +574,10 @@ pub fn report(env_name: &str, region: &str, machine: &MachineDetail, detail: &Ex
     }
     if let Some(f) = &failure {
         if let Some(state) = &f.state {
-            let _ = writeln!(md, "- **Failed state:** `{state}`");
+            let _ = writeln!(md, "- **Failed state:** {}", md_code(state));
         }
         if let Some(e) = &f.error {
-            let _ = writeln!(md, "- **Error:** `{e}`");
+            let _ = writeln!(md, "- **Error:** {}", md_code(e));
         }
         if let Some(c) = &f.cause {
             let _ = writeln!(md, "\n**Cause:**\n");
@@ -609,7 +609,7 @@ pub fn report(env_name: &str, region: &str, machine: &MachineDetail, detail: &Ex
             };
             let resource = s.lambda.as_deref().map(|l| format!("lambda `{l}`")).or_else(|| s.resource.clone()).unwrap_or_default();
             let duration = s.duration(now).map(fmt_duration).unwrap_or_default();
-            let _ = writeln!(md, "| `{}` | {} | {status}{retries} | {duration} | {resource} |", s.name, s.kind);
+            let _ = writeln!(md, "| {} | {} | {status}{retries} | {duration} | {resource} |", md_code(&s.name).replace('|', "\\|"), s.kind);
         }
     }
     let mut logs = Vec::new();
