@@ -1,5 +1,6 @@
 mod asl;
 mod aws;
+mod catalog;
 mod cli;
 mod clicmd;
 mod config;

@@ -64,6 +64,8 @@ pub struct Parameters {
     list_area: Rect,
     editing: Option<Editing>,
     env_name: String,
+    /// A parameter to show once it is listed (from the `:` search).
+    open_target: Option<String>,
 }
 
 impl Parameters {
@@ -86,13 +88,14 @@ impl Parameters {
             list_area: Rect::default(),
             editing: None,
             env_name: String::new(),
+            open_target: None,
         }
     }
 
     fn load(&mut self, ctx: &mut Ctx) {
-        let env_name = std::mem::take(&mut self.env_name);
+        let (env_name, open_target) = (std::mem::take(&mut self.env_name), self.open_target.take());
         *self = Parameters::new();
-        self.env_name = env_name;
+        (self.env_name, self.open_target) = (env_name, open_target);
         self.load = LoadState::Loading;
         let aws = ctx.env().aws.clone();
         ctx.spawn_stream(move |em: Emitter<Msg>| {
@@ -189,6 +192,23 @@ impl Parameters {
         {
             self.pending = Some((p.name.clone(), Instant::now()));
         }
+    }
+
+    /// Shows the parameter asked for by `open`, in its folder, once it is listed.
+    fn try_open(&mut self) -> bool {
+        let Some(name) = self.open_target.clone() else { return false };
+        let Some(i) = self.all.iter().position(|p| p.name == name) else { return false };
+        self.open_target = None;
+        self.filter.clear();
+        self.filtering = false;
+        self.prefix = match name.rfind('/') {
+            Some(slash) if slash > 0 => name[..=slash].to_string(),
+            _ => String::new(),
+        };
+        self.rebuild();
+        let pos = self.entries.iter().position(|e| matches!(e, Entry::Param(k) if *k == i)).unwrap_or(0);
+        self.select(pos);
+        true
     }
 
     fn enter(&mut self) {
@@ -520,6 +540,12 @@ impl Module for Parameters {
         }
     }
 
+    /// Shows parameter `target` in its folder, now or once it is listed.
+    fn open(&mut self, target: &str, _ctx: &mut Ctx) {
+        self.open_target = Some(target.to_string());
+        self.try_open();
+    }
+
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
         if let Some(editing) = &mut self.editing {
             if editing.busy {
@@ -622,7 +648,7 @@ impl Module for Parameters {
                 let first = self.all.is_empty();
                 self.all.extend(page);
                 self.rebuild();
-                if first {
+                if !self.try_open() && first {
                     self.select(0);
                 }
             }

@@ -522,6 +522,12 @@ impl Module for EventBridge {
         }
     }
 
+    /// Shows the rules of event bus `target`.
+    fn open(&mut self, target: &str, ctx: &mut Ctx) {
+        self.sending = None;
+        self.open_bus(target.to_string(), ctx);
+    }
+
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
         if let Some(sending) = &mut self.sending {
             if sending.busy {

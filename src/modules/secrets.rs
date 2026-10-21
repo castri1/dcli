@@ -344,6 +344,17 @@ impl Module for Secrets {
         }
     }
 
+    /// Selects secret `target`, now or once it is listed.
+    fn open(&mut self, target: &str, _ctx: &mut Ctx) {
+        self.filter.clear();
+        self.filtering = false;
+        self.refilter();
+        match self.visible.iter().position(|&i| self.all[i].name == target) {
+            Some(pos) => self.select(pos),
+            None => self.reselect = Some(target.to_string()),
+        }
+    }
+
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
         if let Some(editing) = &mut self.editing {
             if editing.busy {

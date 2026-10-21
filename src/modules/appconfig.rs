@@ -119,6 +119,8 @@ pub struct AppConfig {
     env_name: String,
     scroll: u16,
     list_area: Rect,
+    /// An application (id or name) to open once the list arrives (from the `:` search).
+    open_target: Option<String>,
 }
 
 /// Grey hint for an empty attribute field.
@@ -168,6 +170,7 @@ impl AppConfig {
             env_name: String::new(),
             scroll: 0,
             list_area: Rect::default(),
+            open_target: None,
         }
     }
 
@@ -914,6 +917,22 @@ impl Module for AppConfig {
         }
     }
 
+    /// Opens application `target` (its id or name), now or once the list arrives.
+    fn open(&mut self, target: &str, ctx: &mut Ctx) {
+        if !matches!(self.apps_load, LoadState::Loaded) {
+            self.open_target = Some(target.to_string());
+            return;
+        }
+        match self.apps.iter().position(|a| a.id == target || a.name == target) {
+            Some(i) => {
+                self.dialog = None;
+                self.list_state.select(Some(i));
+                self.open_app(i, ctx);
+            }
+            None => ctx.toast(Level::Warn, format!("AppConfig application not found here: {target}")),
+        }
+    }
+
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
         if self.dialog.is_some() {
             self.dialog_key(key, ctx);
@@ -1005,6 +1024,9 @@ impl Module for AppConfig {
                     self.apps_load = LoadState::Loaded;
                     if self.open.is_none() {
                         self.list_state.select(if self.apps.is_empty() { None } else { Some(0) });
+                    }
+                    if let Some(target) = self.open_target.take() {
+                        self.open(&target, ctx);
                     }
                 }
                 Err(e) => self.apps_load = LoadState::Failed(e),

@@ -24,11 +24,13 @@ pub struct Item {
     pub color: Option<Color>,
     /// Marked with ● (the current environment or module).
     pub current: bool,
+    /// Listed only once something is typed (the many resources in the `:` palette).
+    pub on_search: bool,
 }
 
 impl Item {
     pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Item {
-        Item { label: label.into(), detail: detail.into(), color: None, current: false }
+        Item { label: label.into(), detail: detail.into(), color: None, current: false, on_search: false }
     }
 
     pub fn color(mut self, color: Color) -> Item {
@@ -38,6 +40,11 @@ impl Item {
 
     pub fn current(mut self, current: bool) -> Item {
         self.current = current;
+        self
+    }
+
+    pub fn on_search(mut self) -> Item {
+        self.on_search = true;
         self
     }
 }
@@ -85,11 +92,26 @@ impl Picker {
         self
     }
 
+    /// Replaces the items (they arrived while the list was open), keeping what was typed
+    /// and the item under the cursor.
+    pub fn set_items(&mut self, items: Vec<Item>) {
+        let keep = self.cursor().map(|i| (self.items[i].label.clone(), self.items[i].detail.clone()));
+        self.items = items;
+        self.marked.clear();
+        self.refilter();
+        if let Some(pos) = keep.and_then(|(l, d)| self.visible.iter().position(|&i| self.items[i].label == l && self.items[i].detail == d)) {
+            self.state.select(Some(pos));
+        }
+    }
+
     /// Label matches first, then matches on the detail only.
     fn refilter(&mut self) {
         let query = self.input.value.to_lowercase();
         let (mut by_label, mut by_detail) = (Vec::new(), Vec::new());
         for (i, item) in self.items.iter().enumerate() {
+            if item.on_search && query.trim().is_empty() {
+                continue;
+            }
             if matches_filter(&item.label, &query) {
                 by_label.push(i);
             } else if matches_filter(&format!("{} {}", item.label, item.detail), &query) {

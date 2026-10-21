@@ -181,6 +181,8 @@ pub struct DynamoDb {
     region: String,
     list_area: Rect,
     detail_area: Rect,
+    /// A table to select once it is listed (from the `:` search).
+    open_target: Option<String>,
 }
 
 impl DynamoDb {
@@ -202,7 +204,21 @@ impl DynamoDb {
             region: String::new(),
             list_area: Rect::default(),
             detail_area: Rect::default(),
+            open_target: None,
         }
+    }
+
+    /// Selects the table asked for by `open`, once it is listed.
+    fn try_open(&mut self) -> bool {
+        let Some(name) = self.open_target.clone() else { return false };
+        let Some(i) = self.tables.iter().position(|t| *t == name) else { return false };
+        self.open_target = None;
+        self.filter.clear();
+        self.filtering = false;
+        self.refilter();
+        let pos = self.visible.iter().position(|&v| v == i).unwrap_or(0);
+        self.select(pos);
+        true
     }
 
     fn load(&mut self, ctx: &mut Ctx) {
@@ -737,6 +753,14 @@ impl Module for DynamoDb {
         }
     }
 
+    /// Selects table `target` in the list of tables, now or once it is listed.
+    fn open(&mut self, target: &str, _ctx: &mut Ctx) {
+        self.open = None;
+        self.dialog = None;
+        self.open_target = Some(target.to_string());
+        self.try_open();
+    }
+
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
         // Dialogs first: the index picker, then the query form.
         if let Some(dialog) = &mut self.dialog {
@@ -906,7 +930,7 @@ impl Module for DynamoDb {
                 let first = self.tables.is_empty();
                 self.tables.extend(page);
                 self.refilter();
-                if first {
+                if !self.try_open() && first {
                     self.select(0);
                 }
             }

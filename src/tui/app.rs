@@ -4,6 +4,7 @@
 //! The header lists the modules while they fit; past that it shows only the current one,
 //! and `:` (a searchable palette) reaches any module or environment.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -37,17 +38,29 @@ enum LoginMsg {
 /// A newer dcli release exists (tag).
 struct UpdateAvailable(String);
 
+/// The resources of an environment, listed for the `:` palette.
+struct CatalogLoaded {
+    env: String,
+    resources: Vec<crate::catalog::Resource>,
+    listed: usize,
+}
+
+/// How long the resources listed for the palette are reused.
+const CATALOG_TTL: Duration = Duration::from_secs(300);
+
 /// What a palette entry does.
 #[derive(Clone)]
 enum Jump {
     Module(usize),
     Env(String),
+    /// Open a resource: the module's title and what to pass to its `open`.
+    Resource(&'static str, String),
 }
 
 enum Overlay {
     Help,
-    /// Module palette (`:`) or environment picker (`e`).
-    Palette(Picker, Vec<Jump>),
+    /// Module palette (`:`, with modules and resources) or environment picker (`e`).
+    Palette { picker: Picker, jumps: Vec<Jump>, modules: bool },
     Login { profile: String, lines: Vec<String>, error: Option<String> },
 }
 
@@ -57,6 +70,9 @@ pub struct App {
     activated: Vec<bool>,
     shared: Shared,
     overlay: Option<Overlay>,
+    /// Resources listed per environment for the palette, and when.
+    catalogs: HashMap<String, (Instant, Vec<crate::catalog::Resource>)>,
+    catalog_loading: HashSet<String>,
     started: Instant,
     tab_hits: Vec<(Rect, usize)>,
     login_running: bool,
@@ -106,6 +122,8 @@ impl App {
                 login: None,
             },
             overlay: None,
+            catalogs: HashMap::new(),
+            catalog_loading: HashSet::new(),
             started: Instant::now(),
             tab_hits: Vec::new(),
             login_running: false,
@@ -181,7 +199,7 @@ impl App {
             AppEvent::Input(Event::Key(key)) if key.kind != KeyEventKind::Release => self.key(key),
             AppEvent::Input(Event::Mouse(m)) => self.mouse(m),
             AppEvent::Input(Event::Paste(text)) => match &mut self.overlay {
-                Some(Overlay::Palette(picker, _)) => picker.paste(&text),
+                Some(Overlay::Palette { picker, .. }) => picker.paste(&text),
                 Some(_) => {}
                 None => {
                     let active = self.active;
@@ -249,7 +267,7 @@ impl App {
                     self.overlay = None;
                 }
             }
-            Overlay::Palette(picker, jumps) => match picker.handle(key) {
+            Overlay::Palette { picker, jumps, .. } => match picker.handle(key) {
                 Outcome::Pending => {}
                 Outcome::Cancel => self.overlay = None,
                 Outcome::Done(chosen) => {
@@ -258,6 +276,12 @@ impl App {
                     match jump {
                         Some(Jump::Module(i)) => self.select_module(i),
                         Some(Jump::Env(name)) => self.switch_env(&name),
+                        Some(Jump::Resource(module, target)) => {
+                            if let Some(i) = self.modules.iter().position(|m| m.title() == module) {
+                                self.select_module(i);
+                                self.with_module(i, |m, ctx| m.open(&target, ctx));
+                            }
+                        }
                         None => {}
                     }
                 }
@@ -265,8 +289,24 @@ impl App {
         }
     }
 
-    /// `:` lists modules then environments; `e` only environments.
+    /// `:` lists modules, environments and (as you type) the environment's resources; `e`
+    /// only environments.
     fn open_palette(&mut self, with_modules: bool) {
+        if with_modules {
+            self.list_resources();
+        }
+        let (items, jumps) = self.palette_items(with_modules);
+        let cursor = if with_modules {
+            self.active
+        } else {
+            self.shared.loaded.config.environments.get_index_of(&self.shared.env.name).unwrap_or(0)
+        };
+        let (title, submit) = if with_modules { ("Go to", "go") } else { ("Environment", "switch") };
+        let picker = Picker::new(title, submit, items, false).with_cursor(cursor);
+        self.overlay = Some(Overlay::Palette { picker, jumps, modules: with_modules });
+    }
+
+    fn palette_items(&self, with_modules: bool) -> (Vec<Item>, Vec<Jump>) {
         let mut items = Vec::new();
         let mut jumps = Vec::new();
         if with_modules {
@@ -291,13 +331,39 @@ impl App {
             );
             jumps.push(Jump::Env(name.clone()));
         }
-        let cursor = if with_modules {
-            self.active
-        } else {
-            self.shared.loaded.config.environments.get_index_of(&self.shared.env.name).unwrap_or(0)
-        };
-        let (title, submit) = if with_modules { ("Go to", "go") } else { ("Environment", "switch") };
-        self.overlay = Some(Overlay::Palette(Picker::new(title, submit, items, false).with_cursor(cursor), jumps));
+        if with_modules {
+            match self.catalogs.get(&self.shared.env.name) {
+                Some((_, resources)) => {
+                    for r in resources {
+                        items.push(Item::new(r.name.as_str(), r.detail.as_str()).on_search());
+                        jumps.push(Jump::Resource(r.module, r.target.clone()));
+                    }
+                }
+                None if self.catalog_loading.contains(&self.shared.env.name) => {
+                    items.push(Item::new("…", "listing this environment's resources").on_search());
+                    jumps.push(Jump::Module(self.active));
+                }
+                None => {}
+            }
+        }
+        (items, jumps)
+    }
+
+    /// Lists the current environment's resources for the palette in the background, unless
+    /// a recent list exists.
+    fn list_resources(&mut self) {
+        let env = self.shared.env.clone();
+        let fresh = self.catalogs.get(&env.name).is_some_and(|(at, _)| at.elapsed() < CATALOG_TTL);
+        if fresh || !self.catalog_loading.insert(env.name.clone()) {
+            return;
+        }
+        let tx = self.shared.tx.clone();
+        let pipelines: Vec<String> = env.pipelines.iter().map(|p| p.name.clone()).collect();
+        std::thread::spawn(move || {
+            let (resources, listed) = crate::catalog::list(&env.aws, &pipelines);
+            let loaded = CatalogLoaded { env: env.name.clone(), resources, listed };
+            let _ = tx.send(AppEvent::Task { module: APP, generation: 0, payload: Box::new(loaded) });
+        });
     }
 
     fn mouse(&mut self, event: MouseEvent) {
@@ -375,6 +441,25 @@ impl App {
     }
 
     fn app_task(&mut self, payload: Payload) {
+        let payload = match payload.downcast::<CatalogLoaded>() {
+            Ok(loaded) => {
+                let CatalogLoaded { env, resources, listed } = *loaded;
+                self.catalog_loading.remove(&env);
+                // Nothing could be listed (an expired session): try again next time.
+                if listed > 0 {
+                    self.catalogs.insert(env, (Instant::now(), resources));
+                }
+                if matches!(self.overlay, Some(Overlay::Palette { modules: true, .. })) {
+                    let (items, new_jumps) = self.palette_items(true);
+                    if let Some(Overlay::Palette { picker, jumps, .. }) = &mut self.overlay {
+                        picker.set_items(items);
+                        *jumps = new_jumps;
+                    }
+                }
+                return;
+            }
+            Err(other) => other,
+        };
         let payload = match payload.downcast::<UpdateAvailable>() {
             Ok(update) => {
                 let text = format!(
@@ -584,7 +669,7 @@ impl App {
                 let height = lines.len() as u16 + 2;
                 widgets::popup(f, widgets::popup_area(area, width, height), "Keys", theme::ACCENT, Text::from(lines));
             }
-            Overlay::Palette(picker, _) => {
+            Overlay::Palette { picker, .. } => {
                 let rect = widgets::popup_area(area, 84, picker.height(area.height.saturating_sub(4)));
                 picker.render(f, rect, theme::ACCENT);
             }
