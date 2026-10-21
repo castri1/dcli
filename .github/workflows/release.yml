@@ -95,8 +95,20 @@ jobs:
       - run: npm install -g npm@latest
       - run: gh release download "$TAG" --dir archives --pattern 'dcli-*'
       - run: node npm/build.mjs "$TAG" archives out
+      # A version already on npm is skipped, so the job can run again after a partial
+      # failure; signing the provenance sometimes fails once (a transparency log conflict).
       - name: Publish (platform packages first, the launcher last)
         run: |
+          published() { [ -n "$(npm view "$1@$2" version 2>/dev/null)" ]; }
           for dir in out/dcli-*/ out/dcli/; do
-            npm publish --access public "$dir"
+            name=$(node -p "require('./${dir}package.json').name")
+            version=$(node -p "require('./${dir}package.json').version")
+            if published "$name" "$version"; then
+              echo "$name@$version is already published"
+              continue
+            fi
+            npm publish --access public "$dir" || {
+              sleep 30
+              published "$name" "$version" || npm publish --access public "$dir"
+            }
           done
