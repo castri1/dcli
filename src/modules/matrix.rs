@@ -1,6 +1,8 @@
 //! What is deployed where: applications × environments, the commit each environment runs
 //! (its last successful execution), what is deploying now and how far each environment
-//! trails the one to its left. Enter opens the pipeline; `g` compares the commits.
+//! trails the one to its left. Enter opens the pipeline; `g` compares the commits; `p`
+//! promotes what the environment to the left runs and `R` rolls back (both confirmed and
+//! run by Pipelines, in that environment).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +17,7 @@ use ratatui::widgets::Paragraph;
 use crate::aws::{self, Aws};
 use crate::aws::credentials::effective_profile;
 use crate::matrix::{App, Cell, Drift, drift};
-use crate::pipeline::{self, Status};
+use crate::pipeline::{self, Intent, Status};
 use crate::tui::module::{Ctx, Handled, Level, Module, Payload, View};
 use crate::tui::theme;
 use crate::tui::widgets;
@@ -116,6 +118,66 @@ impl Matrix {
             return Err("Nothing to compare");
         };
         pipeline::compare_url(older, newer, None).ok_or("No commit comparison for this source (GitHub, GitLab or Bitbucket only)")
+    }
+
+    /// `p`: deploys to the selected cell what the environment to its left runs. Pipelines,
+    /// in that environment, confirms and runs it.
+    fn promote(&self, ctx: &mut Ctx) {
+        let (row, col) = (self.row, self.col);
+        let Some(pipeline) = self.apps.get(row).and_then(|a| a.pipelines.get(col)?.clone()) else {
+            return ctx.toast(Level::Info, "No pipeline here to promote to");
+        };
+        let (app, env) = (&self.apps[row].name, &self.columns[col].env);
+        let Some(left) = (0..col).rev().find(|&c| self.apps[row].pipelines[c].is_some()) else {
+            return ctx.toast(Level::Info, format!("{env} is the first environment of {app}: nothing to promote from"));
+        };
+        let left_env = self.columns[left].env.clone();
+        match &self.cells[row][col] {
+            State::Ready(_) => {}
+            State::Login => return ctx.toast(Level::Warn, format!("Sign in to {env} first (Enter)")),
+            _ => return ctx.toast(Level::Info, format!("{env} is still loading")),
+        }
+        let Some(theirs) = self.cell(row, left).and_then(Cell::deployed) else {
+            return ctx.toast(Level::Info, format!("{left_env} has no successful deploy of {app} to promote (or is still loading)"));
+        };
+        let behind = match self.drift_of(row, col).map(|(_, d)| d) {
+            Some(Drift::InSync) => return ctx.toast(Level::Info, format!("{env} already runs what {left_env} runs")),
+            Some(Drift::Behind(n)) => Some(n),
+            _ => None,
+        };
+        let Some(revision) = crate::matrix::commit_of(theirs) else {
+            return ctx.toast(Level::Info, format!("{left_env}'s deploy of {app} has no revision to promote"));
+        };
+        let intent = Intent::Promote {
+            pipeline,
+            revision: revision.to_string(),
+            source_action: theirs.source_revisions.first().map(|r| r.action_name.clone()).unwrap_or_default(),
+            from_env: left_env,
+            summary: pipeline::revision(theirs, &[]).one_line(),
+            behind,
+        };
+        self.hand_off(col, intent, ctx);
+    }
+
+    /// `R`: goes back to the previous successful deploy of the selected cell.
+    fn rollback(&self, ctx: &mut Ctx) {
+        let (row, col) = (self.row, self.col);
+        let Some(pipeline) = self.apps.get(row).and_then(|a| a.pipelines.get(col)?.clone()) else {
+            return ctx.toast(Level::Info, "No pipeline here to roll back");
+        };
+        if matches!(self.cells[row][col], State::Login) {
+            return ctx.toast(Level::Warn, format!("Sign in to {} first (Enter)", self.columns[col].env));
+        }
+        self.hand_off(col, Intent::Rollback { pipeline }, ctx);
+    }
+
+    /// Opens Pipelines in the column's environment with `intent`.
+    fn hand_off(&self, col: usize, intent: Intent, ctx: &mut Ctx) {
+        let env = &self.columns[col].env;
+        if *env != ctx.env().name {
+            ctx.switch_env(env.clone());
+        }
+        ctx.jump("Pipelines", intent.encode());
     }
 
     fn render_cell(&self, row: usize, col: usize, view: &View, width: usize) -> Vec<Span<'static>> {
@@ -246,16 +308,16 @@ impl Matrix {
                     let text = match d {
                         Drift::InSync => format!("same commit as {left_env}"),
                         Drift::Behind(n) => format!(
-                            "{n} deploy{} behind {left_env}, which runs {theirs} · g compares the commits",
+                            "{n} deploy{} behind {left_env}, which runs {theirs} · g compares the commits · p promotes it",
                             if n == 1 { "" } else { "s" }
                         ),
-                        Drift::Differs => format!("differs from {left_env} ({theirs}); not in its recent history · g compares"),
+                        Drift::Differs => format!("differs from {left_env} ({theirs}); not in its recent history · g compares · p deploys {left_env}'s"),
                     };
                     let style = if d == Drift::InSync { Style::new().fg(theme::OK) } else { Style::new().fg(theme::WARN) };
                     lines.push(Line::from(vec![Span::styled(format!("{:<kw$} ", format!("vs {left_env}")), theme::muted()), Span::styled(text, style)]));
                 }
                 lines.push(Line::raw(""));
-                lines.push(Line::styled("Enter opens it in Pipelines", theme::muted()));
+                lines.push(Line::styled("Enter opens it in Pipelines · R rolls it back to its previous deploy", theme::muted()));
             }
         }
         f.render_widget(
@@ -319,6 +381,8 @@ impl Module for Matrix {
                     _ => {}
                 }
             }
+            KeyCode::Char('p') => self.promote(ctx),
+            KeyCode::Char('R') => self.rollback(ctx),
             KeyCode::Char('g') => match self.compare_link() {
                 Ok(url) => {
                     if !crate::platform::open_url(&url) {
@@ -390,7 +454,7 @@ impl Module for Matrix {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("↑↓←→", "move"), ("Enter", "open / sign in"), ("g", "compare commits"), ("r", "refresh")]
+        vec![("↑↓←→", "move"), ("Enter", "open / sign in"), ("p", "promote"), ("R", "rollback"), ("g", "compare commits"), ("r", "refresh")]
     }
 
     fn animating(&self) -> bool {

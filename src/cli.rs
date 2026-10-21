@@ -273,10 +273,10 @@ pub(crate) fn ask(question: &str) -> String {
 
 // ---- context -----------------------------------------------------------------------
 
-struct Target<'a> {
-    env_name: String,
-    pipeline: &'a PipelineConfig,
-    aws: Arc<Aws>,
+pub(crate) struct Target<'a> {
+    pub(crate) env_name: String,
+    pub(crate) pipeline: &'a PipelineConfig,
+    pub(crate) aws: Arc<Aws>,
 }
 
 pub(crate) fn aws_for(config: &Config, env_name: &str) -> Result<Arc<Aws>> {
@@ -306,7 +306,7 @@ pub(crate) fn env_and(config: &Config, env: Option<String>, item: Option<String>
 }
 
 /// Resolves `[ENV] [PIPELINE]`; without a pipeline, the only one, or a picker in a terminal.
-fn target(config: &Config, env: Option<String>, pipeline: Option<String>) -> Result<Target<'_>> {
+pub(crate) fn target(config: &Config, env: Option<String>, pipeline: Option<String>) -> Result<Target<'_>> {
     let (env_name, pipeline) = env_and(config, env, pipeline)?;
     let env = config.env(&env_name)?;
     let pipeline = match pipeline {
@@ -537,8 +537,8 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Events(args) => crate::clicmd::events::run(config, args),
         Command::Flags(args) => crate::clicmd::appconfig::run(config, args),
         Command::Approvals(args) => crate::clicmd::approvals::run(config, args),
-        Command::Promote(args) => crate::clicmd::promote::run(config, args),
-        Command::Rollback(args) => crate::clicmd::promote::rollback(config, args),
+        Command::Promote(args) => crate::clicmd::promote::run(&loaded, args),
+        Command::Rollback(args) => crate::clicmd::promote::rollback(&loaded, args),
         Command::Alarms(args) => crate::clicmd::alarms::run(config, args),
         Command::Sqs(args) => crate::clicmd::sqs::run(config, args),
         Command::Insights(args) => crate::clicmd::insights::run(config, args),
@@ -975,8 +975,21 @@ fn history(t: &Target, limit: u32, json: bool) -> Result<ExitCode> {
 }
 
 fn deploy(t: &Target, loaded: &Loaded, skip_hooks: bool, yes: bool, no_wait: bool) -> Result<ExitCode> {
+    deploy_pinned(t, loaded, skip_hooks, yes, no_wait, None)
+}
+
+/// `deploy`, on `pin`'s revision when given (promote, rollback by re-running).
+pub(crate) fn deploy_pinned(
+    t: &Target,
+    loaded: &Loaded,
+    skip_hooks: bool,
+    yes: bool,
+    no_wait: bool,
+    pin: Option<&cp::Pin>,
+) -> Result<ExitCode> {
     let config = &loaded.config;
     let name = &t.pipeline.name;
+    let what = pin.map(|p| format!(" at {}", p.revision.chars().take(7).collect::<String>())).unwrap_or_default();
     let hooks = &t.pipeline.hooks;
     if !skip_hooks && !hooks.is_empty() {
         // Show what will run on this machine, and flag a config picked up from the current
@@ -1007,12 +1020,12 @@ fn deploy(t: &Target, loaded: &Loaded, skip_hooks: bool, yes: bool, no_wait: boo
             bail!("refusing to deploy without confirmation; pass --yes");
         }
         if config::is_production(&t.env_name) {
-            let typed = ask(&format!("Deploy {name} to {}? Type '{}' to confirm:", t.env_name.to_uppercase(), t.env_name));
+            let typed = ask(&format!("Deploy {name}{what} to {}? Type '{}' to confirm:", t.env_name.to_uppercase(), t.env_name));
             if typed != t.env_name {
                 println!("Cancelled.");
                 return Ok(ExitCode::FAILURE);
             }
-        } else if !confirm(&format!("Deploy {name} to {}?", t.env_name)) {
+        } else if !confirm(&format!("Deploy {name}{what} to {}?", t.env_name)) {
             println!("Cancelled.");
             return Ok(ExitCode::FAILURE);
         }
@@ -1022,21 +1035,36 @@ fn deploy(t: &Target, loaded: &Loaded, skip_hooks: bool, yes: bool, no_wait: boo
         bail!("pre-deploy hook failed — deployment aborted (use --skip-hooks to bypass)");
     }
 
-    let exec = cp::start(&t.aws, name)?;
-    println!("{} {name} started · execution {exec}", paint("✓", "32"));
+    let exec = cp::start_pinned(&t.aws, name, pin).map_err(|e| {
+        let hint = if pin.is_some() { pipeline::pin_hint(&e.short()) } else { "" };
+        anyhow!("could not start {name}{what}: {}{hint}", e.short())
+    })?;
+    println!("{} {name} started{what} · execution {exec}", paint("✓", "32"));
     if no_wait {
         return Ok(ExitCode::SUCCESS);
     }
-    println!("{}", paint("Following… Ctrl+C stops following; the pipeline keeps running.", "90"));
+    let result = follow(t, config, &exec)?;
+    if result != Status::Succeeded {
+        return Ok(ExitCode::FAILURE);
+    }
+    if !skip_hooks && !run_hooks("post-deploy", &t.pipeline.hooks.post_deploy) {
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
+/// Prints the stages of execution `exec` as they change, until it ends; returns how.
+pub(crate) fn follow(t: &Target, config: &Config, exec: &str) -> Result<Status> {
+    let name = &t.pipeline.name;
+    println!("{}", paint("Following… Ctrl+C stops following; the pipeline keeps running.", "90"));
     let poll = Duration::from_secs(config.defaults.poll_interval_seconds.clamp(3, 10));
     let mut seen: HashMap<String, Status> = HashMap::new();
     let mut announced_approvals = Vec::new();
     let result = loop {
         std::thread::sleep(poll);
-        let execution = cp::get_execution(&t.aws, name, &exec)?;
+        let execution = cp::get_execution(&t.aws, name, exec)?;
         let state = cp::get_pipeline_state(&t.aws, name)?;
-        let details = cp::list_action_executions(&t.aws, name, Some(&exec), 100)?;
+        let details = cp::list_action_executions(&t.aws, name, Some(exec), 100)?;
         let stages = pipeline::stages(&state, Some(&execution), &details);
         let now = now_secs();
         for s in &stages {
@@ -1065,17 +1093,10 @@ fn deploy(t: &Target, loaded: &Loaded, skip_hooks: bool, yes: bool, no_wait: boo
             break status;
         }
     };
-
-    if result != Status::Succeeded {
-        return Ok(ExitCode::FAILURE);
-    }
-    if !skip_hooks && !run_hooks("post-deploy", &t.pipeline.hooks.post_deploy) {
-        return Ok(ExitCode::FAILURE);
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(result)
 }
 
-fn run_hooks(phase: &str, hooks: &[crate::config::Hook]) -> bool {
+pub(crate) fn run_hooks(phase: &str, hooks: &[crate::config::Hook]) -> bool {
     if hooks.is_empty() {
         return true;
     }

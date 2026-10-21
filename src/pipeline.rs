@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 
-use crate::aws::codepipeline::{ActionExecutionDetail, ExecutionSummary, PipelineState};
+use serde::{Deserialize, Serialize};
+
+use crate::aws::codepipeline::{self as cp, ActionDeclaration, ActionExecutionDetail, ExecutionSummary, PipelineState};
+use crate::aws::{self, Aws};
 use crate::util::{ellipsize, first_line};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -333,6 +336,7 @@ pub fn trigger_label(summary: &ExecutionSummary) -> &'static str {
         Some("CloudWatchEvent") => "event",
         Some("PollForSourceChanges" | "Webhook" | "WebhookV2") => "push",
         Some("AutomatedTrigger" | "ScheduledTrigger") => "schedule",
+        Some("ManualRollback" | "AutomatedRollback") => "rollback",
         Some(_) => "other",
         None => "—",
     }
@@ -415,12 +419,143 @@ pub fn stage_averages(details: &[ActionExecutionDetail]) -> HashMap<String, f64>
         .collect()
 }
 
+// ---- promote, rollback, approvals waiting ---------------------------------------------
+
+/// What another module (the matrix) asks Pipelines to do with a pipeline it opens: the
+/// target of `Ctx::jump`, as JSON. A plain pipeline name only selects it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "lowercase")]
+pub enum Intent {
+    /// Deploy `revision` of `source_action`, which `from_env` runs (`summary` describes it),
+    /// to the pipeline; `behind`: how many deploys that moves it forward, when known.
+    Promote { pipeline: String, revision: String, source_action: String, from_env: String, summary: String, behind: Option<usize> },
+    /// Go back to the last successful deploy before the current one.
+    Rollback { pipeline: String },
+}
+
+impl Intent {
+    pub fn pipeline(&self) -> &str {
+        match self {
+            Intent::Promote { pipeline, .. } | Intent::Rollback { pipeline } => pipeline,
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(target: &str) -> Option<Intent> {
+        target.starts_with('{').then(|| serde_json::from_str(target).ok()).flatten()
+    }
+}
+
+/// Which of a pipeline's source actions to pin: the only one, or the one named `wanted`
+/// (the source action the revision comes from). `None` when the user has to choose.
+pub fn pick_source(actions: &[&ActionDeclaration], wanted: &str) -> Option<usize> {
+    if actions.len() == 1 {
+        return Some(0);
+    }
+    actions.iter().position(|a| a.name == wanted)
+}
+
+/// The revision `execution` ran for source action `action` (its first source if no match).
+pub fn revision_of<'a>(execution: &'a ExecutionSummary, action: &str) -> Option<&'a str> {
+    let revisions = &execution.source_revisions;
+    revisions.iter().find(|r| r.action_name == action).or(revisions.first())?.revision_id.as_deref()
+}
+
+/// Plain words to add when AWS refuses to start a pipeline on a given revision.
+pub fn pin_hint(error: &str) -> &'static str {
+    let e = error.to_lowercase();
+    if e.contains("validation") || e.contains("revision") || e.contains("not supported") {
+        ". CodePipeline runs a given revision only for CodeCommit and CodeStar connection sources \
+         (GitHub, GitLab, Bitbucket: a commit), S3 (an object version) and ECR (an image digest)"
+    } else {
+        ""
+    }
+}
+
+/// Where a rollback can go: the deployed execution (the latest success) and the earlier
+/// successful ones that ran another revision, newest first, one per revision.
+#[derive(Debug, Clone)]
+pub struct RollbackPlan {
+    pub current: ExecutionSummary,
+    pub targets: Vec<ExecutionSummary>,
+}
+
+/// `history`: newest first. `None` when nothing succeeded before with another revision.
+pub fn rollback_plan(history: &[ExecutionSummary]) -> Option<RollbackPlan> {
+    let succeeded = |e: &&ExecutionSummary| Status::parse(&e.status) == Status::Succeeded;
+    let mut successes = history.iter().filter(succeeded);
+    let current = successes.next()?.clone();
+    let revision = |e: &ExecutionSummary| e.source_revisions.first().and_then(|r| r.revision_id.clone());
+    let mut seen = vec![revision(&current)];
+    let mut targets = Vec::new();
+    for e in successes {
+        let r = revision(e);
+        // Without revision ids every earlier success is a different deploy.
+        if r.is_some() && seen.contains(&r) {
+            continue;
+        }
+        seen.push(r);
+        targets.push(e.clone());
+        if targets.len() == 5 {
+            break;
+        }
+    }
+    (!targets.is_empty()).then_some(RollbackPlan { current, targets })
+}
+
+/// A manual approval waiting in a pipeline, with what it approves.
+#[derive(Debug, Clone)]
+pub struct Waiting {
+    pub pipeline: String,
+    pub stage: String,
+    pub action: String,
+    pub token: String,
+    /// When it started waiting (Unix seconds).
+    pub since: Option<f64>,
+    /// The execution waiting for it.
+    pub execution: Option<ExecutionSummary>,
+    /// The approval's CustomData and ExternalEntityLink, from the pipeline's definition.
+    pub custom_data: Option<String>,
+    pub link: Option<String>,
+}
+
+/// The manual approvals waiting in `pipeline`. Reading what they approve is best effort.
+pub fn waiting_approvals(aws: &Aws, pipeline: &str) -> aws::Result<Vec<Waiting>> {
+    let state = cp::get_pipeline_state(aws, pipeline)?;
+    let mut declaration = None;
+    let mut out = Vec::new();
+    for stage in &state.stage_states {
+        for a in &stage.action_states {
+            let Some(live) = a.latest_execution.as_ref().filter(|l| l.status == "InProgress") else { continue };
+            let Some(token) = live.token.clone() else { continue };
+            let declaration = declaration.get_or_insert_with(|| cp::get_pipeline(aws, pipeline).ok());
+            let config = declaration.as_ref().and_then(|d| d.action(&stage.stage_name, &a.action_name)).map(|d| &d.configuration);
+            let field = |key: &str| config.and_then(|c| c.get(key)).filter(|v| !v.trim().is_empty()).cloned();
+            let execution = stage.latest_execution.as_ref().and_then(|e| cp::get_execution(aws, pipeline, &e.pipeline_execution_id).ok());
+            out.push(Waiting {
+                pipeline: pipeline.to_string(),
+                stage: stage.stage_name.clone(),
+                action: a.action_name.clone(),
+                token,
+                since: live.last_status_change,
+                execution,
+                custom_data: field("CustomData"),
+                link: field("ExternalEntityLink"),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod changes_tests {
     use super::*;
     use crate::aws::codepipeline::SourceRevision;
 
-    fn exec(status: &str, sha: &str, url: Option<&str>) -> ExecutionSummary {
+    pub(super) fn exec(status: &str, sha: &str, url: Option<&str>) -> ExecutionSummary {
         ExecutionSummary {
             status: status.into(),
             source_revisions: vec![SourceRevision {
@@ -508,6 +643,44 @@ mod tests {
         let r = revision(&exec, &[]);
         assert_eq!(r.commit.as_deref(), Some("3f9e1a2"));
         assert_eq!(r.message.as_deref(), Some("fix: retry"));
+    }
+
+    #[test]
+    fn plans_rollbacks_and_intents() {
+        use super::changes_tests::exec;
+        let history = [
+            exec("InProgress", "ddd", None),
+            exec("Succeeded", "ccc", None),
+            exec("Failed", "bbb", None),
+            exec("Succeeded", "ccc", None),
+            exec("Succeeded", "aaa", None),
+            exec("Succeeded", "999", None),
+        ];
+        let plan = rollback_plan(&history).unwrap();
+        assert_eq!(revision_of(&plan.current, "Source"), Some("ccc"));
+        let targets: Vec<_> = plan.targets.iter().map(|t| revision_of(t, "Source").unwrap()).collect();
+        assert_eq!(targets, ["aaa", "999"]);
+        assert!(rollback_plan(&history[..2]).is_none());
+
+        let intent = Intent::Promote {
+            pipeline: "app-prod".into(),
+            revision: "ccc".into(),
+            source_action: "Source".into(),
+            from_env: "qa".into(),
+            summary: "ccc \"fix\"".into(),
+            behind: Some(2),
+        };
+        assert_eq!(Intent::decode(&intent.encode()), Some(intent));
+        assert_eq!(Intent::decode("app-prod"), None);
+    }
+
+    #[test]
+    fn picks_the_source_action_to_pin() {
+        let action = |name: &str| ActionDeclaration { name: name.into(), ..Default::default() };
+        let (app, infra) = (action("App"), action("Infra"));
+        assert_eq!(pick_source(&[&app], "Source"), Some(0));
+        assert_eq!(pick_source(&[&app, &infra], "Infra"), Some(1));
+        assert_eq!(pick_source(&[&app, &infra], "Source"), None);
     }
 
     #[test]
