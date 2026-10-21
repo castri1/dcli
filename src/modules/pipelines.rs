@@ -1,6 +1,7 @@
 //! CodePipeline dashboard: live status of every configured pipeline, stage progress
-//! estimated from recent runs, CodeBuild logs, history, and deploy / approve / stop.
-//! Pipelines are added by searching the account (`n`) and saved to the config file.
+//! estimated from recent runs, CodeBuild logs, history, and deploy / approve / stop /
+//! rollback (also promote, from the matrix). Pipelines are added by searching the account
+//! (`n`) and saved to the config file.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::aws::{self, AwsError, codebuild, codepipeline as cp, logs};
 use crate::config::{Hook, PipelineConfig, is_production};
-use crate::pipeline::{self, Approval, StageView, Status};
+use crate::pipeline::{self, Approval, Intent, StageView, Status};
 use crate::tui::logview::{LogKey, LogView};
 use crate::tui::module::{Ctx, Emitter, Handled, Level, Module, Payload, View};
 use crate::tui::picker::{Item, Outcome, Picker};
@@ -105,6 +106,74 @@ enum Dialog {
     /// Searching the account's pipelines; the names match the picker's items.
     Add(Picker, Vec<String>),
     Remove { name: String },
+    Release(Box<Release>),
+}
+
+/// Promote or roll back: deploy a given revision instead of the latest, or roll a stage
+/// back (V2 pipelines). Confirmed like a deploy.
+struct Release {
+    name: String,
+    kind: ReleaseKind,
+    /// The pipeline's source actions; a pinned run fixes the revision of `sources[source]`.
+    sources: Vec<cp::ActionDeclaration>,
+    source: usize,
+    /// False when several source actions could take the revision and none was matched.
+    source_matched: bool,
+    input: TextInput,
+    needs_typing: bool,
+    running: bool,
+    hooks: Vec<(&'static str, String)>,
+    local: Option<String>,
+}
+
+enum ReleaseKind {
+    /// Deploy `revision`, which `from_env` runs.
+    Promote { revision: String, from_env: String, summary: String, behind: Option<usize> },
+    /// Back to `plan.targets[target]`: with `native`, by rolling a stage back; otherwise by
+    /// re-running the pipeline on that revision.
+    Rollback { plan: pipeline::RollbackPlan, target: usize, native: Option<NativeRollback> },
+}
+
+struct NativeRollback {
+    stages: Vec<String>,
+    stage: usize,
+}
+
+impl Release {
+    fn source_name(&self) -> &str {
+        self.sources.get(self.source).map_or("", |a| a.name.as_str())
+    }
+
+    /// The revision a pinned run deploys (`None` for a native rollback).
+    fn revision(&self) -> Option<String> {
+        match &self.kind {
+            ReleaseKind::Promote { revision, .. } => Some(revision.clone()),
+            ReleaseKind::Rollback { native: Some(_), .. } => None,
+            ReleaseKind::Rollback { plan, target, .. } => {
+                plan.targets.get(*target).and_then(|t| pipeline::revision_of(t, self.source_name())).map(str::to_string)
+            }
+        }
+    }
+
+    fn pin(&self) -> Option<cp::Pin> {
+        Some(cp::Pin::new(self.sources.get(self.source)?, &self.revision()?))
+    }
+
+    /// Short form of what is deployed, for messages.
+    fn label(&self) -> String {
+        match &self.kind {
+            ReleaseKind::Rollback { plan, target, native: Some(n) } => format!(
+                "{} back to {}",
+                n.stages[n.stage],
+                plan.targets.get(*target).and_then(|t| pipeline::revision(t, &[]).commit).unwrap_or_default()
+            ),
+            _ => self.revision().map(|r| short(&r)).unwrap_or_default(),
+        }
+    }
+}
+
+fn short(revision: &str) -> String {
+    revision.chars().take(7).collect()
 }
 
 enum Msg {
@@ -115,7 +184,11 @@ enum Msg {
     Logs { build_id: String, result: aws::Result<LogChunk> },
     HookLine { name: String, line: String },
     HooksDone { name: String, pre_deploy: bool, result: Result<(), String> },
-    Started { name: String, result: aws::Result<String> },
+    /// `what`: the revision or rollback it runs, when not the latest; `pinned`: started on a
+    /// given revision.
+    Started { name: String, what: Option<String>, pinned: bool, result: aws::Result<String> },
+    /// What a promote or rollback needs: the pipeline's definition and recent executions.
+    Planned { intent: Intent, result: aws::Result<(cp::Declaration, Vec<cp::ExecutionSummary>)> },
     Acted { name: String, what: &'static str, result: aws::Result<()> },
     Discovered(aws::Result<Vec<cp::PipelineSummary>>),
     Report { name: String, full: bool, result: aws::Result<crate::report::Report> },
@@ -150,6 +223,8 @@ pub struct Pipelines {
     /// The last deploy dialog fit on screen, so every hook it lists was visible.
     deploy_fits: bool,
     report_loading: bool,
+    /// The revision the next start of this pipeline runs (promote, rollback), and its label.
+    pinned: Option<(String, cp::Pin, String)>,
 }
 
 impl Pipelines {
@@ -180,6 +255,7 @@ impl Pipelines {
             logs_area: Rect::default(),
             deploy_fits: false,
             report_loading: false,
+            pinned: None,
         }
     }
 
@@ -426,6 +502,7 @@ impl Pipelines {
     // ---- actions ----------------------------------------------------------------
 
     fn open_deploy(&mut self, ctx: &mut Ctx) {
+        self.pinned = None;
         let Some(row) = self.row() else { return };
         let phases = [("pre-deploy", &row.cfg.hooks.pre_deploy), ("post-deploy", &row.cfg.hooks.post_deploy)];
         let hooks: Vec<(&'static str, String)> = phases
@@ -454,12 +531,133 @@ impl Pipelines {
     }
 
     fn start_pipeline(&mut self, name: String, ctx: &mut Ctx) {
-        self.dialog = Some(Dialog::Busy(format!("Starting {name}…")));
+        let pinned = self.pinned.take().filter(|(n, ..)| *n == name);
+        let what = pinned.as_ref().map(|(.., label)| label.clone());
+        self.dialog = Some(Dialog::Busy(match &what {
+            Some(w) => format!("Starting {name} at {w}…"),
+            None => format!("Starting {name}…"),
+        }));
         let aws = ctx.env().aws.clone();
         ctx.spawn(move || {
-            let result = cp::start(&aws, &name);
-            Msg::Started { name, result }
+            let result = cp::start_pinned(&aws, &name, pinned.as_ref().map(|(_, pin, _)| pin));
+            Msg::Started { name, pinned: what.is_some(), what, result }
         });
+    }
+
+    /// Reads what a promote or a rollback of a pipeline needs, then shows its dialog.
+    fn plan(&mut self, intent: Intent, ctx: &mut Ctx) {
+        let name = intent.pipeline().to_string();
+        let Some(index) = self.rows.iter().position(|r| r.name() == name) else {
+            return ctx.toast(Level::Warn, format!("{name} is not in {}'s pipelines", self.env_name));
+        };
+        self.select(index, ctx);
+        let what = if matches!(intent, Intent::Promote { .. }) { "promote" } else { "rollback" };
+        self.dialog = Some(Dialog::Busy(format!("Preparing the {what} of {name}…")));
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || {
+            let runs = if matches!(intent, Intent::Rollback { .. }) { 25 } else { 1 };
+            let result = cp::get_pipeline(&aws, &name).and_then(|d| Ok((d, cp::list_executions(&aws, &name, runs)?)));
+            Msg::Planned { intent, result }
+        });
+    }
+
+    fn on_planned(
+        &mut self,
+        intent: Intent,
+        result: aws::Result<(cp::Declaration, Vec<cp::ExecutionSummary>)>,
+        ctx: &mut Ctx,
+    ) {
+        // Closed while it was being prepared: cancelled.
+        if !matches!(self.dialog, Some(Dialog::Busy(_))) {
+            return;
+        }
+        self.dialog = None;
+        let name = intent.pipeline().to_string();
+        let (declaration, history) = match result {
+            Ok(r) => r,
+            Err(e) => return self.report(ctx, &format!("Could not read {name}"), e),
+        };
+        let sources: Vec<cp::ActionDeclaration> = declaration.source_actions().into_iter().cloned().collect();
+        let pick = |wanted: &str| pipeline::pick_source(&sources.iter().collect::<Vec<_>>(), wanted);
+        let (kind, source, matched) = match intent {
+            Intent::Promote { revision, source_action, from_env, summary, behind, .. } => {
+                if sources.is_empty() {
+                    return ctx.toast(Level::Error, format!("{name} has no source action to deploy {} with", short(&revision)));
+                }
+                let chosen = pick(&source_action);
+                (ReleaseKind::Promote { revision, from_env, summary, behind }, chosen.unwrap_or(0), chosen.is_some())
+            }
+            Intent::Rollback { .. } => {
+                let Some(plan) = pipeline::rollback_plan(&history) else {
+                    return ctx.toast(
+                        Level::Info,
+                        format!("Nothing to roll back to: no earlier successful run of {name} with another revision in its last {} runs", history.len()),
+                    );
+                };
+                let native = declaration
+                    .is_v2()
+                    .then(|| {
+                        let stages: Vec<String> = declaration.rollback_stages().into_iter().map(str::to_string).collect();
+                        let stage = declaration.deploy_stage().and_then(|d| stages.iter().position(|s| s == d));
+                        NativeRollback { stage: stage.unwrap_or(stages.len().saturating_sub(1)), stages }
+                    })
+                    .filter(|n| !n.stages.is_empty());
+                if native.is_none() && sources.is_empty() {
+                    return ctx.toast(Level::Error, format!("{name} has no source action to re-run at an earlier revision"));
+                }
+                let wanted = plan.current.source_revisions.first().map(|r| r.action_name.clone()).unwrap_or_default();
+                let chosen = pick(&wanted);
+                let matched = chosen.is_some() || native.is_some();
+                (ReleaseKind::Rollback { plan, target: 0, native }, chosen.unwrap_or(0), matched)
+            }
+        };
+        let hooks = self.row_by_name(&name).map(|r| r.cfg.hooks.clone()).unwrap_or_default();
+        // A stage rollback builds nothing: only the checks after a deploy apply.
+        let native = matches!(kind, ReleaseKind::Rollback { native: Some(_), .. });
+        let mut phases = vec![("pre-deploy", &hooks.pre_deploy), ("post-deploy", &hooks.post_deploy)];
+        if native {
+            phases.remove(0);
+        }
+        let hooks: Vec<(&'static str, String)> = phases
+            .into_iter()
+            .flat_map(|(phase, list)| list.iter().map(move |h| (phase, crate::util::show_invisible(&h.command))))
+            .collect();
+        let local = if hooks.is_empty() { None } else { ctx.local_config() };
+        self.dialog = Some(Dialog::Release(Box::new(Release {
+            name,
+            kind,
+            sources,
+            source,
+            source_matched: matched,
+            input: TextInput::default(),
+            needs_typing: is_production(&self.env_name),
+            running: history.first().is_some_and(|e| Status::parse(&e.status).is_running()),
+            hooks,
+            local,
+        })));
+    }
+
+    /// Runs a confirmed promote or rollback.
+    fn release(&mut self, r: Release, ctx: &mut Ctx) {
+        let label = r.label();
+        if let ReleaseKind::Rollback { plan, target, native: Some(n) } = &r.kind {
+            let (name, stage) = (r.name.clone(), n.stages[n.stage].clone());
+            let Some(execution) = plan.targets.get(*target).map(|t| t.pipeline_execution_id.clone()) else { return };
+            self.dialog = Some(Dialog::Busy(format!("Rolling back {stage} of {name}…")));
+            let aws = ctx.env().aws.clone();
+            ctx.spawn(move || {
+                let result = cp::rollback_stage(&aws, &name, &stage, &execution);
+                Msg::Started { name, what: Some(label), pinned: false, result }
+            });
+            return;
+        }
+        match r.pin() {
+            Some(pin) => {
+                self.pinned = Some((r.name.clone(), pin, label));
+                self.begin_deploy(r.name, ctx);
+            }
+            None => ctx.toast(Level::Error, "No revision to deploy"),
+        }
     }
 
     fn open_approve(&mut self, ctx: &mut Ctx) {
@@ -590,6 +788,46 @@ impl Pipelines {
                     self.remove_pipeline(name, ctx);
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.dialog = None,
+                _ => {}
+            },
+            Dialog::Release(r) => match key.code {
+                KeyCode::Esc => self.dialog = None,
+                KeyCode::Tab | KeyCode::BackTab if r.sources.len() > 1 && r.revision().is_some() => {
+                    let n = r.sources.len();
+                    r.source = if key.code == KeyCode::Tab { (r.source + 1) % n } else { (r.source + n - 1) % n };
+                    r.source_matched = true;
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    if let ReleaseKind::Rollback { plan, target, .. } = &mut r.kind {
+                        *target = if key.code == KeyCode::Up {
+                            target.saturating_sub(1)
+                        } else {
+                            (*target + 1).min(plan.targets.len().saturating_sub(1))
+                        };
+                    }
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    if let ReleaseKind::Rollback { native: Some(n), .. } = &mut r.kind {
+                        let len = n.stages.len();
+                        n.stage = if key.code == KeyCode::Left { (n.stage + len - 1) % len } else { (n.stage + 1) % len };
+                    }
+                }
+                KeyCode::Enter => {
+                    if !r.hooks.is_empty() && !self.deploy_fits {
+                        ctx.toast(Level::Warn, "Enlarge the terminal to review every hook before deploying");
+                        return;
+                    }
+                    if r.needs_typing && r.input.value.trim() != self.env_name {
+                        ctx.toast(Level::Warn, format!("Type '{}' to confirm", self.env_name));
+                        return;
+                    }
+                    if let Some(Dialog::Release(r)) = self.dialog.take() {
+                        self.release(*r, ctx);
+                    }
+                }
+                _ if r.needs_typing => {
+                    r.input.handle(key);
+                }
                 _ => {}
             },
         }
@@ -856,25 +1094,34 @@ impl Pipelines {
                     self.start_pipeline(name, ctx);
                 }
             }
-            Msg::HooksDone { name, pre_deploy: true, result: Err(e) } => match &mut self.dialog {
-                Some(Dialog::Hooks { name: n, state, .. }) if *n == name => *state = HookState::Failed(e),
-                _ => ctx.toast(Level::Error, format!("Pre-deploy hook failed for {name}: {e}")),
-            },
+            Msg::HooksDone { name, pre_deploy: true, result: Err(e) } => {
+                self.pinned = None;
+                match &mut self.dialog {
+                    Some(Dialog::Hooks { name: n, state, .. }) if *n == name => *state = HookState::Failed(e),
+                    _ => ctx.toast(Level::Error, format!("Pre-deploy hook failed for {name}: {e}")),
+                }
+            }
             Msg::HooksDone { name, pre_deploy: false, result } => match result {
                 Ok(()) => ctx.toast(Level::Success, format!("Post-deploy hooks passed for {name}")),
                 Err(e) => ctx.notify(Level::Error, &format!("{name}: post-deploy hook failed"), &e),
             },
-            Msg::Started { name, result } => {
+            Msg::Started { name, what, pinned, result } => {
                 self.dialog = None;
                 match result {
                     Ok(exec) => {
-                        ctx.toast(Level::Success, format!("Started {name} · {}", &exec[..8.min(exec.len())]));
+                        let at = what.map(|w| format!(" · {w}")).unwrap_or_default();
+                        ctx.toast(Level::Success, format!("Started {name}{at} · {}", &exec[..8.min(exec.len())]));
                         self.started_by_us.insert(exec, name);
                         self.last_poll = None;
                     }
-                    Err(e) => self.report(ctx, &format!("Could not start {name}"), e),
+                    Err(e) => {
+                        let what = what.map(|w| format!(" ({w})")).unwrap_or_default();
+                        let hint = if pinned { pipeline::pin_hint(&e.short()) } else { "" };
+                        ctx.toast(Level::Error, format!("Could not start {name}{what}: {}{hint}", e.short()));
+                    }
                 }
             }
+            Msg::Planned { intent, result } => self.on_planned(intent, result, ctx),
             Msg::Acted { name, what, result } => {
                 self.dialog = None;
                 match result {
@@ -1335,8 +1582,156 @@ impl Pipelines {
                 let rect = widgets::popup_area(area, 72, lines.len() as u16 + 2);
                 widgets::popup(f, rect, "Remove from config", theme::WARN, Text::from(lines));
             }
+            Dialog::Release(r) => {
+                let (title, lines, cursor) = self.release_lines(r);
+                let height = widgets::wrapped_height(&lines, 76) + 2;
+                self.deploy_fits = height <= area.height.saturating_sub(2);
+                let rect = widgets::popup_area(area, 80, height);
+                widgets::popup(f, rect, title, theme::env_color(&self.env_name), Text::from(lines));
+                if let Some((row, col)) = cursor {
+                    f.set_cursor_position((rect.x + 1 + col, rect.y + 1 + row));
+                }
+            }
         }
     }
+
+    /// The promote / rollback dialog: title, lines, and where the confirmation cursor is.
+    fn release_lines(&self, r: &Release) -> (&'static str, Vec<Line<'static>>, Option<(u16, u16)>) {
+        let kw = 9;
+        let env = Span::styled(self.env_name.to_uppercase(), Style::new().fg(theme::env_color(&self.env_name)).bold());
+        let describe = |e: &cp::ExecutionSummary| {
+            let when = e.last_update_time.or(e.start_time).map(|t| format!(" · deployed {}", fmt_ago(t))).unwrap_or_default();
+            format!("{}{when}", pipeline::revision(e, &[]).one_line())
+        };
+        let mut lines = vec![Line::raw("")];
+        let title = match &r.kind {
+            ReleaseKind::Promote { from_env, summary, behind, .. } => {
+                lines.push(Line::from(vec![
+                    Span::raw("Deploy to "),
+                    Span::styled(r.name.clone(), theme::bold()),
+                    Span::raw(" in "),
+                    env,
+                    Span::raw(format!(" the revision {from_env} runs:")),
+                ]));
+                lines.push(Line::raw(""));
+                lines.push(widgets::kv("Revision", Span::styled(summary.clone(), theme::bold()), kw));
+                let moves = match behind {
+                    Some(n) => format!("{n} deploy{} forward", if *n == 1 { "" } else { "s" }),
+                    None => format!("replaces a revision that is not in {from_env}'s recent history (a hotfix?)"),
+                };
+                lines.push(widgets::kv("Moves", moves, kw));
+                "Promote"
+            }
+            ReleaseKind::Rollback { plan, target, native } => {
+                lines.push(Line::from(vec![Span::raw("Roll "), Span::styled(r.name.clone(), theme::bold()), Span::raw(" back in "), env]));
+                lines.push(Line::raw(""));
+                lines.push(widgets::kv("Now", describe(&plan.current), kw));
+                for (i, t) in plan.targets.iter().enumerate() {
+                    let chosen = i == *target;
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:<kw$} ", if i == 0 { "Back to" } else { "" }), theme::muted()),
+                        Span::styled(if chosen { "▶ " } else { "  " }, theme::accent()),
+                        Span::styled(describe(t), if chosen { theme::bold() } else { theme::muted() }),
+                    ]));
+                }
+                if let Some(n) = native {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:<kw$} ", "Stage"), theme::muted()),
+                        Span::styled(format!("◀ {} ▶", n.stages[n.stage]), theme::bold()),
+                    ]));
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled(
+                        format!(
+                            "Method: CodePipeline's stage rollback (a V2 pipeline). {} gets again what that execution \
+                             deployed there; nothing is rebuilt and the other stages do not run.",
+                            n.stages[n.stage]
+                        ),
+                        theme::muted(),
+                    ));
+                } else {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled(
+                        "Method: run the whole pipeline again at that revision (a V1 pipeline cannot roll a stage back): \
+                         build, tests and approvals run again.",
+                        theme::muted(),
+                    ));
+                }
+                "Rollback"
+            }
+        };
+        if r.revision().is_some()
+            && let Some(source) = r.sources.get(r.source)
+        {
+            let c = &source.configuration;
+            let place: Vec<&str> = ["FullRepositoryId", "RepositoryName", "S3Bucket", "S3ObjectKey", "BranchName", "ImageTag"]
+                .iter()
+                .filter_map(|k| c.get(*k).map(String::as_str))
+                .collect();
+            let mut text = format!("{} ({}", source.name, source.action_type_id.provider);
+            if !place.is_empty() {
+                text.push_str(&format!(" · {}", place.join(" · ")));
+            }
+            text.push(')');
+            let mut spans = vec![Span::styled(format!("{:<kw$} ", "Source"), theme::muted()), Span::raw(text)];
+            if r.sources.len() > 1 {
+                spans.push(Span::styled("   Tab: another source", theme::muted()));
+            }
+            lines.push(Line::from(spans));
+            if !r.source_matched {
+                lines.push(Line::styled(
+                    "! It has several source actions: check which one takes this revision (Tab).",
+                    Style::new().fg(theme::WARN),
+                ));
+            }
+        }
+        if r.running {
+            let text = if r.revision().is_some() {
+                "! It is running now; this execution will supersede it."
+            } else {
+                "! It is running now: CodePipeline may refuse to roll back a stage that is running."
+            };
+            lines.push(Line::styled(text, Style::new().fg(theme::WARN)));
+        }
+        if !r.hooks.is_empty() {
+            lines.push(Line::raw(""));
+            // Every command in full: they run on this machine once confirmed.
+            lines.push(Line::styled("These hooks run on your machine:", theme::muted()));
+            for (phase, command) in &r.hooks {
+                lines.push(Line::from(vec![Span::styled(format!("{phase}: "), theme::muted()), Span::raw(command.replace('\n', " ⏎ "))]));
+            }
+            if let Some(path) = &r.local {
+                lines.push(Line::styled(format!("! Defined in {path} (current folder)"), Style::new().fg(theme::WARN)));
+            }
+        }
+        let mut cursor = None;
+        if r.needs_typing {
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(format!("Type '{}' to confirm:", self.env_name)));
+            let (line, col) = r.input.line("› ", "");
+            cursor = Some((widgets::wrapped_height(&lines, 76), col));
+            lines.push(line);
+        }
+        lines.push(Line::raw(""));
+        lines.push(widgets::hints_line(&release_hints(r)));
+        (title, lines, cursor)
+    }
+}
+
+fn release_hints(r: &Release) -> Vec<(&'static str, &'static str)> {
+    let mut hints = vec![("Enter", if matches!(r.kind, ReleaseKind::Promote { .. }) { "promote" } else { "roll back" })];
+    if let ReleaseKind::Rollback { plan, native, .. } = &r.kind {
+        if plan.targets.len() > 1 {
+            hints.push(("↑↓", "revision"));
+        }
+        if native.as_ref().is_some_and(|n| n.stages.len() > 1) {
+            hints.push(("←→", "stage"));
+        }
+    }
+    if r.sources.len() > 1 && r.revision().is_some() {
+        hints.push(("Tab", "source"));
+    }
+    hints.push(("Esc", "cancel"));
+    hints
 }
 
 /// Last column of a stage row: progress, approval prompt, error or provider.
@@ -1442,8 +1837,12 @@ impl Module for Pipelines {
         self.list_state.select(Some(0));
     }
 
-    /// Selects pipeline `target` (from the matrix, say).
+    /// Selects pipeline `target` (from the matrix, say), or promotes / rolls it back when
+    /// the target is an [`Intent`].
     fn open(&mut self, target: &str, ctx: &mut Ctx) {
+        if let Some(intent) = Intent::decode(target) {
+            return self.plan(intent, ctx);
+        }
         if let Some(i) = self.rows.iter().position(|r| r.name() == target) {
             self.select(i, ctx);
         }
@@ -1476,6 +1875,11 @@ impl Module for Pipelines {
                 });
             }
             KeyCode::Char('d') => self.open_deploy(ctx),
+            KeyCode::Char('R') => {
+                if let Some(name) = self.row().map(|r| r.name().to_string()) {
+                    self.plan(Intent::Rollback { pipeline: name }, ctx);
+                }
+            }
             KeyCode::Char('a') => self.open_approve(ctx),
             KeyCode::Char('s') => self.open_stop(ctx),
             KeyCode::Char('l') => self.toggle_logs(ctx),
@@ -1651,6 +2055,7 @@ impl Module for Pipelines {
             Some(Dialog::Add(..)) => vec![("Space", "mark"), ("Enter", "add"), ("Esc", "cancel")],
             None if self.zoomed() => vec![("/", "search"), ("e", "next error"), ("y", "copy all"), ("Esc", "back")],
             Some(Dialog::Remove { .. }) => vec![("Enter", "remove"), ("Esc", "cancel")],
+            Some(Dialog::Release(r)) => release_hints(r),
             Some(_) => vec![("Esc", "close")],
             None if self.rows.is_empty() => vec![("n", "add pipelines")],
             None => {
@@ -1660,6 +2065,7 @@ impl Module for Pipelines {
                     ("d", "deploy"),
                     ("a", "approve"),
                     ("s", "stop"),
+                    ("R", "rollback"),
                     ("l", "logs"),
                     ("h", "history"),
                     ("o", "console"),

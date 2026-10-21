@@ -73,6 +73,15 @@ pub struct ExecutionSummary {
     pub last_update_time: Option<f64>,
     pub source_revisions: Vec<SourceRevision>,
     pub trigger: Option<Trigger>,
+    /// `STANDARD`, or `ROLLBACK` for a stage rollback (V2 pipelines).
+    pub execution_type: Option<String>,
+    pub rollback_metadata: Option<RollbackMetadata>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RollbackMetadata {
+    pub rollback_target_pipeline_execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -189,6 +198,91 @@ pub fn list_action_executions(
     Ok(out.action_execution_details)
 }
 
+/// A pipeline's definition (GetPipeline): its type and its stages' actions.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Declaration {
+    pub name: String,
+    /// `V1` or `V2`; older pipelines leave it out (V1).
+    pub pipeline_type: Option<String>,
+    pub stages: Vec<StageDeclaration>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StageDeclaration {
+    pub name: String,
+    pub actions: Vec<ActionDeclaration>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ActionDeclaration {
+    pub name: String,
+    pub action_type_id: ActionTypeId,
+    pub configuration: HashMap<String, String>,
+}
+
+impl Declaration {
+    /// Only V2 pipelines can roll a stage back.
+    pub fn is_v2(&self) -> bool {
+        self.pipeline_type.as_deref() == Some("V2")
+    }
+
+    pub fn source_actions(&self) -> Vec<&ActionDeclaration> {
+        self.stages.iter().flat_map(|s| &s.actions).filter(|a| a.action_type_id.category == "Source").collect()
+    }
+
+    /// Stages that can be rolled back: every stage but the source ones.
+    pub fn rollback_stages(&self) -> Vec<&str> {
+        self.stages
+            .iter()
+            .filter(|s| !s.actions.iter().all(|a| a.action_type_id.category == "Source"))
+            .map(|s| s.name.as_str())
+            .collect()
+    }
+
+    /// The stage a rollback usually means: the last one that deploys.
+    pub fn deploy_stage(&self) -> Option<&str> {
+        let deploys = |s: &&StageDeclaration| s.actions.iter().any(|a| a.action_type_id.category == "Deploy");
+        self.stages.iter().rev().find(deploys).map(|s| s.name.as_str()).or_else(|| self.rollback_stages().last().copied())
+    }
+
+    pub fn action(&self, stage: &str, action: &str) -> Option<&ActionDeclaration> {
+        self.stages.iter().find(|s| s.name == stage)?.actions.iter().find(|a| a.name == action)
+    }
+}
+
+pub fn get_pipeline(aws: &Aws, name: &str) -> Result<Declaration> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Out {
+        pipeline: Declaration,
+    }
+    let out: Out = aws.call(&SERVICE, "GetPipeline", &json!({ "name": name }))?;
+    Ok(out.pipeline)
+}
+
+/// Runs a pipeline on a given revision of one source action instead of its latest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pin {
+    pub action: String,
+    /// `COMMIT_ID`, `S3_OBJECT_VERSION_ID` or `IMAGE_DIGEST`, after the action's provider.
+    pub revision_type: &'static str,
+    pub revision: String,
+}
+
+impl Pin {
+    pub fn new(action: &ActionDeclaration, revision: &str) -> Pin {
+        let revision_type = match action.action_type_id.provider.as_str() {
+            "S3" => "S3_OBJECT_VERSION_ID",
+            "ECR" => "IMAGE_DIGEST",
+            _ => "COMMIT_ID",
+        };
+        Pin { action: action.name.clone(), revision_type, revision: revision.to_string() }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PipelineSummary {
@@ -223,13 +317,27 @@ pub fn list_pipelines(aws: &Aws) -> Result<Vec<PipelineSummary>> {
     Ok(all)
 }
 
-pub fn start(aws: &Aws, name: &str) -> Result<String> {
-    #[derive(Deserialize, Default)]
-    #[serde(rename_all = "camelCase", default)]
-    struct Out {
-        pipeline_execution_id: String,
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct Started {
+    pipeline_execution_id: String,
+}
+
+/// Starts a pipeline, on `pin`'s revision when given (promote, rollback by re-running).
+pub fn start_pinned(aws: &Aws, name: &str, pin: Option<&Pin>) -> Result<String> {
+    let mut input = json!({ "name": name });
+    if let Some(p) = pin {
+        input["sourceRevisions"] = json!([{ "actionName": p.action, "revisionType": p.revision_type, "revisionValue": p.revision }]);
     }
-    let out: Out = aws.call(&SERVICE, "StartPipelineExecution", &json!({ "name": name }))?;
+    let out: Started = aws.call(&SERVICE, "StartPipelineExecution", &input)?;
+    Ok(out.pipeline_execution_id)
+}
+
+/// Rolls `stage` back to what `target_execution` deployed there (V2 pipelines): nothing
+/// is rebuilt. Returns the rollback execution.
+pub fn rollback_stage(aws: &Aws, name: &str, stage: &str, target_execution: &str) -> Result<String> {
+    let input = json!({ "pipelineName": name, "stageName": stage, "targetPipelineExecutionId": target_execution });
+    let out: Started = aws.call(&SERVICE, "RollbackStage", &input)?;
     Ok(out.pipeline_execution_id)
 }
 

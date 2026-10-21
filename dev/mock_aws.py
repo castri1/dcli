@@ -41,14 +41,41 @@ COMMITS = [("3f9e1a2b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f", "fix(payments): retry on
            ("0f1e2d3c4b5a69788796a5b4c3d2e1f0a9b8c7d6", "chore: initial pipeline")]
 
 
-def revision(name, k):
-    """Source revision of the current run (k=0) or the k-th history entry. A pipeline's
-    "lag" makes it run older commits, like a later environment of the same app."""
+def sha_at(name, k):
+    """Commit of the current run (k=0) or the k-th history entry, unless the execution was
+    started on a given one. A pipeline's "lag" makes it run older commits, like a later
+    environment of the same app."""
     k += PIPES.get(name, {}).get("lag", 0)
-    sha, msg = COMMITS[min(k, len(COMMITS) - 1)]
-    return [{"actionName": "Source", "revisionId": sha,
+    return COMMITS[min(k, len(COMMITS) - 1)][0]
+
+
+def revision(name, k, execution=None):
+    sha = PIPES.get(name, {}).get("revs", {}).get(execution) or sha_at(name, k)
+    msg = dict(COMMITS).get(sha, "pinned revision")
+    return [{"actionName": "GitHub", "revisionId": sha,
              "revisionUrl": f"https://github.com/acme/{name}/commit/{sha}",
              "revisionSummary": json.dumps({"ProviderType": "GitHub", "CommitMessage": msg})}]
+
+
+def restart(name, mode, trigger, sha=None, **extra):
+    """A new execution (StartPipelineExecution, RollbackStage): the current one joins the
+    history, whose commits are fixed first so they don't shift."""
+    old = PIPES[name]
+    revs = old.setdefault("revs", {})
+    for k, (h, *_) in enumerate(old["history"]):
+        revs.setdefault(h, sha_at(name, k + 1))
+    history = old["history"]
+    if old["exec"]:
+        revs.setdefault(old["exec"], sha_at(name, 0))
+        status = exec_status(old)
+        history = [(old["exec"], "Superseded" if status == "InProgress" else status, old["start"],
+                    time.time() - old["start"])] + history
+    lag = old.get("lag", 0)
+    new_run(name, 0, mode, trigger)
+    p = PIPES[name]
+    p.update(history=history[:10], revs=revs, lag=lag, **extra)
+    revs[p["exec"]] = sha or sha_at(name, 0)
+    return p["exec"]
 
 
 new_run("app-dev", 120)
@@ -59,9 +86,10 @@ new_run("infra-dev", 900, "cfnfail")
 new_run("app-prod", 0, "idle")
 PIPES["app-prod"]["exec"] = None
 PIPES["app-prod"]["lag"] = 2
-new_run("app-qa", 0, "idle")
-PIPES["app-qa"]["exec"] = None
+new_run("app-qa", 600, "approval")
 PIPES["app-qa"]["lag"] = 1
+# Stage rollback (RollbackStage) needs V2 pipelines; the others are V1.
+V2_PIPELINES = {"app-dev", "app-prod", "infra-dev"}
 # In the account but not in demo-config.yaml: found with `n` (add pipelines); they get a
 # finished run when first looked at.
 UNLISTED = ["legacy-batch", "billing-dev", "billing-prod", "search-indexer-dev", "notifications-v2-dev",
@@ -72,6 +100,12 @@ def timeline(p):
     """Per stage: (status, start, end) for the current execution."""
     now = time.time()
     t = p["start"]
+    if p["mode"] == "rollback":
+        # Only the rolled back stage runs.
+        stage, dur = p["rollback_stage"], AVG[p["rollback_stage"]]
+        out = {s: (None, None, None) for s in STAGES}
+        out[stage] = ("Succeeded", t, t + dur) if t + dur <= now else ("InProgress", t, None)
+        return out
     out = {}
     for s in STAGES:
         dur = AVG[s] * (1.4 if s == "Build" and p["mode"] == "fail" else 1)
@@ -103,7 +137,7 @@ def timeline(p):
 
 def exec_status(p):
     tl = timeline(p)
-    sts = [v[0] for v in tl.values()]
+    sts = [v[0] for v in tl.values() if v[0] or p["mode"] != "rollback"]
     if "Failed" in sts:
         return "Failed"
     if "Stopped" in sts:
@@ -116,12 +150,39 @@ def exec_status(p):
 def summary(name, p):
     tl = timeline(p)
     ends = [v[2] for v in tl.values() if v[2]]
-    return {
+    out = {
         "pipelineExecutionId": p["exec"], "status": exec_status(p), "startTime": p["start"],
         "lastUpdateTime": max(ends) if exec_status(p) != "InProgress" and ends else time.time(),
         "trigger": {"triggerType": p["trigger"]},
-        "sourceRevisions": revision(name, 0),
+        "sourceRevisions": revision(name, 0, p["exec"]),
+        "executionType": "ROLLBACK" if p["mode"] == "rollback" else "STANDARD",
     }
+    if p["mode"] == "rollback":
+        out["rollbackMetadata"] = {"rollbackTargetPipelineExecutionId": p["rollback_target"]}
+    return out
+
+
+def declaration(name):
+    """GetPipeline: the stages and their actions (the approval with its CustomData)."""
+    category = {"Source": "Source", "Build": "Build", "Deploy": "Deploy", "Approval": "Approval", "Production": "Deploy"}
+    provider = {"Source": "CodeStarSourceConnection", "Build": "CodeBuild", "Deploy": "CodeDeploy",
+                "Approval": "Manual", "Production": "CloudFormation"}
+    config = {
+        "Source": {"ConnectionArn": "arn:aws:codeconnections:us-east-1:123456789012:connection/demo",
+                   "FullRepositoryId": f"acme/{name}", "BranchName": "main"},
+        "Build": {"ProjectName": f"{name}-build"},
+        "Deploy": {"ApplicationName": name, "DeploymentGroupName": "web"},
+        "Approval": {"CustomData": "Check the release notes and the staging dashboard before approving.",
+                     "ExternalEntityLink": f"https://github.com/acme/{name}/releases"},
+        "Production": {"StackName": f"{name}-stack", "ActionMode": "CREATE_UPDATE"},
+    }
+    stages = [{"name": s, "actions": [{
+        "name": action_name(s), "runOrder": 1, "configuration": config[s],
+        "actionTypeId": {"category": category[s], "owner": "AWS", "provider": provider[s], "version": "1"}}]}
+        for s in STAGES]
+    return {"pipeline": {"name": name, "pipelineType": "V2" if name in V2_PIPELINES else "V1", "version": 3,
+                         "roleArn": "arn:aws:iam::123456789012:role/codepipeline", "stages": stages},
+            "metadata": {"pipelineArn": f"arn:aws:codepipeline:us-east-1:123456789012:{name}"}}
 
 
 def action_name(stage):
@@ -198,18 +259,39 @@ def codepipeline(op, body):
         p = PIPES[name]
         items = ([summary(name, p)] if p["exec"] else []) + [
             {"pipelineExecutionId": h, "status": st, "startTime": s, "lastUpdateTime": s + d,
-             "trigger": {"triggerType": "StartPipelineExecution"}, "sourceRevisions": revision(name, k + 1)}
+             "trigger": {"triggerType": "StartPipelineExecution"}, "sourceRevisions": revision(name, k + 1, h)}
             for k, (h, st, s, d) in enumerate(p["history"])]
         return {"pipelineExecutionSummaries": items[: body.get("maxResults", 10)]}
     if op == "GetPipelineExecution":
         return {"pipelineExecution": summary(name, PIPES[name])}
+    if op == "GetPipeline":
+        return declaration(name)
     if op == "ListActionExecutions":
         return {"actionExecutionDetails": action_details(name, (body.get("filter") or {}).get("pipelineExecutionId"))}
     if op == "StartPipelineExecution":
-        old = PIPES[name]
-        new_run(name, 0, "approval" if name == "api-dev" else "run", "StartPipelineExecution")
-        PIPES[name]["history"] = old["history"]
-        return {"pipelineExecutionId": PIPES[name]["exec"]}
+        sha = None
+        for r in body.get("sourceRevisions") or []:
+            if r.get("actionName") != action_name("Source"):
+                raise KeyError(f"InvalidArgumentException: no source action named {r.get('actionName')} in {name}")
+            if r.get("revisionType") != "COMMIT_ID":
+                raise KeyError(f"ValidationException: revision type {r.get('revisionType')} is not supported for "
+                               "CodeStarSourceConnection source actions")
+            sha = r["revisionValue"]
+        mode = "approval" if name in ("api-dev", "app-qa") else "run"
+        return {"pipelineExecutionId": restart(name, mode, "StartPipelineExecution", sha)}
+    if op == "RollbackStage":
+        if name not in V2_PIPELINES:
+            raise KeyError("ValidationException: Rollback is only supported for pipelines of type V2")
+        target, stage = body["targetPipelineExecutionId"], body["stageName"]
+        p = PIPES[name]
+        found = [k for k, h in enumerate(p["history"]) if h[0] == target]
+        if not found or p["history"][found[0]][1] != "Succeeded":
+            raise KeyError(f"PipelineExecutionNotFoundException: no successful execution {target} of {name}")
+        if stage not in STAGES or stage == "Source":
+            raise KeyError(f"StageNotFoundException: {stage}")
+        sha = p.get("revs", {}).get(target) or sha_at(name, found[0] + 1)
+        return {"pipelineExecutionId": restart(name, "rollback", "ManualRollback", sha, rollback_stage=stage,
+                                               rollback_target=target)}
     if op == "StopPipelineExecution":
         PIPES[name]["stopped"] = True
         return {"pipelineExecutionId": PIPES[name]["exec"]}
