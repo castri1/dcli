@@ -1,9 +1,9 @@
 //! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, log
-//! groups, parameters, secrets, buckets, state machines, queues, tables, event buses,
+//! groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues, tables, event buses,
 //! AppConfig applications and alarms, each with the module that opens it. Services are listed in parallel and
 //! capped; a service the user cannot read is left out.
 
-use crate::aws::{self, Aws, alarms, appconfig, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
+use crate::aws::{self, Aws, alarms, appconfig, cloudformation, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
 use crate::util::show_invisible;
 
 /// Resources listed at most per service (some accounts have thousands of log groups).
@@ -29,7 +29,7 @@ impl Resource {
 type Lister = fn(&Aws) -> aws::Result<Vec<Resource>>;
 
 const LISTERS: &[Lister] =
-    &[functions, log_groups, parameters, secret_list, buckets, state_machines, queues, tables, buses, applications, alarm_list];
+    &[functions, log_groups, parameters, secret_list, stacks, buckets, state_machines, queues, tables, buses, applications, alarm_list];
 
 /// The resources of the environment `aws` points at, `pipelines` being those in its config,
 /// and how many services could be listed (none: the session has probably expired).
@@ -75,6 +75,11 @@ fn parameters(aws: &Aws) -> aws::Result<Vec<Resource>> {
 fn secret_list(aws: &Aws) -> aws::Result<Vec<Resource>> {
     let list = pages(|t| secrets::list_secrets(aws, t))?;
     Ok(list.iter().map(|s| Resource::new("Secrets", &s.name, s.name.clone(), "secret")).collect())
+}
+
+fn stacks(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    let list = cloudformation::describe_stacks(aws, None)?;
+    Ok(list.iter().map(|s| Resource::new("CloudFormation", &s.name, s.name.clone(), &s.status.to_lowercase())).collect())
 }
 
 fn buckets(aws: &Aws) -> aws::Result<Vec<Resource>> {
