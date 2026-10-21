@@ -1,30 +1,48 @@
-//! Lambda explorer: list functions, search, and inspect configuration,
-//! environment variables (masked until revealed), layers, VPC, tags.
+//! Lambda explorer: list functions, search, and inspect configuration, environment
+//! variables (masked until revealed), layers, VPC, tags; charts of their metrics; invoke
+//! them with a test payload; and copy a report for an AI agent.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use super::common::{LoadState, filter_bar, matches_filter};
+use crate::aws::lambda::{Invocation, Metrics, Range};
 use crate::aws::{self, AwsError, lambda};
+use crate::config::is_production;
+use crate::tui::chart::{Agg, Chart, fmt_count, fmt_ms};
+use crate::tui::form::{Field, Form, FormEvent};
+use crate::tui::logview::{LogKey, LogView};
 use crate::tui::module::{Ctx, Emitter, Handled, Level, Module, Payload, View};
 use crate::tui::theme;
 use crate::tui::widgets::{self, InputEvent, TextInput};
-use crate::util::{ellipsize, fmt_ago, fmt_bytes, parse_rfc3339};
+use crate::util::{ellipsize, fmt_ago, fmt_bytes, now_secs, parse_rfc3339, pretty_json};
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
+/// Metrics older than this are read again when the module is opened again.
+const METRICS_FRESH: Duration = Duration::from_secs(120);
 
 enum Msg {
     Page(Vec<lambda::FunctionConfiguration>),
     Done,
     Failed(AwsError),
     Detail { name: String, result: Box<aws::Result<lambda::FunctionDetail>> },
+    Metrics { name: String, range: Range, result: Box<aws::Result<Metrics>> },
+    Invoked { name: String, payload: String, result: Box<aws::Result<Invocation>> },
+    Report { name: String, result: aws::Result<String> },
+}
+
+/// The invoke form, while it is open.
+struct Invoke {
+    name: String,
+    form: Form,
+    busy: bool,
 }
 
 pub struct Lambda {
@@ -40,9 +58,20 @@ pub struct Lambda {
     reveal_env: bool,
     detail_scroll: u16,
     region: String,
+    env_name: String,
     list_area: Rect,
     /// Function another module asked to show, selected once the list has it.
     open_target: Option<String>,
+    range: Range,
+    metrics: HashMap<(String, Range), (Instant, aws::Result<Metrics>)>,
+    metrics_in_flight: HashSet<(String, Range)>,
+    invoke: Option<Invoke>,
+    /// The last payload sent to each function, for the next invoke.
+    payloads: HashMap<String, String>,
+    /// An invocation's response and log, full screen.
+    result: Option<(String, LogView)>,
+    /// Functions whose report is being written.
+    reporting: HashSet<String>,
 }
 
 impl Lambda {
@@ -60,8 +89,16 @@ impl Lambda {
             reveal_env: false,
             detail_scroll: 0,
             region: String::new(),
+            env_name: String::new(),
             list_area: Rect::default(),
             open_target: None,
+            range: Range::Day,
+            metrics: HashMap::new(),
+            metrics_in_flight: HashSet::new(),
+            invoke: None,
+            payloads: HashMap::new(),
+            result: None,
+            reporting: HashSet::new(),
         }
     }
 
@@ -85,11 +122,12 @@ impl Lambda {
     }
 
     fn load(&mut self, ctx: &mut Ctx) {
-        let region = ctx.env().region.clone();
+        let env = ctx.env();
         *self = Lambda::new();
-        self.region = region;
+        self.region = env.region.clone();
+        self.env_name = env.name.clone();
         self.load = LoadState::Loading;
-        let aws = ctx.env().aws.clone();
+        let aws = env.aws.clone();
         ctx.spawn_stream(move |em: Emitter<Msg>| {
             let mut marker: Option<String> = None;
             loop {
@@ -162,6 +200,116 @@ impl Lambda {
         });
     }
 
+    /// Reads the selected function's metrics for the current range, unless they are here.
+    fn fetch_metrics(&mut self, ctx: &mut Ctx) {
+        let Some(name) = self.selected().map(|f| f.function_name.clone()) else { return };
+        let key = (name.clone(), self.range);
+        if self.metrics.contains_key(&key) || !self.metrics_in_flight.insert(key) {
+            return;
+        }
+        let (aws, range) = (ctx.env().aws.clone(), self.range);
+        ctx.spawn(move || {
+            let result = Box::new(lambda::metrics(&aws, &name, range, now_secs()));
+            Msg::Metrics { name, range, result }
+        });
+    }
+
+    fn open_invoke(&mut self) {
+        let Some(name) = self.selected().map(|f| f.function_name.clone()) else { return };
+        let payload = self.payloads.get(&name).cloned().unwrap_or_else(|| "{}".into());
+        let field = Field::text("Payload", payload).hint("JSON; paste works");
+        let mut form = Form::new(format!("Invoke · {name}"), vec![Field::fixed("Function", name.clone()), field])
+            .submit_label("invoke")
+            .focus_on("Payload");
+        form.note = Some("Runs the function now, for real: whatever it does (writes, messages, charges) happens.".into());
+        if is_production(&self.env_name) {
+            form = form.confirm_with(&self.env_name);
+        }
+        self.invoke = Some(Invoke { name, form, busy: false });
+    }
+
+    fn submit_invoke(&mut self, ctx: &mut Ctx) {
+        let Some(invoke) = &mut self.invoke else { return };
+        let payload = match invoke.form.get("Payload").trim() {
+            "" => "{}".to_string(),
+            text => text.to_string(),
+        };
+        if let Err(e) = serde_json::from_str::<serde_json::Value>(&payload) {
+            return invoke.form.fail(format!("The payload is not valid JSON: {e}"));
+        }
+        invoke.busy = true;
+        let (aws, name) = (ctx.env().aws.clone(), invoke.name.clone());
+        ctx.spawn(move || {
+            let result = Box::new(lambda::invoke(&aws, &name, &payload));
+            Msg::Invoked { name, payload, result }
+        });
+    }
+
+    fn on_invoked(&mut self, name: String, payload: String, result: aws::Result<Invocation>, ctx: &mut Ctx) {
+        let Some(invoke) = &mut self.invoke else { return };
+        invoke.busy = false;
+        let inv = match result {
+            Ok(inv) => inv,
+            Err(e) => return invoke.form.fail(e.short()),
+        };
+        self.invoke = None;
+        self.payloads.insert(name.clone(), payload);
+        let outcome = match &inv.function_error {
+            Some(kind) => format!("✗ function error ({kind})"),
+            None => "✓ succeeded".to_string(),
+        };
+        let mut lines = vec![format!("Status {} · {outcome} · version {}", inv.status, inv.version.as_deref().unwrap_or("?")), String::new()];
+        lines.push("RESPONSE".into());
+        let response = pretty_json(&inv.payload).unwrap_or_else(|| inv.payload.clone());
+        lines.extend(response.lines().map(str::to_string));
+        if inv.payload.is_empty() {
+            lines.push("(empty)".into());
+        }
+        lines.push(String::new());
+        lines.push("LOG (the last 4 KB)".into());
+        // Runtimes separate the timestamp, request id and level with tabs, which terminals
+        // show as nothing in a line of text.
+        lines.extend(inv.log_tail.as_deref().unwrap_or("(none)").lines().map(|l| l.replace('\t', "  ")));
+        let mut view = LogView::default();
+        view.extend(lines);
+        view.zoomed = true;
+        view.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        self.result = Some((format!("Invoke · {name}"), view));
+        match inv.function_error {
+            Some(_) => ctx.toast(Level::Warn, format!("{name} returned an error")),
+            None => ctx.toast(Level::Success, format!("Invoked {name}")),
+        }
+    }
+
+    fn copy_report(&mut self, ctx: &mut Ctx) {
+        let Some(name) = self.selected().map(|f| f.function_name.clone()) else { return };
+        if !self.reporting.insert(name.clone()) {
+            return ctx.toast(Level::Info, format!("Still writing the report of {name}"));
+        }
+        ctx.toast(Level::Info, format!("Writing the report of {name}: metrics and 24 h of logs…"));
+        let env = ctx.env();
+        let (aws, env_name, region) = (env.aws.clone(), env.name.clone(), env.region.clone());
+        ctx.spawn(move || {
+            let result = lambda::gather_report(&aws, &env_name, &region, &name, now_secs());
+            Msg::Report { name, result }
+        });
+    }
+
+    fn on_report(&mut self, name: String, result: aws::Result<String>, ctx: &mut Ctx) {
+        self.reporting.remove(&name);
+        let md = match result {
+            Ok(md) => md,
+            Err(e) => return ctx.toast(Level::Error, format!("Could not write the report: {}", e.short())),
+        };
+        if crate::platform::copy_to_clipboard(&md) {
+            return ctx.toast(Level::Success, format!("Copied the report of {name}. Paste it into your AI agent."));
+        }
+        match crate::platform::write_temp_file(&format!("lambda-{name}"), &md) {
+            Ok(path) => ctx.toast(Level::Success, format!("Saved the report to {}", path.display())),
+            Err(e) => ctx.toast(Level::Error, format!("Could not save the report: {e}")),
+        }
+    }
+
     fn render_list(&mut self, f: &mut Frame, area: Rect, view: &View) {
         self.list_area = area;
         let width = area.width.saturating_sub(4) as usize;
@@ -205,6 +353,86 @@ impl Lambda {
         f.render_stateful_widget(list, list_area, &mut self.list_state);
     }
 
+    /// The metrics section: a header with the range, then the charts.
+    fn metric_lines(&self, func: &lambda::FunctionConfiguration, width: usize, view: &View) -> Vec<Line<'static>> {
+        let mut ranges = vec![widgets::section("Metrics").spans.remove(0), Span::raw("   ")];
+        for r in [Range::Hour, Range::Day, Range::Week] {
+            let style = if r == self.range { theme::accent().bold() } else { theme::muted() };
+            ranges.push(Span::styled(format!("{} ", r.label()), style));
+        }
+        ranges.push(Span::styled("  m changes", theme::muted()));
+        let mut lines = vec![Line::from(ranges)];
+        let m = match self.metrics.get(&(func.function_name.clone(), self.range)) {
+            Some((_, Ok(m))) => m,
+            Some((_, Err(e))) => {
+                lines.push(Line::styled(e.short(), Style::new().fg(theme::ERR)));
+                return lines;
+            }
+            None => {
+                lines.push(Line::from(vec![Span::styled(theme::spinner(view.tick), theme::accent()), Span::raw(" loading metrics…")]));
+                return lines;
+            }
+        };
+        if m.points("invocations").is_empty() {
+            lines.push(Line::styled(format!("No invocations in the last {}.", self.range.label()), theme::muted()));
+            return lines;
+        }
+        let err = Style::new().fg(theme::ERR);
+        let errors = m.total("errors");
+        let mut summary = vec![Span::styled(format!("{} total", fmt_count(m.total("invocations"))), theme::muted())];
+        if errors > 0.0 {
+            let rate = m.error_rate().map(|r| format!(" ({:.1}%)", r * 100.0)).unwrap_or_default();
+            summary.push(Span::styled(format!(" · {} errors{rate}", fmt_count(errors)), err));
+        } else {
+            summary.push(Span::styled(" · no errors", Style::new().fg(theme::OK)));
+        }
+        let mut invocations = Chart::new("Invocations", m.points("invocations"), m.window);
+        invocations.summary = summary;
+        invocations.stacked = Some(m.points("errors"));
+        invocations.axis = false;
+        lines.extend(invocations.lines(width));
+
+        let timeout_ms = func.timeout.map(|t| t as f64 * 1000.0);
+        let mut duration = Chart::new("Duration p95", m.points("p95"), m.window);
+        duration.agg = Agg::Max;
+        duration.color = theme::RUNNING;
+        duration.fmt = fmt_ms;
+        duration.threshold = timeout_ms;
+        duration.axis = false;
+        let mut summary = Vec::new();
+        if let Some(avg) = m.mean_duration() {
+            summary.push(format!("avg {}", fmt_ms(avg)));
+        }
+        if let Some(p95) = m.max("p95") {
+            summary.push(format!("worst {}", fmt_ms(p95)));
+        }
+        if let Some(t) = timeout_ms {
+            summary.push(format!("timeout {}", fmt_ms(t)));
+        }
+        let near_timeout = timeout_ms.zip(m.max("p95")).is_some_and(|(t, p)| p >= t * 0.8);
+        duration.summary = vec![Span::styled(summary.join(" · "), if near_timeout { err } else { theme::muted() })];
+        lines.extend(duration.lines(width));
+
+        let throttles = m.total("throttles");
+        let mut concurrency = Chart::new("Concurrency", m.points("concurrency"), m.window);
+        concurrency.agg = Agg::Max;
+        concurrency.color = theme::OK;
+        concurrency.rows = 2;
+        concurrency.axis = throttles == 0.0;
+        concurrency.summary = vec![Span::styled(format!("max {}", fmt_count(m.max("concurrency").unwrap_or_default())), theme::muted())];
+        lines.extend(concurrency.lines(width));
+        if throttles > 0.0 {
+            let mut chart = Chart::new("Throttles", m.points("throttles"), m.window);
+            chart.color = theme::WARN;
+            chart.rows = 2;
+            chart.summary = vec![Span::styled(format!("{} total", fmt_count(throttles)), Style::new().fg(theme::WARN))];
+            lines.extend(chart.lines(width));
+        } else {
+            lines.push(Line::from(vec![Span::styled("Throttles", Style::new().fg(theme::WARN).bold()), Span::styled("  none", theme::muted())]));
+        }
+        lines
+    }
+
     fn render_detail(&self, f: &mut Frame, area: Rect, view: &View) {
         let Some(func) = self.selected() else {
             f.render_widget(
@@ -220,7 +448,9 @@ impl Lambda {
             _ => (func, None, None),
         };
         let kw = 14;
-        let mut lines = vec![widgets::section("General")];
+        let mut lines = self.metric_lines(c, area.width.saturating_sub(4) as usize, view);
+        lines.push(Line::raw(""));
+        lines.push(widgets::section("General"));
         if let Some(d) = c.description.as_ref().filter(|d| !d.is_empty()) {
             lines.push(widgets::kv("Description", d.clone(), kw));
         }
@@ -273,29 +503,28 @@ impl Lambda {
         if let Some(role) = &c.role {
             lines.push(widgets::kv("Role", role.rsplit('/').next().unwrap_or(role).to_string(), kw));
         }
-        let log_group = c
-            .logging_config
-            .as_ref()
-            .and_then(|l| l.log_group.clone())
-            .unwrap_or_else(|| format!("/aws/lambda/{}", c.function_name));
-        lines.push(widgets::kv("Log group", log_group, kw));
+        lines.push(widgets::kv("Log group", c.log_group(), kw));
         if let Some(fmt) = c.logging_config.as_ref().and_then(|l| l.log_format.clone()) {
             lines.push(widgets::kv("Log format", fmt, kw));
         }
         if let Some(mode) = c.tracing_config.as_ref().and_then(|t| t.mode.clone()) {
             lines.push(widgets::kv("Tracing", mode, kw));
         }
-        if let Some(vpc) = c.vpc_config.as_ref().filter(|v| v.vpc_id.as_deref().is_some_and(|id| !id.is_empty())) {
+        if let Some(vpc) = c.vpc_config.as_ref().filter(|_| c.in_vpc()) {
             lines.push(widgets::kv(
                 "VPC",
                 format!(
-                    "{} · {} subnets · {} security groups",
+                    "{} · {} subnets · {} security group{}",
                     vpc.vpc_id.clone().unwrap_or_default(),
                     vpc.subnet_ids.len(),
-                    vpc.security_group_ids.len()
+                    vpc.security_group_ids.len(),
+                    if vpc.security_group_ids.len() == 1 { "" } else { "s" }
                 ),
                 kw,
             ));
+        }
+        if let Some(dlq) = c.dead_letter_config.as_ref().and_then(|d| d.target_arn.clone()).filter(|a| !a.is_empty()) {
+            lines.push(widgets::kv("Dead letters", dlq.rsplit(':').next().unwrap_or(&dlq).to_string(), kw));
         }
         for layer in &c.layers {
             let name = layer.arn.rsplit(":layer:").next().unwrap_or(&layer.arn);
@@ -340,11 +569,30 @@ impl Lambda {
             _ => {}
         }
 
-        let block = widgets::panel(Line::from(format!(" {} ", c.function_name)).bold(), false);
+        let mut block = widgets::panel(Line::from(format!(" {} ", c.function_name)).bold(), false);
+        if self.reporting.contains(&c.function_name) {
+            block = block.title_top(
+                Line::from(vec![Span::styled(theme::spinner(view.tick), theme::accent()), Span::styled(" writing the report ", theme::muted())])
+                    .right_aligned(),
+            );
+        }
         f.render_widget(
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((self.detail_scroll, 0)).block(block),
             area,
         );
+    }
+
+    fn render_invoke(&self, f: &mut Frame, area: Rect, view: &View) {
+        let Some(invoke) = &self.invoke else { return };
+        let color = if is_production(&self.env_name) { theme::ERR } else { theme::ACCENT };
+        invoke.form.render(f, area, color);
+        if invoke.busy {
+            let body = Text::from(vec![
+                Line::raw(""),
+                Line::from(vec![Span::styled(format!("{} ", theme::spinner(view.tick)), theme::accent()), Span::raw("Invoking…")]),
+            ]);
+            widgets::popup(f, widgets::popup_area(area, 30, 5), "Lambda", theme::ACCENT, body);
+        }
     }
 }
 
@@ -354,21 +602,45 @@ impl Module for Lambda {
     }
 
     fn description(&self) -> &'static str {
-        "Lambda functions · configuration, environment, tags"
+        "Lambda functions · configuration, metrics, invoke, reports for AI"
     }
 
     fn reset(&mut self, ctx: &mut Ctx) {
         *self = Lambda::new();
         self.region = ctx.env().region.clone();
+        self.env_name = ctx.env().name.clone();
     }
 
     fn activate(&mut self, ctx: &mut Ctx) {
         if matches!(self.load, LoadState::Idle) {
             self.load(ctx);
         }
+        // Coming back later shows current numbers.
+        self.metrics.retain(|_, (at, _)| at.elapsed() < METRICS_FRESH);
     }
 
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
+        if let Some((_, view)) = &mut self.result {
+            if let LogKey::Copy = view.key(key) {
+                let ok = crate::platform::copy_to_clipboard(&view.lines().join("\n"));
+                ctx.toast(if ok { Level::Success } else { Level::Warn }, if ok { "Copied" } else { "Clipboard not available" });
+            }
+            if !view.zoomed {
+                self.result = None;
+            }
+            return Handled::Yes;
+        }
+        if let Some(invoke) = &mut self.invoke {
+            if invoke.busy {
+                return Handled::Yes;
+            }
+            match invoke.form.handle(key) {
+                FormEvent::Submit => self.submit_invoke(ctx),
+                FormEvent::Cancel => self.invoke = None,
+                FormEvent::Pending => {}
+            }
+            return Handled::Yes;
+        }
         let selected = self.list_state.selected().unwrap_or(0);
         if self.filtering {
             match self.filter.handle(key) {
@@ -402,7 +674,13 @@ impl Module for Lambda {
                 self.rebuild();
             }
             KeyCode::Char('v') => self.reveal_env = !self.reveal_env,
-            KeyCode::Char('c') => {
+            KeyCode::Char('m') => {
+                self.range = self.range.next();
+                self.fetch_metrics(ctx);
+            }
+            KeyCode::Char('i') => self.open_invoke(),
+            KeyCode::Char('c') => self.copy_report(ctx),
+            KeyCode::Char('y') => {
                 if let Some(func) = self.selected() {
                     let ok = crate::platform::copy_to_clipboard(&func.function_arn);
                     ctx.toast(if ok { Level::Success } else { Level::Warn }, if ok { "ARN copied" } else { "Clipboard not available" });
@@ -410,13 +688,7 @@ impl Module for Lambda {
             }
             KeyCode::Char('l') => {
                 if let Some(func) = self.selected() {
-                    // The function's log group: its logging config, else the default name.
-                    let group = func
-                        .logging_config
-                        .as_ref()
-                        .and_then(|l| l.log_group.clone())
-                        .unwrap_or_else(|| format!("/aws/lambda/{}", func.function_name));
-                    ctx.jump("Logs", group);
+                    ctx.jump("Logs", func.log_group());
                 }
             }
             KeyCode::Char('o') => {
@@ -434,7 +706,9 @@ impl Module for Lambda {
                 if let Some(func) = self.selected() {
                     let name = func.function_name.clone();
                     self.details.remove(&name);
+                    self.metrics.retain(|(n, _), _| *n != name);
                     self.fetch(name, ctx);
+                    self.fetch_metrics(ctx);
                 } else {
                     self.load(ctx);
                 }
@@ -447,7 +721,7 @@ impl Module for Lambda {
 
     fn mouse(&mut self, event: MouseEvent, _ctx: &mut Ctx) -> Handled {
         let pos = (event.column, event.row).into();
-        if !self.list_area.contains(pos) {
+        if self.invoke.is_some() || !self.list_area.contains(pos) {
             return Handled::No;
         }
         let selected = self.list_state.selected().unwrap_or(0);
@@ -469,7 +743,7 @@ impl Module for Lambda {
         self.try_open();
     }
 
-    fn task(&mut self, payload: Payload, _ctx: &mut Ctx) {
+    fn task(&mut self, payload: Payload, ctx: &mut Ctx) {
         let Ok(msg) = payload.downcast::<Msg>() else { return };
         match *msg {
             Msg::Page(page) => {
@@ -486,10 +760,16 @@ impl Module for Lambda {
                 self.in_flight.remove(&name);
                 self.details.insert(name, *result);
             }
+            Msg::Metrics { name, range, result } => {
+                self.metrics_in_flight.remove(&(name.clone(), range));
+                self.metrics.insert((name, range), (Instant::now(), *result));
+            }
+            Msg::Invoked { name, payload, result } => self.on_invoked(name, payload, *result, ctx),
+            Msg::Report { name, result } => self.on_report(name, result, ctx),
         }
     }
 
-    fn tick(&mut self, ctx: &mut Ctx, _active: bool) {
+    fn tick(&mut self, ctx: &mut Ctx, active: bool) {
         if let Some((name, at)) = &self.pending
             && at.elapsed() >= DEBOUNCE
         {
@@ -499,27 +779,46 @@ impl Module for Lambda {
                 self.fetch(name, ctx);
             }
         }
+        // The charts follow the selection once it settles.
+        if active && self.pending.is_none() {
+            self.fetch_metrics(ctx);
+        }
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        if let Some((title, result)) = &mut self.result {
+            let title = title.clone();
+            result.render_zoomed(f, area, &title);
+            return;
+        }
         let [left, right] = if area.width < 90 {
             area.layout(&Layout::vertical([Constraint::Percentage(45), Constraint::Fill(1)]))
         } else {
-            area.layout(&Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]))
+            area.layout(&Layout::horizontal([Constraint::Percentage(38), Constraint::Fill(1)]))
         };
         self.render_list(f, left, view);
         self.render_detail(f, right, view);
+        self.render_invoke(f, area, view);
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.result.is_some() {
+            return vec![("/", "search"), ("y", "copy"), ("Esc", "back")];
+        }
+        if self.invoke.is_some() {
+            return vec![("Enter", "invoke"), ("Esc", "cancel")];
+        }
         if self.filtering {
             return vec![("Enter", "keep filter"), ("Esc", "clear"), ("↑↓", "move")];
         }
         vec![
             ("↑↓", "move"),
             ("/", "search"),
+            ("m", "1h/24h/7d"),
+            ("i", "invoke"),
+            ("c", "copy for AI"),
+            ("y", "copy ARN"),
             ("v", "env values"),
-            ("c", "copy ARN"),
             ("l", "logs"),
             ("o", "console"),
             ("r", "refresh"),
@@ -528,10 +827,31 @@ impl Module for Lambda {
     }
 
     fn animating(&self) -> bool {
-        matches!(self.load, LoadState::Loading) || self.pending.is_some() || !self.in_flight.is_empty()
+        matches!(self.load, LoadState::Loading)
+            || self.pending.is_some()
+            || !self.in_flight.is_empty()
+            || !self.metrics_in_flight.is_empty()
+            || !self.reporting.is_empty()
+            || self.invoke.as_ref().is_some_and(|i| i.busy)
     }
 
     fn capturing(&self) -> bool {
-        self.filtering
+        self.filtering || self.invoke.is_some() || self.result.is_some()
+    }
+
+    fn wants_mouse(&self) -> bool {
+        self.result.is_none()
+    }
+
+    fn paste(&mut self, text: &str, _ctx: &mut Ctx) {
+        match &mut self.invoke {
+            Some(invoke) if !invoke.busy => invoke.form.paste(text),
+            Some(_) => {}
+            None if self.filtering => {
+                self.filter.insert_str(text, false);
+                self.rebuild();
+            }
+            None => {}
+        }
     }
 }

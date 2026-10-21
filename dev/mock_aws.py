@@ -312,6 +312,31 @@ LAMBDA_LINES = [
 ]
 
 
+ORDERS_SYNC_LINES = [
+    "START RequestId: {uuid} Version: $LATEST",
+    "[INFO]\t2026-10-21T10:00:00.000Z\t{uuid}\tsyncing {n} orders",
+    "[ERROR]\t2026-10-21T10:00:01.000Z\t{uuid}\tTraceback (most recent call last):\n  File \"/var/task/app.py\", line 41, in handler\n    rows = db.fetch_pending()\n  File \"/var/task/db.py\", line 12, in fetch_pending\n    return conn.execute(SQL)\nConnectionError: orders-db.internal:5432 refused the connection",
+    "END RequestId: {uuid}",
+    "REPORT RequestId: {uuid}\tDuration: 1840.22 ms\tBilled Duration: 1841 ms\tMemory Size: 1024 MB\tMax Memory Used: 402 MB\tInit Duration: 612.40 ms",
+    "START RequestId: {uuid} Version: $LATEST",
+    "2026-10-21T10:05:00.031Z {uuid} Task timed out after 300.03 seconds",
+    "END RequestId: {uuid}",
+    "REPORT RequestId: {uuid}\tDuration: 300030.00 ms\tBilled Duration: 300000 ms\tMemory Size: 1024 MB\tMax Memory Used: 988 MB\tStatus: timeout",
+]
+PAYMENTS_LINES = [
+    "START RequestId: {uuid} Version: $LATEST",
+    "2026-10-21T10:00:00.000Z\t{uuid}\tINFO\tprocessing order {n}",
+    "2026-10-21T10:00:00.182Z\t{uuid}\tINFO\torder {n} charged in 182 ms",
+    "END RequestId: {uuid}",
+    "REPORT RequestId: {uuid}\tDuration: 211.40 ms\tBilled Duration: 212 ms\tMemory Size: 512 MB\tMax Memory Used: 96 MB",
+    "START RequestId: {uuid} Version: $LATEST",
+    "2026-10-21T10:00:03.010Z\t{uuid}\tERROR\tInvoke Error \t{{\"errorType\":\"TimeoutError\",\"errorMessage\":\"payment provider did not answer in 3000 ms\",\"stack\":[\"TimeoutError: payment provider did not answer in 3000 ms\",\"    at charge (/var/task/payments.js:42:11)\",\"    at handler (/var/task/index.js:17:5)\"]}}",
+    "END RequestId: {uuid}",
+    "REPORT RequestId: {uuid}\tDuration: 3012.88 ms\tBilled Duration: 3013 ms\tMemory Size: 512 MB\tMax Memory Used: 101 MB\tInit Duration: 233.10 ms",
+]
+LINES_BY_GROUP = {"/aws/lambda/orders-sync": ORDERS_SYNC_LINES, "/aws/lambda/payments-webhook": PAYMENTS_LINES}
+
+
 def synthetic_events(group, start_ms, pattern):
     """An event every 7 s for the last 2 hours, the same on every call (by timestamp)."""
     now_ms = int(time.time() * 1000)
@@ -321,7 +346,10 @@ def synthetic_events(group, start_ms, pattern):
     out = []
     while t <= now_ms:
         k = t // 7000
-        line = LAMBDA_LINES[k % len(LAMBDA_LINES)].format(rid=f"{k:08x}-7f3c", n=1000 + k % 977)
+        lines = LINES_BY_GROUP.get(group, LAMBDA_LINES)
+        # One request id per invocation (the lines from START to REPORT).
+        uuid_ = f"{(k // len(lines)) * 2654435761 % 2**32:08x}-2b7a-4c55-9a0e-1f2d3c4b{(k // len(lines)) % 9999:04d}"
+        line = lines[k % len(lines)].format(rid=f"{k:08x}-7f3c", n=1000 + k % 977, uuid=uuid_)
         if not terms or any(term.lower() in line.lower() for term in terms):
             out.append({"logStreamName": f"2026/10/20/[$LATEST]{k % 3:04x}", "timestamp": t, "message": line + "\n",
                         "ingestionTime": t + 300, "eventId": f"{k}-{group}"})
@@ -467,6 +495,51 @@ FUNCS = [{"FunctionName": n, "FunctionArn": f"arn:aws:lambda:us-east-1:123456789
          for i, (n, r, m, t) in enumerate([("payments-webhook", "nodejs22.x", 512, 30), ("orders-sync", "python3.13", 1024, 300),
                                            ("users-auth", "nodejs22.x", 256, 10), ("image-resizer", "provided.al2023", 2048, 60),
                                            ("report-builder", "java21", 3008, 900), ("cron-cleanup", "python3.13", 128, 120)])]
+
+
+FUNCS[0]["DeadLetterConfig"] = {"TargetArn": "arn:aws:sqs:us-east-1:123456789012:payments-dlq"}
+EVENT_INVOKE_CONFIG = {"payments-webhook": {
+    "FunctionArn": FUNCS[0]["FunctionArn"], "MaximumRetryAttempts": 2, "MaximumEventAgeInSeconds": 3600,
+    "DestinationConfig": {"OnFailure": {"Destination": "arn:aws:sqs:us-east-1:123456789012:payments-failures"}, "OnSuccess": {}}}}
+
+
+def lambda_event_invoke_config(path):
+    """GET /2019-09-25/functions/{name}/event-invoke-config: (status, body)."""
+    name = [p for p in path.split("?")[0].split("/") if p][2]
+    if name not in EVENT_INVOKE_CONFIG:
+        return 404, {"Type": "User", "message": f"The function {name} doesn't have an EventInvokeConfig"}
+    return 200, EVENT_INVOKE_CONFIG[name]
+
+
+def lambda_invoke(path, headers, raw):
+    """POST /2015-03-31/functions/{name}/invocations: (status, headers, body). payments-webhook
+    fails when the payload asks for it ({"fail": true})."""
+    name = [p for p in path.split("?")[0].split("/") if p][2]
+    if not any(f["FunctionName"] == name for f in FUNCS):
+        return 404, {"content-type": "application/json", "x-amzn-errortype": "ResourceNotFoundException"}, json.dumps(
+            {"Type": "User", "message": f"Function not found: {name}"}).encode()
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        return 400, {"content-type": "application/json", "x-amzn-errortype": "InvalidRequestContentException"}, json.dumps(
+            {"Type": "User", "message": "Could not parse request body into json"}).encode()
+    rid = str(uuid.uuid4())
+    failing = name == "payments-webhook" and isinstance(payload, dict) and payload.get("fail")
+    log = [f"START RequestId: {rid} Version: $LATEST", f"2026-10-21T10:00:00.000Z\t{rid}\tINFO\tgot {json.dumps(payload)[:200]}"]
+    out_headers = {"content-type": "application/json", "x-amz-executed-version": "$LATEST"}
+    if failing:
+        error = {"errorType": "TimeoutError", "errorMessage": "payment provider did not answer in 3000 ms",
+                 "trace": ["TimeoutError: payment provider did not answer in 3000 ms", "    at charge (/var/task/payments.js:42:11)"]}
+        log.append(f"2026-10-21T10:00:03.010Z\t{rid}\tERROR\tInvoke Error \t{json.dumps(error)}")
+        body = error
+        out_headers["x-amz-function-error"] = "Unhandled"
+    else:
+        body = {"statusCode": 200, "body": json.dumps({"ok": True, "function": name, "received": payload})}
+    log += [f"END RequestId: {rid}", f"REPORT RequestId: {rid}\tDuration: 182.33 ms\tBilled Duration: 183 ms\tMemory Size: 512 MB\tMax Memory Used: 88 MB"]
+    if headers.get("x-amz-log-type") == "Tail":
+        import base64
+        out_headers["x-amz-log-result"] = base64.b64encode("\n".join(log).encode()[-4096:]).decode()
+    return 200, out_headers, json.dumps(body).encode()
 
 
 def lambda_rest(path):
@@ -1286,7 +1359,8 @@ def cw_metrics(action, params):
             j += 1
         times = list(range(int(start) // period * period, int(end), period))[-1440:]
         stamps = "".join(f"<member>{cw_iso(t)}</member>" for t in times)
-        values = "".join(f"<member>{cw_metric_value(name, dims, t)}</member>" for t in times)
+        scale = {"p95": 1.7, "p99": 2.4, "Maximum": 2.6}.get(get(f"{p}.MetricStat.Stat"), 1.0) if name == "Duration" else 1.0
+        values = "".join(f"<member>{round(cw_metric_value(name, dims, t) * scale, 2)}</member>" for t in times)
         results.append(f"<member><Timestamps>{stamps}</Timestamps><Values>{values}</Values><Label>{name}</Label>"
                        f"<Id>{get(p + '.Id')}</Id><StatusCode>Complete</StatusCode></member>")
         i += 1
@@ -1531,6 +1605,8 @@ class H(BaseHTTPRequestHandler):
         self.check_sig()
         if self.path.startswith("/__stats"):
             return self.reply(200, SIGNED)
+        if self.path.startswith("/2019-09-25/functions/"):
+            return self.reply(*lambda_event_invoke_config(self.path))
         if not self.path.startswith("/2015-03-31/"):
             return self.route_rest("GET")
         try:
@@ -1561,6 +1637,8 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         self.check_sig()
         raw = self.raw_body()
+        if self.path.startswith("/2015-03-31/functions/") and "/invocations" in self.path:
+            return self.reply_raw(*lambda_invoke(self.path, self.headers, raw))
         if is_appconfig(self.path):
             return self.route_rest("POST", raw)
         if self.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):

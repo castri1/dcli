@@ -420,6 +420,28 @@ pub fn base64(input: &[u8]) -> String {
     out
 }
 
+/// Decodes standard base64 (padding optional, whitespace ignored); `None` if it is not.
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let sextets: Vec<u8> = input.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').map(value).collect::<Option<_>>()?;
+    if sextets.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(sextets.len() * 3 / 4);
+    for chunk in sextets.chunks(4) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, d)| n | u32::from(*d) << (18 - 6 * i));
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    Some(out)
+}
+
 /// Pretty-prints `s` when it is a JSON object or array; otherwise `None`.
 pub fn pretty_json(s: &str) -> Option<String> {
     let t = s.trim_start();
@@ -433,6 +455,15 @@ pub fn pretty_json(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_round_trips() {
+        for text in ["", "a", "ab", "abc", "abcd", "START RequestId: 42\nEND\n", "ñandú ✓"] {
+            assert_eq!(base64_decode(&base64(text.as_bytes())).as_deref(), Some(text.as_bytes()));
+        }
+        assert_eq!(base64_decode("aGk"), Some(b"hi".to_vec()));
+        assert_eq!(base64_decode("not base64!"), None);
+    }
 
     #[test]
     fn dates_round_trip() {
