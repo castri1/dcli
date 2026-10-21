@@ -1307,7 +1307,158 @@ def query_error(code, message):
 
 
 # ---- SQS (awsJson1_0, X-Amz-Target AmazonSQS.*) ----------------------------------------------
+SQS_BASE = "https://sqs.us-east-1.amazonaws.com/123456789012"
+SQS_ARN = "arn:aws:sqs:us-east-1:123456789012"
+
+
+def _sqs_dlq_message(i):
+    order = f"ORD-{1000 + i * 7}"
+    detail = {"orderId": order, "customerId": f"C-{40 + i}", "amount": round(19.9 + i * 13.5, 2), "currency": "USD"}
+    body = json.dumps({"version": "0", "id": str(uuid.UUID(int=i + 1)), "detail-type": "OrderPaid", "source": "orders.service",
+                       "account": "123456789012", "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 - 3600 * (40 - i))),
+                       "region": "us-east-1", "resources": [], "detail": detail})
+    sent = int((T0 - 3600 * (40 - i)) * 1000)
+    attrs = {}
+    if i % 3 == 0:
+        attrs = {"ErrorCode": {"DataType": "String", "StringValue": "200"},
+                 "ErrorMessage": {"DataType": "String", "StringValue": "Task timed out after 30.03 seconds"},
+                 "RequestID": {"DataType": "String", "StringValue": str(uuid.UUID(int=500 + i))}}
+    elif i % 3 == 1:
+        attrs = {"ErrorMessage": {"DataType": "String", "StringValue": f"PaymentDeclined: card ending {4000 + i} was declined"}}
+    return {"MessageId": str(uuid.UUID(int=900 + i)), "Body": body, "MD5OfBody": hashlib.md5(body.encode()).hexdigest(),
+            "Attributes": {"SentTimestamp": str(sent), "ApproximateReceiveCount": "5",
+                           "ApproximateFirstReceiveTimestamp": str(sent + 2000),
+                           "SenderId": "AROAEXAMPLEID:orders-api"},
+            "MessageAttributes": attrs}
+
+
+def _sqs_queue(name, visible=0, in_flight=0, delayed=0, **extra):
+    q = {"name": name, "messages": [], "counts": [visible, in_flight, delayed],
+         "attrs": {"QueueArn": f"{SQS_ARN}:{name}", "CreatedTimestamp": str(int(T0 - 86400 * 200)),
+                   "LastModifiedTimestamp": str(int(T0 - 86400 * 9)), "VisibilityTimeout": "30",
+                   "MaximumMessageSize": "262144", "MessageRetentionPeriod": "345600", "DelaySeconds": "0",
+                   "ReceiveMessageWaitTimeSeconds": "0", "SqsManagedSseEnabled": "true"}}
+    q["attrs"].update(extra)
+    return q
+
+
+SQS_QUEUES = {q["name"]: q for q in [
+    _sqs_queue("orders", 37, 4, 0, ReceiveMessageWaitTimeSeconds="20",
+               RedrivePolicy=json.dumps({"deadLetterTargetArn": f"{SQS_ARN}:orders-dlq", "maxReceiveCount": 5})),
+    _sqs_queue("orders-dlq", MessageRetentionPeriod="1209600",
+               RedriveAllowPolicy=json.dumps({"redrivePermission": "byQueue", "sourceQueueArns": [f"{SQS_ARN}:orders"]})),
+    _sqs_queue("payments.fifo", 3, 0, 0, FifoQueue="true", ContentBasedDeduplication="true",
+               RedrivePolicy=json.dumps({"deadLetterTargetArn": f"{SQS_ARN}:payments-dlq.fifo", "maxReceiveCount": "3"})),
+    _sqs_queue("payments-dlq.fifo", FifoQueue="true", ContentBasedDeduplication="true", MessageRetentionPeriod="1209600"),
+    _sqs_queue("notifications", 0, 2, 1, KmsMasterKeyId="alias/aws/sqs", SqsManagedSseEnabled="false",
+               DelaySeconds="5"),
+]}
+SQS_QUEUES["orders-dlq"]["messages"] = [_sqs_dlq_message(i) for i in range(12)]
+SQS_TASKS = []  # message move tasks: {handle, source, destination, to_move, moved, status, started, cancelled_at}
+
+
+def _sqs_by_url(url):
+    q = SQS_QUEUES.get(url.rstrip("/").rsplit("/", 1)[-1])
+    if q is None:
+        raise KeyError(f"QueueDoesNotExist: The specified queue does not exist: {url}")
+    return q
+
+
+def _sqs_by_arn(arn):
+    q = SQS_QUEUES.get(arn.rsplit(":", 1)[-1])
+    if q is None:
+        raise KeyError(f"ResourceNotFoundException: {arn}")
+    return q
+
+
+def _sqs_advance():
+    """Moves messages of running tasks: 2 per second."""
+    now = time.time()
+    for t in SQS_TASKS:
+        if t["status"] not in ("RUNNING", "CANCELLING"):
+            continue
+        target = min(t["to_move"], int((now - t["started"]) * 2))
+        src = _sqs_by_arn(t["source"])
+        while t["moved"] < target and src["messages"]:
+            m = src["messages"].pop(0)
+            if t["destination"]:
+                dests = [_sqs_by_arn(t["destination"])]
+            else:
+                dests = [q for q in SQS_QUEUES.values()
+                         if json.loads(q["attrs"].get("RedrivePolicy") or "{}").get("deadLetterTargetArn") == t["source"]]
+            if dests:
+                dests[0]["counts"][0] += 1
+            t["moved"] += 1
+        if t["status"] == "CANCELLING":
+            t["status"] = "CANCELLED"
+        elif t["moved"] >= t["to_move"]:
+            t["status"] = "COMPLETED"
+
+
+def _sqs_attrs(q):
+    visible = len(q["messages"]) if q["messages"] or q["name"].endswith(("-dlq", "-dlq.fifo")) else q["counts"][0]
+    return {**q["attrs"], "ApproximateNumberOfMessages": str(visible),
+            "ApproximateNumberOfMessagesNotVisible": str(q["counts"][1]),
+            "ApproximateNumberOfMessagesDelayed": str(q["counts"][2])}
+
+
 def sqs(op, body):
+    _sqs_advance()
+    if op == "ListQueues":
+        prefix = body.get("QueueNamePrefix", "")
+        names = sorted(n for n in SQS_QUEUES if n.startswith(prefix))
+        start, size = int(body.get("NextToken") or 0), body.get("MaxResults") or 1000
+        out = {"QueueUrls": [f"{SQS_BASE}/{n}" for n in names[start:start + size]]}
+        if start + size < len(names):
+            out["NextToken"] = str(start + size)
+        return out
+    if op == "GetQueueUrl":
+        if body["QueueName"] not in SQS_QUEUES:
+            raise KeyError(f"QueueDoesNotExist: The specified queue does not exist: {body['QueueName']}")
+        return {"QueueUrl": f"{SQS_BASE}/{body['QueueName']}"}
+    if op == "GetQueueAttributes":
+        return {"Attributes": _sqs_attrs(_sqs_by_url(body["QueueUrl"]))}
+    if op == "ListDeadLetterSourceQueues":
+        arn = _sqs_by_url(body["QueueUrl"])["attrs"]["QueueArn"]
+        return {"queueUrls": [f"{SQS_BASE}/{q['name']}" for q in SQS_QUEUES.values()
+                              if json.loads(q["attrs"].get("RedrivePolicy") or "{}").get("deadLetterTargetArn") == arn]}
+    if op == "ReceiveMessage":
+        q = _sqs_by_url(body["QueueUrl"])
+        # Short polling samples: some of the messages each time.
+        sample = [m for m in q["messages"] if hash((m["MessageId"], time.time_ns() // 1000)) % 3]
+        out = []
+        for m in sample[:body.get("MaxNumberOfMessages") or 1]:
+            m["Attributes"]["ApproximateReceiveCount"] = str(int(m["Attributes"]["ApproximateReceiveCount"]) + 1)
+            out.append({**m, "ReceiptHandle": uuid.uuid4().hex})
+        return {"Messages": out} if out else {}
+    if op == "StartMessageMoveTask":
+        src = _sqs_by_arn(body["SourceArn"])
+        if any(t["source"] == body["SourceArn"] and t["status"] == "RUNNING" for t in SQS_TASKS):
+            raise KeyError("UnsupportedOperation: a message move task is already running for this queue")
+        if body.get("DestinationArn"):
+            _sqs_by_arn(body["DestinationArn"])
+        task = {"handle": uuid.uuid4().hex, "source": body["SourceArn"], "destination": body.get("DestinationArn"),
+                "to_move": len(src["messages"]), "moved": 0, "status": "RUNNING", "started": time.time()}
+        SQS_TASKS.insert(0, task)
+        return {"TaskHandle": task["handle"]}
+    if op == "ListMessageMoveTasks":
+        _sqs_by_arn(body["SourceArn"])
+        out = []
+        for t in [t for t in SQS_TASKS if t["source"] == body["SourceArn"]][:body.get("MaxResults") or 1]:
+            r = {"Status": t["status"], "SourceArn": t["source"], "ApproximateNumberOfMessagesMoved": t["moved"],
+                 "ApproximateNumberOfMessagesToMove": t["to_move"], "StartedTimestamp": int(t["started"] * 1000)}
+            if t["destination"]:
+                r["DestinationArn"] = t["destination"]
+            if t["status"] == "RUNNING":
+                r["TaskHandle"] = t["handle"]
+            out.append(r)
+        return {"Results": out}
+    if op == "CancelMessageMoveTask":
+        t = next((t for t in SQS_TASKS if t["handle"] == body["TaskHandle"]), None)
+        if t is None or t["status"] != "RUNNING":
+            raise KeyError("ResourceNotFoundException: no running task with that handle")
+        t["status"] = "CANCELLING"
+        return {"ApproximateNumberOfMessagesMoved": t["moved"]}
     raise KeyError(op)
 
 

@@ -210,6 +210,7 @@ impl EventBridge {
             "lambda" => ctx.jump("Lambda", t.name()),
             "states" => ctx.jump("Step Functions", t.arn.clone()),
             "logs" => ctx.jump("Logs", t.name()),
+            "sqs" => ctx.jump("SQS", t.arn.clone()),
             _ => ctx.toast(Level::Info, format!("dcli has no module for {} targets; o opens the rule in the console", t.kind())),
         }
     }
