@@ -61,7 +61,13 @@ pub fn notify(title: &str, body: &str) {
     }
 }
 
+/// Opens `url` in the browser. Only http(s) URLs with a host: links can come from AWS
+/// (an approval's ExternalEntityLink, say), and the system opener would also run files,
+/// `file:` paths and other schemes.
 pub fn open_url(url: &str) -> bool {
+    if !is_web_url(url) {
+        return false;
+    }
     #[cfg(target_os = "macos")]
     let cmd = {
         let mut c = Command::new("open");
@@ -81,6 +87,13 @@ pub fn open_url(url: &str) -> bool {
         c
     };
     spawn_quiet(cmd)
+}
+
+fn is_web_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else { return false };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !host.is_empty() && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn pipe_to(program: &str, args: &[&str], text: &str) -> bool {
@@ -156,6 +169,15 @@ pub fn write_temp_file(label: &str, content: &str) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opens_only_web_urls() {
+        assert!(is_web_url("https://us-east-1.console.aws.amazon.com/codesuite/x?region=us-east-1"));
+        assert!(is_web_url("http://127.0.0.1:47123/bucket/key"));
+        for bad in ["file:///etc/passwd", "/Applications/Calculator.app", "smb://host/share", "https://", "javascript:alert(1)", "https://a b"] {
+            assert!(!is_web_url(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn temp_files_are_new_and_private() {
