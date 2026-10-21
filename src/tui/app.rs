@@ -559,10 +559,14 @@ impl App {
             let current = format!(" {} ", self.modules[self.active].title());
             x += (current.chars().count() + "  : modules".len()) as u16;
             spans.push(Span::styled(current, active));
+            if let Some((text, color)) = &badges[self.active] {
+                spans.push(Span::styled(format!(" {text} "), Style::new().fg(*color).bold()));
+                x += text.chars().count() as u16 + 2;
+            }
             spans.push(Span::styled("  : modules", theme::muted()));
             let env_width = badge.width() as u16;
             for (i, count) in badges.iter().enumerate() {
-                let Some((text, color)) = count else { continue };
+                let Some((text, color)) = count.as_ref().filter(|_| i != self.active) else { continue };
                 let label = format!("   {} {text}", self.modules[i].title());
                 let width = label.chars().count() as u16;
                 if x + width + env_width > area.right() {

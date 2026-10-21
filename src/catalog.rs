@@ -1,7 +1,7 @@
 //! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, log
-//! groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues, tables, event buses,
-//! AppConfig applications and alarms, each with the module that opens it. Services are listed in parallel and
-//! capped; a service the user cannot read is left out.
+//! groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues,
+//! tables, event buses, AppConfig applications and alarms, each with the module that opens
+//! it. Services are listed in parallel and capped; a service the user cannot read is left out.
 
 use crate::aws::{self, Aws, alarms, appconfig, cloudformation, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
 use crate::util::show_invisible;
