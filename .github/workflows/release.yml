@@ -10,8 +10,21 @@ permissions:
   contents: write
 
 jobs:
+  # Creates the release once, so the builds only upload to it: several builds creating it
+  # at the same moment fail with "already_exists".
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes ""
+
   build:
     name: ${{ matrix.target }}
+    needs: release
     strategy:
       fail-fast: false
       matrix:
