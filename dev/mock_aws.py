@@ -1,6 +1,9 @@
 """Fake AWS endpoint to try or develop dcli without an AWS account (see demo.sh).
 Simulates CodePipeline, CodeBuild, CloudWatch Logs, SSM and Lambda with time-based progress."""
+import calendar
+import hashlib
 import json
+import math
 import sys
 import time
 import uuid
@@ -1239,9 +1242,56 @@ def cw_alarms(action, params):
 
 
 # ---- CloudWatch metrics (awsQuery, Version 2010-08-01) ---------------------------------------
+def cw_iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def cw_parse(s):
+    return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+
+
+def cw_metric_value(name, dims, ts):
+    """A plausible, repeatable value of a metric at `ts`: daily waves, a little noise, and
+    error spikes for payments-webhook."""
+    seed = int(hashlib.sha256(f"{name}{sorted(dims.items())}{int(ts)}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    wave = 1 + 0.6 * math.sin(ts / 86400 * 2 * math.pi)
+    fn = dims.get("FunctionName", "")
+    if name == "Errors":
+        return float(int(seed * 4)) if fn == "payments-webhook" and seed > 0.6 else 0.0
+    if name == "Throttles":
+        return 1.0 if seed > 0.97 else 0.0
+    if name == "Invocations":
+        return float(int(40 * wave + 20 * seed))
+    if name == "Duration":
+        return round(180 * wave + 90 * seed, 1)
+    if name == "ConcurrentExecutions":
+        return float(int(3 * wave + 3 * seed))
+    return round(10 * wave + 5 * seed, 2)
+
+
 def cw_metrics(action, params):
-    """GetMetricData…: XML response (status, body)."""
-    return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
+    """GetMetricData: XML response (status, body)."""
+    if action != "GetMetricData":
+        return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
+    get = lambda k, d="": params.get(k, [d])[0]
+    start, end = cw_parse(get("StartTime")), cw_parse(get("EndTime"))
+    results, i = [], 1
+    while get(f"MetricDataQueries.member.{i}.Id"):
+        p = f"MetricDataQueries.member.{i}"
+        name = get(f"{p}.MetricStat.Metric.MetricName")
+        period = int(get(f"{p}.MetricStat.Period", "300"))
+        dims, j = {}, 1
+        while get(f"{p}.MetricStat.Metric.Dimensions.member.{j}.Name"):
+            dims[get(f"{p}.MetricStat.Metric.Dimensions.member.{j}.Name")] = get(f"{p}.MetricStat.Metric.Dimensions.member.{j}.Value")
+            j += 1
+        times = list(range(int(start) // period * period, int(end), period))[-1440:]
+        stamps = "".join(f"<member>{cw_iso(t)}</member>" for t in times)
+        values = "".join(f"<member>{cw_metric_value(name, dims, t)}</member>" for t in times)
+        results.append(f"<member><Timestamps>{stamps}</Timestamps><Values>{values}</Values><Label>{name}</Label>"
+                       f"<Id>{get(p + '.Id')}</Id><StatusCode>Complete</StatusCode></member>")
+        i += 1
+    return 200, (f"<GetMetricDataResponse><GetMetricDataResult><MetricDataResults>{''.join(results)}</MetricDataResults>"
+                 f"<Messages/></GetMetricDataResult></GetMetricDataResponse>")
 
 
 def cloudwatch(params):
