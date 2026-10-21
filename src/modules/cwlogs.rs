@@ -1,6 +1,9 @@
 //! CloudWatch Logs: list log groups, open one to read the events of every stream for a
 //! time range (with a CloudWatch filter pattern), keep following new events, and read
-//! them full screen. Other modules jump here (Lambda → its log group).
+//! them full screen; or query one or more groups with Logs Insights. Other modules jump
+//! here (Lambda → its log group).
+
+mod insights;
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -33,6 +36,7 @@ enum Msg {
     Failed(AwsError),
     /// Events of the open group; `seq` drops results of a group or range left meanwhile.
     Events { seq: u64, result: aws::Result<Vec<logs::FilteredEvent>>, done: bool, truncated: bool },
+    Insights(insights::Msg),
 }
 
 enum Feed {
@@ -68,6 +72,11 @@ pub struct CwLogs {
     range: usize,
     pattern: String,
     editing_pattern: Option<TextInput>,
+    /// Groups marked with Space, to query together.
+    marked: Vec<String>,
+    /// Logs Insights, kept (query, results, history) while the module is open.
+    insights: Option<insights::Insights>,
+    insights_open: bool,
     region: String,
     list_area: Rect,
     log_area: Rect,
@@ -87,6 +96,9 @@ impl CwLogs {
             range: 1,
             pattern: String::new(),
             editing_pattern: None,
+            marked: Vec::new(),
+            insights: None,
+            insights_open: false,
             region: String::new(),
             list_area: Rect::default(),
             log_area: Rect::default(),
@@ -255,6 +267,22 @@ impl CwLogs {
         ctx.toast(if ok { Level::Success } else { Level::Warn }, if ok { format!("Copied {n} lines") } else { "Clipboard not available".into() });
     }
 
+    /// Opens Logs Insights over the marked groups, else the open or selected one.
+    fn open_insights(&mut self, ctx: &mut Ctx) {
+        let current = self.open.as_ref().map(|o| o.group.clone()).or_else(|| self.selected().map(|g| g.log_group_name.clone()));
+        let groups = if self.marked.is_empty() { current.into_iter().collect() } else { self.marked.clone() };
+        match &mut self.insights {
+            Some(i) if !groups.is_empty() => i.groups = groups,
+            Some(_) => {}
+            None => self.insights = Some(insights::Insights::new(groups, self.range, ctx)),
+        }
+        self.insights_open = true;
+    }
+
+    fn group_names(&self) -> Vec<String> {
+        self.groups.iter().map(|g| g.log_group_name.clone()).collect()
+    }
+
     fn render_list(&mut self, f: &mut Frame, area: Rect, view: &View) {
         self.list_area = area;
         let [bar, list_area] = area.layout(&Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]));
@@ -263,9 +291,10 @@ impl CwLogs {
         if let Some(col) = cursor {
             f.set_cursor_position((bar.x + col, bar.y));
         }
+        let marked = if self.marked.is_empty() { String::new() } else { format!("· {} marked ", self.marked.len()) };
         let title = match &self.load {
-            LoadState::Loading => format!(" {} Log groups · {} ", theme::spinner(view.tick), self.groups.len()),
-            _ => format!(" Log groups · {} ", self.visible.len()),
+            LoadState::Loading => format!(" {} Log groups · {} {marked}", theme::spinner(view.tick), self.groups.len()),
+            _ => format!(" Log groups · {} {marked}", self.visible.len()),
         };
         if self.visible.is_empty() {
             let text = match &self.load {
@@ -287,8 +316,15 @@ impl CwLogs {
                 let name = ellipsize(&g.log_group_name, width.saturating_sub(size.len() + 3));
                 let pad = width.saturating_sub(name.chars().count() + size.len() + 2);
                 let style = if open == Some(g.log_group_name.as_str()) { theme::accent().bold() } else { Style::new() };
+                let marker = if self.marked.contains(&g.log_group_name) {
+                    "● "
+                } else if open == Some(g.log_group_name.as_str()) {
+                    "▸ "
+                } else {
+                    "  "
+                };
                 ListItem::new(Line::from(vec![
-                    Span::styled(if open == Some(g.log_group_name.as_str()) { "▸ " } else { "  " }, theme::accent()),
+                    Span::styled(marker, theme::accent()),
                     Span::styled(name, style),
                     Span::raw(" ".repeat(pad)),
                     Span::styled(size, theme::muted()),
@@ -308,6 +344,8 @@ impl CwLogs {
                 Line::styled("Select a log group and press Enter", theme::muted()).centered(),
                 Line::raw(""),
                 Line::styled(format!("Shows the last {range} of every stream · t changes the range · f filters"), theme::muted())
+                    .centered(),
+                Line::styled("i queries it with Logs Insights · Space marks several groups to query together", theme::muted())
                     .centered(),
             ];
             f.render_widget(Paragraph::new(text).block(widgets::panel(" Events ", false)), area);
@@ -375,6 +413,7 @@ impl Module for CwLogs {
     }
 
     fn open(&mut self, target: &str, ctx: &mut Ctx) {
+        self.insights_open = false;
         if let Some(pos) = self.visible.iter().position(|&i| self.groups[i].log_group_name == target) {
             self.select(pos);
         }
@@ -382,6 +421,13 @@ impl Module for CwLogs {
     }
 
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
+        if self.insights_open {
+            let names = self.group_names();
+            let Some(insights) = &mut self.insights else { return Handled::No };
+            let (handled, keep) = insights.key(key, &names, ctx);
+            self.insights_open = keep;
+            return handled;
+        }
         if let Some(input) = &mut self.editing_pattern {
             match input.handle(key) {
                 InputEvent::Submit => {
@@ -443,6 +489,18 @@ impl Module for CwLogs {
                 }
             }
             KeyCode::Char('f') => self.editing_pattern = Some(TextInput::with_value(self.pattern.clone())),
+            KeyCode::Char(' ') => {
+                if let Some(name) = self.selected().map(|g| g.log_group_name.clone()) {
+                    match self.marked.iter().position(|m| *m == name) {
+                        Some(i) => {
+                            self.marked.remove(i);
+                        }
+                        None => self.marked.push(name),
+                    }
+                    self.select(selected + 1);
+                }
+            }
+            KeyCode::Char('i') => self.open_insights(ctx),
             KeyCode::Char('p') => {
                 if let Some(open) = &mut self.open {
                     open.feed = match open.feed {
@@ -486,6 +544,9 @@ impl Module for CwLogs {
     }
 
     fn mouse(&mut self, event: MouseEvent, _ctx: &mut Ctx) -> Handled {
+        if self.insights_open {
+            return self.insights.as_mut().map_or(Handled::No, |i| i.mouse(event));
+        }
         let pos = (event.column, event.row).into();
         let selected = self.list_state.selected().unwrap_or(0);
         match event.kind {
@@ -528,10 +589,19 @@ impl Module for CwLogs {
                     self.on_events(result, done, truncated, ctx);
                 }
             }
+            Msg::Insights(msg) => {
+                if let Some(insights) = &mut self.insights {
+                    insights.task(msg, ctx);
+                }
+            }
         }
     }
 
     fn tick(&mut self, ctx: &mut Ctx, active: bool) {
+        // A running query keeps being polled, so it finishes while another module shows.
+        if let Some(insights) = &mut self.insights {
+            insights.tick(ctx);
+        }
         let due = self.open.as_ref().is_some_and(|o| {
             matches!(o.feed, Feed::Live) && !o.in_flight && o.last_fetch.elapsed() >= FOLLOW_EVERY
         });
@@ -541,6 +611,12 @@ impl Module for CwLogs {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        if self.insights_open
+            && let Some(insights) = &mut self.insights
+        {
+            insights.render(f, area, view);
+            return;
+        }
         if let Some(open) = self.open.as_mut().filter(|o| o.view.zoomed) {
             let title = format!("{} · last {} UTC", open.group, RANGES[self.range].0);
             open.view.render_zoomed(f, area, &title);
@@ -557,6 +633,11 @@ impl Module for CwLogs {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.insights_open
+            && let Some(insights) = &self.insights
+        {
+            return insights.hints();
+        }
         if self.editing_pattern.is_some() {
             return vec![("Enter", "apply filter"), ("Esc", "cancel")];
         }
@@ -566,7 +647,7 @@ impl Module for CwLogs {
         if self.filtering {
             return vec![("Enter", "keep filter"), ("Esc", "clear"), ("↑↓", "move")];
         }
-        let mut h = vec![("↑↓", "group"), ("Enter", "open"), ("/", "search"), ("t", "range"), ("f", "filter")];
+        let mut h = vec![("↑↓", "group"), ("Enter", "open"), ("i", "Insights"), ("Space", "mark"), ("/", "search"), ("t", "range"), ("f", "filter")];
         if self.open.is_some() {
             h.extend([("z", "full screen"), ("p", "pause"), ("y", "copy"), ("PgUp/PgDn", "scroll")]);
         }
@@ -575,20 +656,31 @@ impl Module for CwLogs {
     }
 
     fn animating(&self) -> bool {
-        matches!(self.load, LoadState::Loading)
+        self.insights.as_ref().is_some_and(insights::Insights::animating)
+            || matches!(self.load, LoadState::Loading)
             || self.open.as_ref().is_some_and(|o| matches!(o.feed, Feed::Loading | Feed::Live))
     }
 
     fn capturing(&self) -> bool {
+        if self.insights_open {
+            return self.insights.as_ref().is_some_and(insights::Insights::capturing);
+        }
         self.filtering || self.editing_pattern.is_some() || self.zoomed()
     }
 
     fn wants_mouse(&self) -> bool {
+        if self.insights_open {
+            return self.insights.as_ref().is_none_or(insights::Insights::wants_mouse);
+        }
         !self.zoomed()
     }
 
     fn paste(&mut self, text: &str, _ctx: &mut Ctx) {
-        if let Some(input) = &mut self.editing_pattern {
+        if self.insights_open {
+            if let Some(insights) = &mut self.insights {
+                insights.paste(text);
+            }
+        } else if let Some(input) = &mut self.editing_pattern {
             input.insert_str(text, false);
         } else if self.filtering {
             self.filter.insert_str(text, false);

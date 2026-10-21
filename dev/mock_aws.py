@@ -329,7 +329,122 @@ def synthetic_events(group, start_ms, pattern):
     return out
 
 
+INSIGHTS_SAVED = [
+    {"queryDefinitionId": "q-1", "name": "Errors/Recent errors",
+     "queryString": "fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 50",
+     "logGroupNames": ["/aws/lambda/payments-webhook"], "lastModified": int(T0 * 1000)},
+    {"queryDefinitionId": "q-2", "name": "Errors/Errors per 5 minutes",
+     "queryString": "filter @message like /ERROR/\n| stats count(*) by bin(5m)", "logGroupNames": [], "lastModified": int(T0 * 1000)},
+    {"queryDefinitionId": "q-3", "name": "Slowest invocations",
+     "queryString": "filter @type = \"REPORT\"\n| fields @timestamp, @requestId, @duration\n| sort @duration desc\n| limit 20",
+     "logGroupNames": ["/aws/lambda/orders-sync", "/aws/lambda/payments-webhook"], "lastModified": int(T0 * 1000)},
+]
+INSIGHTS_QUERIES = {}
+INSIGHTS_RECORDS = {}
+
+
+def insights_ts(ms):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ms // 1000)) + f".{ms % 1000:03d}"
+
+
+def insights_record(group, e):
+    """Every field Insights knows of an event (what GetLogRecord returns)."""
+    message = e["message"].rstrip("\n")
+    record = {"@timestamp": insights_ts(e["timestamp"]), "@message": message, "@logStream": e["logStreamName"],
+              "@log": f"123456789012:{group}", "@ingestionTime": insights_ts(e["ingestionTime"])}
+    rid = re.search(r"RequestId: (\S+)", message)
+    if rid:
+        record["@requestId"] = rid[1]
+    if message.startswith("REPORT"):
+        record["@type"] = "REPORT"
+        for field, label in [("@duration", "Duration"), ("@billedDuration", "Billed Duration"), ("@memorySize", "Memory Size"),
+                             ("@maxMemoryUsed", "Max Memory Used")]:
+            value = re.search(label + r": ([\d.]+)", message)
+            if value:
+                record[field] = value[1]
+    return record
+
+
+def insights_run(q):
+    """Rows of a query, from the synthetic events of its groups. Understands a little of the
+    language: `filter @message like /x/`, `filter @type = "REPORT"`, `fields a, b`, `sort f desc`,
+    `limit N` and `stats count(*) by bin(Nm)`."""
+    query = q["queryString"]
+    events = [(g, e) for g in q["logGroupNames"] for e in synthetic_events(g, q["startTime"] * 1000, "")
+              if e["timestamp"] <= q["endTime"] * 1000]
+    scanned = len(events)
+    records = [(g, e, insights_record(g, e)) for g, e in events]
+    for pattern in re.findall(r"filter\s+@message\s+like\s+/([^/]*)/", query):
+        records = [r for r in records if re.search(pattern, r[2]["@message"], re.I)]
+    if re.search(r'filter\s+@type\s*=\s*"REPORT"', query):
+        records = [r for r in records if r[2].get("@type") == "REPORT"]
+    stats = re.search(r"stats\s+count\(\*\)\s+by\s+bin\((\d+)([smh])\)", query)
+    if stats:
+        size = int(stats[1]) * {"s": 1, "m": 60, "h": 3600}[stats[2]]
+        bins = {}
+        for _, e, _ in records:
+            b = e["timestamp"] // 1000 // size * size
+            bins[b] = bins.get(b, 0) + 1
+        label = f"bin({stats[1]}{stats[2]})"
+        rows = [[{"field": label, "value": insights_ts(b * 1000)}, {"field": "count(*)", "value": str(n)}] for b, n in sorted(bins.items())]
+        return rows, len(records), scanned
+    sort = re.search(r"sort\s+(@\w+)\s*(desc|asc)?", query)
+    key = sort[1] if sort else "@timestamp"
+    numeric = key in ("@duration", "@billedDuration", "@maxMemoryUsed")
+    records.sort(key=lambda r: float(r[2].get(key, 0)) if numeric else r[2].get(key, ""), reverse=not sort or sort[2] != "asc")
+    limit = re.search(r"limit\s+(\d+)", query)
+    limit = int(limit[1]) if limit else q.get("limit") or 1000
+    fields = re.search(r"fields\s+([^|]+)", query)
+    fields = [f.strip() for f in fields[1].split(",")] if fields else ["@timestamp", "@message"]
+    rows = []
+    for g, e, record in records[:limit]:
+        ptr = f"CmAKJgoiMTIzNDU2Nzg5MDEy{len(INSIGHTS_RECORDS)}"
+        INSIGHTS_RECORDS[ptr] = record
+        rows.append([{"field": f, "value": record[f]} for f in fields if f in record] + [{"field": "@ptr", "value": ptr}])
+    return rows, len(records), scanned
+
+
+def insights(op, body):
+    if op == "StartQuery":
+        missing = [g for g in body.get("logGroupNames", []) if g not in log_groups()]
+        if missing or not body.get("logGroupNames"):
+            raise KeyError(f"ResourceNotFoundException: Log group '{(missing or ['(none)'])[0]}' does not exist")
+        if "|" in body["queryString"] and body["queryString"].strip().startswith("|"):
+            raise KeyError("MalformedQueryException: unexpected symbol found | at line 1 and position 1")
+        qid = uuid.uuid4().hex
+        INSIGHTS_QUERIES[qid] = {**body, "polls": 0, "status": "Running"}
+        return {"queryId": qid}
+    if op == "GetQueryResults":
+        q = INSIGHTS_QUERIES.get(body["queryId"])
+        if q is None:
+            raise KeyError(f"ResourceNotFoundException: query {body['queryId']} does not exist")
+        rows, matched, scanned = insights_run(q)
+        q["polls"] += 1
+        if q["status"] == "Running" and q["polls"] >= 2:
+            q["status"] = "Complete"
+        if q["status"] == "Running":
+            rows, matched, scanned = rows[:len(rows) // 2], matched // 2, scanned // 2
+        return {"status": q["status"], "results": rows,
+                "statistics": {"recordsMatched": float(matched), "recordsScanned": float(scanned), "bytesScanned": float(scanned * 183)}}
+    if op == "StopQuery":
+        q = INSIGHTS_QUERIES.get(body["queryId"])
+        if q is None or q["status"] != "Running":
+            raise KeyError("InvalidParameterException: the query is not running")
+        q["status"] = "Cancelled"
+        return {"success": True}
+    if op == "DescribeQueryDefinitions":
+        return {"queryDefinitions": INSIGHTS_SAVED}
+    if op == "GetLogRecord":
+        record = INSIGHTS_RECORDS.get(body["logRecordPointer"])
+        if record is None:
+            raise KeyError("InvalidParameterException: unknown log record pointer")
+        return {"logRecord": record}
+    raise KeyError(op)
+
+
 def cwlogs(op, body):
+    if op in ("StartQuery", "GetQueryResults", "StopQuery", "DescribeQueryDefinitions", "GetLogRecord"):
+        return insights(op, body)
     if op == "DescribeLogGroups":
         prefix = body.get("logGroupNamePrefix", "")
         groups = [g for g in log_groups() if g.startswith(prefix)]
