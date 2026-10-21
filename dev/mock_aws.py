@@ -625,35 +625,81 @@ SFN_MACHINES = [
      "description": "Validates, charges and ships an order"},
     {"name": "invoice-generation", "type": "STANDARD", "created": T0 - 86400 * 60, "logging": None,
      "description": "Monthly invoices (legacy Lambda tasks)"},
+    {"name": "report-export", "type": "STANDARD", "created": T0 - 86400 * 45, "logging": None,
+     "description": "Exports a report with Athena and waits for it"},
     {"name": "events-ingest", "type": "EXPRESS", "created": T0 - 86400 * 30,
      "logging": f"arn:aws:logs:us-east-1:123456789012:log-group:/aws/vendedlogs/states/events-ingest-Logs:*",
      "description": "High-volume event ingestion"},
 ]
-# Each state: (name, lambda function or None). The optimized integration ("lambda:invoke")
-# for order-fulfillment, the legacy Lambda resource for invoice-generation.
-SFN_STATES = {
-    "order-fulfillment": [("ValidateOrder", "orders-sync"), ("ChargePayment", "payments-webhook"),
-                          ("ShipOrder", "report-builder"), ("NotifyCustomer", None)],
-    "invoice-generation": [("CollectUsage", "report-builder"), ("RenderPdf", "image-resizer"), ("SendInvoice", "users-auth")],
+
+
+def _fn(name):
+    return f"arn:aws:lambda:us-east-1:123456789012:function:{name}"
+
+
+def _invoke(name):
+    return {"Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {"FunctionName": f"{_fn(name)}:live", "Payload.$": "$"}}
+
+
+# Definitions: order-fulfillment has a Choice, a retry and a catch (optimized Lambda
+# integration); invoice-generation a Map and a Parallel (legacy Lambda resources);
+# report-export a polling loop.
+SFN_DEFS = {
+    "order-fulfillment": {"Comment": "Validates, charges and ships an order", "StartAt": "ValidateOrder", "States": {
+        "ValidateOrder": {**_invoke("orders-sync"), "Next": "InStock?"},
+        "InStock?": {"Type": "Choice", "Choices": [{"Variable": "$.inStock", "BooleanEquals": True, "Next": "ChargePayment"}],
+                     "Default": "Backorder"},
+        "Backorder": {"Type": "Task", "Resource": "arn:aws:states:::sqs:sendMessage",
+                      "Parameters": {"QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/backorders", "MessageBody.$": "$"},
+                      "Next": "NotifyCustomer"},
+        "ChargePayment": {**_invoke("payments-webhook"), "Retry": [{"ErrorEquals": ["TimeoutError"], "MaxAttempts": 1}],
+                          "Catch": [{"ErrorEquals": ["PaymentDeclined"], "Next": "PaymentDeclined"}], "Next": "ShipOrder"},
+        "PaymentDeclined": {"Type": "Fail", "Error": "PaymentDeclined", "Cause": "The card was declined"},
+        "ShipOrder": {**_invoke("report-builder"), "Next": "NotifyCustomer"},
+        "NotifyCustomer": {"Type": "Pass", "End": True}}},
+    "invoice-generation": {"StartAt": "CollectUsage", "States": {
+        "CollectUsage": {"Type": "Task", "Resource": _fn("report-builder"), "Next": "RenderInvoices"},
+        "RenderInvoices": {"Type": "Map", "ItemsPath": "$.customers", "MaxConcurrency": 3, "Next": "Notify",
+                           "ItemProcessor": {"ProcessorConfig": {"Mode": "INLINE"}, "StartAt": "RenderPdf", "States": {
+                               "RenderPdf": {"Type": "Task", "Resource": _fn("image-resizer"), "Next": "SendInvoice"},
+                               "SendInvoice": {"Type": "Task", "Resource": _fn("users-auth"), "End": True}}}},
+        "Notify": {"Type": "Parallel", "End": True, "Branches": [
+            {"StartAt": "EmailFinance", "States": {"EmailFinance": {"Type": "Task", "Resource": "arn:aws:states:::sns:publish", "End": True}}},
+            {"StartAt": "UpdateLedger", "States": {"UpdateLedger": {"Type": "Task", "Resource": "arn:aws:states:::dynamodb:putItem", "End": True}}}]}}},
+    "report-export": {"StartAt": "StartExport", "States": {
+        "StartExport": {"Type": "Task", "Resource": "arn:aws:states:::aws-sdk:athena:startQueryExecution", "Next": "WaitForExport"},
+        "WaitForExport": {"Type": "Wait", "Seconds": 10, "Next": "GetStatus"},
+        "GetStatus": {"Type": "Task", "Resource": "arn:aws:states:::aws-sdk:athena:getQueryExecution", "Next": "Done?"},
+        "Done?": {"Type": "Choice", "Choices": [
+            {"Variable": "$.state", "StringEquals": "RUNNING", "Next": "WaitForExport"},
+            {"Variable": "$.state", "StringEquals": "FAILED", "Next": "ExportFailed"}], "Default": "Finish"},
+        "ExportFailed": {"Type": "Fail", "Error": "ExportFailed"},
+        "Finish": {"Type": "Succeed"}}},
+    "events-ingest": {"StartAt": "Store", "States": {"Store": {"Type": "Task", "Resource": "arn:aws:states:::dynamodb:putItem", "End": True}}},
 }
-SFN_INPUT = {"orderId": "ORD-1042", "customerId": "C-77", "amount": 129.9, "currency": "USD",
+SFN_INPUT = {"orderId": "ORD-1042", "customerId": "C-77", "amount": 129.9, "currency": "USD", "inStock": True,
              "items": [{"sku": "SKU-1", "qty": 2}, {"sku": "SKU-9", "qty": 1}]}
 SFN_CAUSE = json.dumps({"errorType": "TimeoutError", "errorMessage": "payment provider did not answer in 3000 ms",
                         "trace": ["TimeoutError: payment provider did not answer in 3000 ms",
                                   "    at charge (/var/task/payments.js:42:11)",
                                   "    at handler (/var/task/index.js:17:5)"]})
-# scenario: success, fail (fails at the 2nd state after a retry), running (in the 2nd state),
-# aborted (stopped in the 3rd state). Started executions run for 20 s, then succeed.
+# scenario: success, fail, running, aborted; "started" ones (StartExecution) run for 20 s,
+# then succeed.
 SFN_EXECUTIONS = []
-for _k, (_scenario, _ago) in enumerate([("running", 40), ("fail", 3600), ("success", 7200), ("success", 3 * 3600),
+for _k, (_scenario, _ago) in enumerate([("running", 40), ("fail", 3600), ("success", 7200), ("backorder", 3 * 3600),
                                          ("aborted", 5 * 3600), ("fail", 86400), ("success", 2 * 86400)]):
     SFN_EXECUTIONS.append({"machine": "order-fulfillment", "name": f"ord-{1042 - _k}-{uuid.uuid4().hex[:6]}",
                            "scenario": _scenario, "start": time.time() - _ago, "redrives": 0,
-                           "input": json.dumps({**SFN_INPUT, "orderId": f"ORD-{1042 - _k}"})})
+                           "input": json.dumps({**SFN_INPUT, "orderId": f"ORD-{1042 - _k}",
+                                                "inStock": _scenario != "backorder"})})
 for _k, _scenario in enumerate(["success", "fail", "success"]):
     SFN_EXECUTIONS.append({"machine": "invoice-generation", "name": f"invoices-2026-{9 - _k:02d}",
                            "scenario": _scenario, "start": time.time() - 86400 * (1 + 30 * _k), "redrives": 0,
-                           "input": json.dumps({"month": f"2026-{9 - _k:02d}", "customers": 412})})
+                           "input": json.dumps({"month": f"2026-{9 - _k:02d}", "customers": ["C-1", "C-2", "C-3", "C-4"]})})
+for _k, (_scenario, _ago) in enumerate([("running", 25), ("success", 4 * 3600), ("fail", 30 * 3600)]):
+    SFN_EXECUTIONS.append({"machine": "report-export", "name": f"export-{300 - _k}", "scenario": _scenario,
+                           "start": time.time() - _ago, "redrives": 0, "input": json.dumps({"report": "sales", "month": "2026-09"})})
 
 
 def sfn_exec_arn(e):
@@ -663,72 +709,152 @@ def sfn_exec_arn(e):
 def sfn_status(e):
     if e["scenario"] == "started":
         return "SUCCEEDED" if time.time() - e["start"] > 20 else "RUNNING"
-    return {"success": "SUCCEEDED", "fail": "FAILED", "running": "RUNNING", "aborted": "ABORTED",
-            "redriven": "SUCCEEDED"}[e["scenario"]]
+    return {"success": "SUCCEEDED", "backorder": "SUCCEEDED", "fail": "FAILED", "running": "RUNNING",
+            "aborted": "ABORTED", "redriven": "SUCCEEDED"}[e["scenario"]]
 
 
-def sfn_history(e):
-    """Events of an execution, oldest first."""
-    states = SFN_STATES[e["machine"]]
-    legacy = e["machine"] == "invoice-generation"
-    events, t = [], e["start"]
-
-    def add(kind, prev, **details):
-        nonlocal t
-        events.append({"id": len(events) + 1, "previousEventId": prev, "timestamp": t, "type": kind, **details})
-        t += 0.05
-        return len(events)
-
-    add("ExecutionStarted", 0, executionStartedEventDetails={"input": e["input"], "roleArn": "arn:aws:iam::123456789012:role/sfn"})
+def sfn_script(e):
+    """What an execution did, as a list of steps:
+    ("task", name, lambda function or service:action, outcome), ("pass" | "choice", name),
+    ("wait", name, seconds), ("succeed", name), ("map", name, [script per item]),
+    ("parallel", name, [script per branch]). Outcomes: ok, fail (after one retry), running, abort."""
     scenario = e["scenario"]
     if scenario == "started":
         scenario = "success" if sfn_status(e) == "SUCCEEDED" else "running"
-    stop_at = {"fail": 1, "running": 1, "aborted": 2}.get(scenario, len(states))
-    prev = 1
-    for i, (name, fn) in enumerate(states):
-        kind = "Pass" if fn is None else "Task"
-        entered = add(f"{kind}StateEntered", prev, stateEnteredEventDetails={"name": name, "input": e["input"]})
-        if fn is None:
-            prev = add(f"{kind}StateExited", entered, stateExitedEventDetails={"name": name, "output": e["input"]})
-            continue
-        arn = f"arn:aws:lambda:us-east-1:123456789012:function:{fn}"
-        attempts = 2 if (scenario == "fail" and i == stop_at) else 1
+    machine = e["machine"]
+    if machine == "order-fulfillment":
+        head = [("task", "ValidateOrder", "orders-sync", "ok"), ("choice", "InStock?")]
+        if scenario == "backorder":
+            return head + [("task", "Backorder", "sqs:sendMessage", "ok"), ("pass", "NotifyCustomer")]
+        charge = {"fail": "fail", "running": "running"}.get(scenario, "ok")
+        script = head + [("task", "ChargePayment", "payments-webhook", charge)]
+        if charge != "ok":
+            return script
+        ship = "abort" if scenario == "aborted" else "ok"
+        script.append(("task", "ShipOrder", "report-builder", ship))
+        return script if ship != "ok" else script + [("pass", "NotifyCustomer")]
+    if machine == "invoice-generation":
+        items = [[("task", "RenderPdf", "image-resizer", "ok"), ("task", "SendInvoice", "users-auth", "ok")] for _ in range(4)]
+        if scenario == "fail":
+            items[3][1] = ("task", "SendInvoice", "users-auth", "fail")
+        script = [("task", "CollectUsage", "report-builder", "ok"), ("map", "RenderInvoices", items)]
+        if scenario == "fail":
+            return script
+        return script + [("parallel", "Notify", [[("task", "EmailFinance", "sns:publish", "ok")],
+                                                 [("task", "UpdateLedger", "dynamodb:putItem", "ok")]])]
+    if machine == "report-export":
+        polls = {"running": 1, "success": 3, "fail": 2}[scenario]
+        script = [("task", "StartExport", "athena:startQueryExecution", "ok")]
+        for i in range(polls):
+            script += [("wait", "WaitForExport", 10)]
+            if scenario == "running" and i == polls - 1:
+                script[-1] = ("wait", "WaitForExport", "running")
+                return script
+            script += [("task", "GetStatus", "athena:getQueryExecution", "ok"), ("choice", "Done?")]
+        return script + ([("fail", "ExportFailed")] if scenario == "fail" else [("succeed", "Finish")])
+    return [("task", "Store", "dynamodb:putItem", "ok")]
+
+
+def sfn_history(e):
+    """Events of an execution, oldest first, linked by previousEventId like the real ones."""
+    legacy = e["machine"] == "invoice-generation"
+    events, clock = [], [e["start"]]
+
+    def add(kind, prev, **details):
+        events.append({"id": len(events) + 1, "previousEventId": prev, "timestamp": clock[0], "type": kind, **details})
+        clock[0] += 0.05
+        return len(events)
+
+    def task(prev, name, target, outcome):
+        entered = add("TaskStateEntered", prev, stateEnteredEventDetails={"name": name, "input": e["input"]})
+        service = ":" in target
+        attempts = 2 if outcome == "fail" else 1
         last = entered
         for attempt in range(attempts):
-            if legacy:
-                last = add("LambdaFunctionScheduled", last, lambdaFunctionScheduledEventDetails={"resource": arn, "input": e["input"]})
+            if service:
+                rtype, action = target.split(":", 1)
+                last = add("TaskScheduled", last, taskScheduledEventDetails={"resourceType": rtype, "resource": action,
+                                                                              "region": "us-east-1", "parameters": e["input"]})
+            elif legacy:
+                last = add("LambdaFunctionScheduled", last, lambdaFunctionScheduledEventDetails={"resource": _fn(target), "input": e["input"]})
                 last = add("LambdaFunctionStarted", last)
             else:
-                params = json.dumps({"FunctionName": f"{arn}:live", "Payload": json.loads(e["input"])})
+                params = json.dumps({"FunctionName": f"{_fn(target)}:live", "Payload": json.loads(e["input"])})
                 last = add("TaskScheduled", last, taskScheduledEventDetails={"resourceType": "lambda", "resource": "invoke",
                                                                               "region": "us-east-1", "parameters": params})
                 last = add("TaskStarted", last, taskStartedEventDetails={"resourceType": "lambda", "resource": "invoke"})
-            t += 1.5 + i
-            if scenario == "running" and i == stop_at:
-                return events
-            if scenario == "aborted" and i == stop_at:
-                add("ExecutionAborted", last, executionAbortedEventDetails={"error": "Manual.Stop", "cause": "Stopped from the console"})
-                return events
-            if scenario == "fail" and i == stop_at:
+            clock[0] += 1.5 + len(name) % 3
+            if outcome == "running":
+                return last, "running"
+            if outcome == "abort":
+                return last, "aborted"
+            if outcome == "fail":
                 failed = {"error": "TimeoutError", "cause": SFN_CAUSE}
                 if legacy:
                     last = add("LambdaFunctionFailed", last, lambdaFunctionFailedEventDetails=failed)
                 else:
                     last = add("TaskFailed", last, taskFailedEventDetails={"resourceType": "lambda", "resource": "invoke", **failed})
                 if attempt == attempts - 1:
-                    add("ExecutionFailed", last, executionFailedEventDetails=failed)
-                    return events
-                t += 2
+                    return last, "failed"
+                clock[0] += 2
                 continue
             ok = json.dumps({"ok": True, "state": name})
-            if legacy:
+            if legacy and not service:
                 last = add("LambdaFunctionSucceeded", last, lambdaFunctionSucceededEventDetails={"output": ok})
             else:
                 last = add("TaskSucceeded", last, taskSucceededEventDetails={"resourceType": "lambda", "resource": "invoke", "output": ok})
-        prev = add(f"{kind}StateExited", last, stateExitedEventDetails={"name": name, "output": json.dumps({"ok": True})})
-        if scenario == "redriven" and i == 1:
-            add("ExecutionRedriven", prev, executionRedrivenEventDetails={"redriveCount": e["redrives"]})
-    add("ExecutionSucceeded", prev, executionSucceededEventDetails={"output": json.dumps({"status": "DONE"})})
+        return add("TaskStateExited", last, stateExitedEventDetails={"name": name, "output": json.dumps({"ok": True})}), None
+
+    def run(prev, script):
+        for step in script:
+            kind, name = step[0], step[1]
+            if kind == "task":
+                prev, stop = task(prev, name, step[2], step[3])
+            elif kind in ("pass", "choice", "succeed"):
+                state = kind.capitalize()
+                entered = add(f"{state}StateEntered", prev, stateEnteredEventDetails={"name": name, "input": e["input"]})
+                prev, stop = add(f"{state}StateExited", entered, stateExitedEventDetails={"name": name, "output": e["input"]}), None
+            elif kind == "fail":
+                return add("FailStateEntered", prev, stateEnteredEventDetails={"name": name, "input": e["input"]}), "failed"
+            elif kind == "wait":
+                entered = add("WaitStateEntered", prev, stateEnteredEventDetails={"name": name, "input": e["input"]})
+                if step[2] == "running":
+                    return entered, "running"
+                clock[0] += step[2]
+                prev, stop = add("WaitStateExited", entered, stateExitedEventDetails={"name": name, "output": e["input"]}), None
+            else:  # map / parallel: items or branches overlap in time
+                state = "Map" if kind == "map" else "Parallel"
+                entered = add(f"{state}StateEntered", prev, stateEnteredEventDetails={"name": name, "input": e["input"]})
+                started = add(f"{state}StateStarted", entered)
+                base, end, stop = clock[0], clock[0], None
+                for i, inner in enumerate(step[2]):
+                    clock[0] = base + i * 0.8
+                    head = add("MapIterationStarted", started, mapIterationStartedEventDetails={"name": name, "index": i}) if kind == "map" else started
+                    last, stop = run(head, inner)
+                    end = max(end, clock[0])
+                    if kind == "map":
+                        add("MapIterationFailed" if stop else "MapIterationSucceeded", last, mapIterationSucceededEventDetails={"name": name, "index": i})
+                    if stop:
+                        break
+                clock[0] = end
+                if stop:
+                    return add(f"{state}StateFailed", started), stop
+                prev = add(f"{state}StateExited", add(f"{state}StateSucceeded", started),
+                           stateExitedEventDetails={"name": name, "output": json.dumps({"ok": True})})
+            if stop:
+                return prev, stop
+        return prev, None
+
+    add("ExecutionStarted", 0, executionStartedEventDetails={"input": e["input"], "roleArn": "arn:aws:iam::123456789012:role/sfn"})
+    last, stop = run(1, sfn_script(e))
+    if stop == "aborted":
+        add("ExecutionAborted", last, executionAbortedEventDetails={"error": "Manual.Stop", "cause": "Stopped from the console"})
+    elif stop == "failed":
+        add("ExecutionFailed", last, executionFailedEventDetails={"error": "TimeoutError", "cause": SFN_CAUSE})
+    elif stop is None:
+        if e["scenario"] == "redriven":
+            last = add("ExecutionRedriven", last, executionRedrivenEventDetails={"redriveCount": e["redrives"]})
+        add("ExecutionSucceeded", last, executionSucceededEventDetails={"output": json.dumps({"status": "DONE"})})
     return events
 
 
@@ -762,7 +888,7 @@ def stepfunctions(op, body):
             raise KeyError(f"StateMachineDoesNotExist: {name}")
         out = {"stateMachineArn": body["stateMachineArn"], "name": name, "status": "ACTIVE", "type": m["type"],
                "roleArn": f"arn:aws:iam::123456789012:role/service-role/{name}-role", "creationDate": m["created"],
-               "description": m["description"], "definition": json.dumps({"StartAt": "Start", "States": {}})}
+               "description": m["description"], "definition": json.dumps(SFN_DEFS[name], indent=2)}
         if m["logging"]:
             out["loggingConfiguration"] = {"level": "ALL", "includeExecutionData": True,
                                            "destinations": [{"cloudWatchLogsLogGroup": {"logGroupArn": m["logging"]}}]}
@@ -782,6 +908,10 @@ def stepfunctions(op, body):
         if start + size < len(items):
             out["nextToken"] = str(start + size)
         return out
+    if op == "DescribeStateMachineForExecution":
+        e = sfn_find_exec(body["executionArn"])
+        return {"stateMachineArn": f"{SFN_ARN}:stateMachine:{e['machine']}", "name": e["machine"],
+                "definition": json.dumps(SFN_DEFS[e["machine"]], indent=2), "updateDate": T0 - 86400}
     if op == "DescribeExecution":
         e = sfn_find_exec(body["executionArn"])
         out = sfn_summary(e)
@@ -816,7 +946,7 @@ def stepfunctions(op, body):
         return {"redriveDate": time.time()}
     if op == "StartExecution":
         name = body["stateMachineArn"].rsplit(":", 1)[-1]
-        if name not in SFN_STATES:
+        if name not in SFN_DEFS:
             raise KeyError(f"StateMachineDoesNotExist: {name}")
         json.loads(body.get("input") or "{}")
         e = {"machine": name, "name": body.get("name") or uuid.uuid4().hex[:12], "scenario": "started",

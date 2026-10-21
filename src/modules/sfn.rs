@@ -1,7 +1,7 @@
 //! Step Functions: state machines → their executions (filtered by status) → the steps of
-//! an execution, where it failed and why. Opens the logs of a failed Lambda step or of the
-//! machine, copies a failure report for an AI agent, and redrives, starts and stops
-//! executions.
+//! an execution, where it failed and why, its graph (like the console's) and its timeline.
+//! Opens the logs of a failed Lambda step or of the machine, copies a failure report for an
+//! AI agent, and redrives, starts and stops executions.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -14,6 +14,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use super::common::{LoadState, filter_bar, matches_filter};
+use super::sfn_flow::{self, Run, Trace};
+use crate::asl;
 use crate::aws::sfn::{self, Execution, ExecutionDetail, HistoryEvent, MachineDetail, StateMachine, Step, StepStatus};
 use crate::aws;
 use crate::config::is_production;
@@ -56,6 +58,8 @@ enum Msg {
     Detail { arn: String, result: Box<aws::Result<(ExecutionDetail, Vec<HistoryEvent>)>> },
     /// An action finished: what to say, and the execution to select afterwards.
     Acted { result: aws::Result<(String, Option<String>)> },
+    /// The definition of an execution (by its ARN) or of a machine (by its ARN).
+    Definition { key: String, result: aws::Result<String> },
 }
 
 #[derive(PartialEq)]
@@ -81,6 +85,69 @@ enum Action {
 enum Dialog {
     Form { form: Form, action: Action, busy: bool },
     Confirm { title: String, lines: Vec<String>, typed: Option<(String, TextInput)>, action: Action, busy: bool, error: Option<String> },
+}
+
+/// A state machine's definition, read and arranged for the graph.
+struct Diagram {
+    machine: asl::Machine,
+    flow: asl::Flow,
+}
+
+fn diagram(definition: &str) -> Result<Diagram, String> {
+    let machine = asl::Machine::parse(definition)?;
+    Ok(Diagram { flow: asl::arrange(&machine, false), machine })
+}
+
+/// An execution's graph or timeline (or a machine's graph), full screen.
+struct FlowView {
+    /// The execution's ARN, or the machine's when showing its definition alone.
+    key: String,
+    execution: bool,
+    title: String,
+    timeline: bool,
+    selected: Option<String>,
+    /// Graph: columns and rows scrolled; timeline: rows scrolled.
+    scroll: (usize, usize),
+    /// Bring the selected state into view on the next render.
+    follow: bool,
+    /// Screen position of the graph's top-left corner, and of the timeline's first row.
+    origin: (i32, i32),
+    rows_top: u16,
+    area: Rect,
+    /// Where each state's box is in the graph.
+    nodes: Vec<sfn_flow::Node>,
+    /// The states in the order ↑↓ moves through them.
+    order: Vec<String>,
+    page: usize,
+}
+
+impl FlowView {
+    /// Moves the selection `by` states (in the graph's order, or the timeline's rows).
+    fn step(&mut self, by: isize) {
+        if self.order.is_empty() {
+            return;
+        }
+        let at = self.selected.as_ref().and_then(|s| self.order.iter().position(|n| n == s)).unwrap_or(0) as isize;
+        let next = at.saturating_add(by).clamp(0, self.order.len() as isize - 1) as usize;
+        self.select(self.order[next].clone());
+    }
+
+    fn select(&mut self, name: String) {
+        self.selected = Some(name);
+        self.follow = true;
+    }
+}
+
+/// The scroll offset that shows `len` items from `at` in a view of `view`, moving as little
+/// as possible from `scroll`.
+fn reveal(scroll: usize, at: usize, len: usize, view: usize, margin: usize) -> usize {
+    if len + 2 * margin >= view || at < scroll + margin {
+        at.saturating_sub(margin)
+    } else if at + len + margin > scroll + view {
+        at + len + margin - view
+    } else {
+        scroll
+    }
 }
 
 pub struct StepFunctions {
@@ -112,6 +179,9 @@ pub struct StepFunctions {
     /// Input / output of an execution or a step, full screen.
     zoom: Option<(String, LogView)>,
     dialog: Option<Dialog>,
+    flow: Option<FlowView>,
+    diagrams: HashMap<String, Result<Diagram, String>>,
+    diagram_in_flight: HashSet<String>,
     /// A jump arrived before the machines loaded.
     pending_open: Option<String>,
     env_name: String,
@@ -152,6 +222,9 @@ impl StepFunctions {
             detail_scroll: 0,
             zoom: None,
             dialog: None,
+            flow: None,
+            diagrams: HashMap::new(),
+            diagram_in_flight: HashSet::new(),
             pending_open: None,
             env_name: String::new(),
             region: String::new(),
@@ -540,6 +613,253 @@ impl StepFunctions {
         }
     }
 
+    // ---- graph and timeline ------------------------------------------------------------
+
+    /// Shows the selected execution's graph (or timeline); on the machines screen, the
+    /// selected machine's graph.
+    fn open_flow(&mut self, timeline: bool, ctx: &mut Ctx) {
+        let (key, execution, title, selected) = match self.screen {
+            Screen::Executions => {
+                let Some(e) = self.selected_execution() else { return };
+                let machine = self.machine.as_ref().map(|m| m.name.as_str()).unwrap_or_default();
+                // Start on the step being looked at, else where it failed, or what runs now.
+                let selected = self.detail().and_then(|d| {
+                    if self.focus == Focus::Steps {
+                        return d.steps.get(self.step_cursor).map(|s| s.name.clone());
+                    }
+                    let failed = sfn::failure(&d.steps, &d.events, Some(&d.detail)).and_then(|f| f.state);
+                    failed.or_else(|| d.steps.iter().rev().find(|s| s.status == StepStatus::Running).map(|s| s.name.clone()))
+                });
+                (e.execution_arn.clone(), true, format!("{machine} · {}", e.name), selected)
+            }
+            Screen::Machines => {
+                let Some(m) = self.selected_machine() else { return };
+                if timeline {
+                    return ctx.toast(Level::Info, "Timelines are per execution: Enter lists them");
+                }
+                (m.state_machine_arn.clone(), false, m.name.clone(), None)
+            }
+        };
+        self.fetch_diagram(&key, execution, ctx);
+        self.flow = Some(FlowView {
+            key,
+            execution,
+            title,
+            timeline,
+            selected,
+            scroll: (0, 0),
+            follow: true,
+            origin: (0, 0),
+            rows_top: 0,
+            area: Rect::default(),
+            nodes: Vec::new(),
+            order: Vec::new(),
+            page: 10,
+        });
+    }
+
+    fn fetch_diagram(&mut self, key: &str, execution: bool, ctx: &mut Ctx) {
+        if self.diagrams.contains_key(key) || !self.diagram_in_flight.insert(key.to_string()) {
+            return;
+        }
+        let (aws, key) = (ctx.env().aws.clone(), key.to_string());
+        ctx.spawn(move || {
+            let result = if execution {
+                sfn::execution_definition(&aws, &key)
+            } else {
+                sfn::describe_state_machine(&aws, &key).map(|d| d.definition.unwrap_or_default())
+            };
+            Msg::Definition { key, result }
+        });
+    }
+
+    fn flow_detail(&self) -> Option<&Detail> {
+        self.details.get(&self.flow.as_ref()?.key)?.as_ref().ok()
+    }
+
+    /// The last visit of the selected state.
+    fn flow_step(&self) -> Option<&Step> {
+        let name = self.flow.as_ref()?.selected.as_ref()?;
+        self.flow_detail()?.steps.iter().rev().find(|s| &s.name == name)
+    }
+
+    fn flow_key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
+        let Some(fv) = &mut self.flow else { return Handled::No };
+        let (arn, execution, page) = (fv.key.clone(), fv.execution, fv.page.max(1));
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => self.flow = None,
+            KeyCode::Up | KeyCode::Char('k') => fv.step(-1),
+            KeyCode::Down | KeyCode::Char('j') => fv.step(1),
+            KeyCode::Home => fv.step(isize::MIN),
+            KeyCode::End => fv.step(isize::MAX),
+            KeyCode::PageUp if fv.timeline => fv.step(-(page as isize)),
+            KeyCode::PageDown if fv.timeline => fv.step(page as isize),
+            KeyCode::PageUp => fv.scroll.1 = fv.scroll.1.saturating_sub(page),
+            KeyCode::PageDown => fv.scroll.1 += page,
+            KeyCode::Left => fv.scroll.0 = fv.scroll.0.saturating_sub(8),
+            KeyCode::Right => fv.scroll.0 += 8,
+            KeyCode::Char('g') => {
+                fv.timeline = false;
+                fv.follow = true;
+            }
+            KeyCode::Char('t') if execution => {
+                fv.timeline = true;
+                fv.follow = true;
+            }
+            KeyCode::Char('f') => {
+                let failed = self.flow_detail().and_then(|d| sfn::failure(&d.steps, &d.events, Some(&d.detail))?.state);
+                match (failed, &mut self.flow) {
+                    (Some(name), Some(fv)) => fv.select(name),
+                    _ => ctx.toast(Level::Info, "Nothing failed here"),
+                }
+            }
+            KeyCode::Char(c @ ('i' | 'O')) => match self.flow_step().cloned() {
+                Some(s) => {
+                    let (what, json) = if c == 'i' { ("input", s.input) } else { ("output", s.output) };
+                    self.zoom_json(format!("{} · {what}", s.name), json.as_deref(), ctx);
+                }
+                None => ctx.toast(Level::Info, "This state has not run in this execution"),
+            },
+            KeyCode::Char('l') => {
+                let machine = if execution { self.machine.as_ref().map(|m| m.state_machine_arn.clone()) } else { Some(arn) };
+                let group = self.flow_step().and_then(Step::log_group).or_else(|| self.machine_detail(&machine?)?.log_group());
+                match group {
+                    Some(group) => ctx.jump("Logs", group),
+                    None => ctx.toast(Level::Info, "This state runs no Lambda function and the state machine does not log to CloudWatch"),
+                }
+            }
+            KeyCode::Char('c') if execution => self.copy_report(ctx),
+            KeyCode::Char('o') => open_url(ctx, &sfn::console_url(&self.region, &arn)),
+            _ => return Handled::No,
+        }
+        Handled::Yes
+    }
+
+    fn flow_mouse(&mut self, event: MouseEvent) -> Handled {
+        let Some(fv) = &mut self.flow else { return Handled::No };
+        if !fv.area.contains((event.column, event.row).into()) {
+            return Handled::No;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp if fv.timeline => fv.step(-1),
+            MouseEventKind::ScrollDown if fv.timeline => fv.step(1),
+            MouseEventKind::ScrollUp => fv.scroll.1 = fv.scroll.1.saturating_sub(3),
+            MouseEventKind::ScrollDown => fv.scroll.1 += 3,
+            MouseEventKind::Down(MouseButton::Left) if fv.timeline => {
+                let row = event.row.checked_sub(fv.rows_top).map(|r| fv.scroll.1 + r as usize);
+                if let Some(name) = row.and_then(|r| fv.order.get(r)).cloned() {
+                    fv.selected = Some(name);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let (x, y) = (i32::from(event.column) - fv.origin.0, i32::from(event.row) - fv.origin.1);
+                let inside = |n: &&sfn_flow::Node| x >= n.x as i32 && y >= n.y as i32 && x < (n.x + n.w) as i32 && y < (n.y + n.h) as i32;
+                // The innermost box: a state inside a Parallel or Map frame, not the frame.
+                if let Some(n) = fv.nodes.iter().filter(inside).min_by_key(|n| n.w * n.h) {
+                    fv.selected = Some(n.name.clone());
+                }
+            }
+            _ => return Handled::No,
+        }
+        Handled::Yes
+    }
+
+    fn render_flow(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        let [main, side] = if area.width >= 110 {
+            area.layout(&Layout::horizontal([Constraint::Fill(1), Constraint::Length(48)]))
+        } else {
+            area.layout(&Layout::vertical([Constraint::Percentage(60), Constraint::Fill(1)]))
+        };
+        let Some(fv) = self.flow.as_mut() else { return };
+        let detail = self.details.get(&fv.key).and_then(|r| r.as_ref().ok());
+        let diagram = self.diagrams.get(&fv.key);
+        let trace = detail.map(|d| Trace::new(&d.steps, &d.events)).unwrap_or_default();
+
+        let tab = |label: &'static str, on: bool| Span::styled(format!(" {label} "), if on { theme::accent().bold() } else { theme::muted() });
+        let mut tabs = vec![tab("g graph", !fv.timeline)];
+        if fv.execution {
+            tabs.push(tab("t timeline", fv.timeline));
+        }
+        let mut block = widgets::panel(Line::from(format!(" {} ", fv.title)).bold(), true).title_top(Line::from(tabs).right_aligned());
+        if let Some(d) = detail {
+            let (symbol, style, label) = status_style(&d.detail.status);
+            let took = d.detail.duration(view.now).map(fmt_duration).unwrap_or_default();
+            block = block.title_bottom(Line::styled(format!(" {symbol} {label} · {took} "), style));
+            if d.events.len() >= sfn::MAX_EVENTS {
+                let partial = format!(" only its first {} history events are shown ", sfn::MAX_EVENTS);
+                block = block.title_bottom(Line::styled(partial, Style::new().fg(theme::WARN)).right_aligned());
+            }
+        }
+        let inner = block.inner(main);
+        f.render_widget(block, main);
+        fv.area = inner;
+        let waiting = |text: &str| Line::from(vec![Span::styled(theme::spinner(view.tick), theme::accent()), Span::raw(format!(" {text}"))]);
+
+        if fv.timeline {
+            let Some(d) = detail else {
+                f.render_widget(widgets::placeholder(waiting("Loading the execution's history…")), inner);
+                return;
+            };
+            let machine = diagram.and_then(|r| r.as_ref().ok()).map(|dg| &dg.machine);
+            let rows = sfn_flow::rows(machine, &trace);
+            if rows.is_empty() {
+                f.render_widget(widgets::placeholder(Line::styled("No state has started yet", theme::muted())), inner);
+            } else {
+                let starts = trace.runs.values().flat_map(|r| r.spans.iter().map(|s| s.0));
+                let t0 = d.detail.start_date.unwrap_or_else(|| starts.fold(view.now, f64::min));
+                let t1 = d.detail.stop_date.unwrap_or(view.now);
+                let selected = fv.selected.as_ref().and_then(|s| rows.iter().position(|r| &r.name == s)).unwrap_or(0);
+                fv.selected = Some(rows[selected].name.clone());
+                let (header, lines) = sfn_flow::timeline(&rows, &trace, (t0, t1), inner.width as usize, Some(selected), view.now, view.tick);
+                let body = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+                let vh = body.height as usize;
+                if fv.follow {
+                    fv.scroll.1 = reveal(fv.scroll.1, selected, 1, vh, 0);
+                    fv.follow = false;
+                }
+                fv.scroll.1 = fv.scroll.1.min(lines.len().saturating_sub(vh));
+                f.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+                f.render_widget(Paragraph::new(lines.into_iter().skip(fv.scroll.1).collect::<Vec<_>>()), body);
+                fv.rows_top = body.y;
+                fv.order = rows.into_iter().map(|r| r.name).collect();
+                fv.page = vh;
+            }
+        } else {
+            match diagram {
+                None => f.render_widget(widgets::placeholder(waiting("Reading the state machine's definition…")), inner),
+                Some(Err(e)) => f.render_widget(
+                    widgets::placeholder(Line::styled(format!("Cannot draw this state machine: {e}"), Style::new().fg(theme::ERR))),
+                    inner,
+                ),
+                Some(Ok(dg)) => {
+                    if fv.selected.is_none() {
+                        fv.selected = Some(dg.machine.start.clone());
+                    }
+                    let (canvas, nodes) = sfn_flow::graph(&dg.machine, &dg.flow, &trace, view.now, view.tick, fv.selected.as_deref());
+                    let (vw, vh) = (inner.width as usize, inner.height as usize);
+                    if fv.follow {
+                        if let Some(n) = nodes.iter().find(|n| fv.selected.as_ref() == Some(&n.name)) {
+                            fv.scroll = (reveal(fv.scroll.0, n.x, n.w, vw, 2), reveal(fv.scroll.1, n.y, n.h, vh, 1));
+                        }
+                        fv.follow = false;
+                    }
+                    fv.scroll.0 = fv.scroll.0.min(canvas.w.saturating_sub(vw));
+                    fv.scroll.1 = fv.scroll.1.min(canvas.h.saturating_sub(vh));
+                    // A graph narrower than the panel is centered.
+                    let pad = (vw.saturating_sub(canvas.w) / 2) as u16;
+                    let rect = Rect { x: inner.x + pad, width: inner.width - pad, ..inner };
+                    f.render_widget(Paragraph::new(canvas.lines(fv.scroll.0, fv.scroll.1, vw, vh)), rect);
+                    fv.origin = (i32::from(rect.x) - fv.scroll.0 as i32, i32::from(rect.y) - fv.scroll.1 as i32);
+                    fv.order = nodes.iter().map(|n| n.name.clone()).collect();
+                    fv.nodes = nodes;
+                    fv.page = vh;
+                }
+            }
+        }
+        let machine = diagram.and_then(|r| r.as_ref().ok()).map(|dg| &dg.machine);
+        render_state(f, side, fv.selected.as_deref(), machine, &trace, detail, fv.execution, view);
+    }
+
     // ---- rendering ---------------------------------------------------------------------
 
     fn render_machines(&mut self, f: &mut Frame, area: Rect, view: &View) {
@@ -619,7 +939,7 @@ impl StepFunctions {
             lines.push(Line::styled("Express workflows do not keep a list of executions:", theme::muted()));
             lines.push(Line::styled("their history is in the logs (l), when logging is on.", theme::muted()));
         } else {
-            lines.push(Line::styled("Enter shows its executions · n starts one · l logs · o console", theme::muted()));
+            lines.push(Line::styled("Enter shows its executions · g its graph · n starts one · l logs · o console", theme::muted()));
         }
         let block = widgets::panel(Line::from(format!(" {} ", m.name)).bold(), false);
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
@@ -733,7 +1053,7 @@ impl StepFunctions {
             }
         }
         lines.push(Line::raw(""));
-        let hint = if self.focus == Focus::Steps { "   ↑↓ step · i/O its input/output · l its logs · Esc back" } else { "   → / Enter to browse" };
+        let hint = if self.focus == Focus::Steps { "   ↑↓ step · i/O its input/output · l its logs · Esc back" } else { "   → browse · g graph · t timeline" };
         lines.push(Line::from(vec![widgets::section(&format!("Steps · {}", d.steps.len())).spans.remove(0), Span::styled(hint, theme::muted())]));
         let name_w = d.steps.iter().map(|s| s.name.chars().count()).max().unwrap_or(4).clamp(4, 28);
         for (i, s) in d.steps.iter().enumerate() {
@@ -877,6 +1197,9 @@ impl Module for StepFunctions {
             }
             return Handled::Yes;
         }
+        if self.flow.is_some() {
+            return self.flow_key(key, ctx);
+        }
         if self.dialog.is_some() {
             self.dialog_key(key, ctx);
             return Handled::Yes;
@@ -914,6 +1237,7 @@ impl Module for StepFunctions {
                     }
                     KeyCode::Char('l') => self.open_logs(ctx),
                     KeyCode::Char('n') => self.open_start(),
+                    KeyCode::Char('g') => self.open_flow(false, ctx),
                     KeyCode::Char('o') => {
                         if let Some(m) = self.selected_machine() {
                             open_url(ctx, &sfn::console_url(&self.region, &m.state_machine_arn));
@@ -938,6 +1262,8 @@ impl Module for StepFunctions {
                     }
                     KeyCode::Char('l') => self.open_logs(ctx),
                     KeyCode::Char('c') => self.copy_report(ctx),
+                    KeyCode::Char('g') => self.open_flow(false, ctx),
+                    KeyCode::Char('t') => self.open_flow(true, ctx),
                     KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
                     KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
                     _ => return Handled::No,
@@ -973,6 +1299,8 @@ impl Module for StepFunctions {
                     KeyCode::Char('l') => self.open_logs(ctx),
                     KeyCode::Char('c') => self.copy_report(ctx),
                     KeyCode::Char('R') => self.open_redrive(ctx),
+                    KeyCode::Char('g') => self.open_flow(false, ctx),
+                    KeyCode::Char('t') => self.open_flow(true, ctx),
                     KeyCode::Char('n') => self.open_start(),
                     KeyCode::Char('x') => self.open_stop(ctx),
                     KeyCode::Char('r') => {
@@ -997,6 +1325,9 @@ impl Module for StepFunctions {
     }
 
     fn mouse(&mut self, event: MouseEvent, ctx: &mut Ctx) -> Handled {
+        if self.flow.is_some() && self.zoom.is_none() {
+            return self.flow_mouse(event);
+        }
         if self.dialog.is_some() || self.zoom.is_some() || !self.list_area.contains((event.column, event.row).into()) {
             return Handled::No;
         }
@@ -1082,6 +1413,10 @@ impl Module for StepFunctions {
                 self.details.insert(arn, result);
             }
             Msg::Acted { result } => self.on_acted(result, ctx),
+            Msg::Definition { key, result } => {
+                self.diagram_in_flight.remove(&key);
+                self.diagrams.insert(key, result.map_err(|e| e.short()).and_then(|d| diagram(&d)));
+            }
         }
     }
 
@@ -1115,6 +1450,10 @@ impl Module for StepFunctions {
             zoomed.render_zoomed(f, area, &title);
             return;
         }
+        if self.flow.is_some() {
+            self.render_flow(f, area, view);
+            return;
+        }
         let [left, right] = if area.width < 100 {
             area.layout(&Layout::vertical([Constraint::Percentage(40), Constraint::Fill(1)]))
         } else {
@@ -1137,6 +1476,19 @@ impl Module for StepFunctions {
         if self.zoom.is_some() {
             return vec![("/", "search"), ("y", "copy"), ("Esc", "back")];
         }
+        if let Some(fv) = &self.flow {
+            let mut hints = vec![("↑↓", "state")];
+            match (fv.execution, fv.timeline) {
+                (true, true) => hints.extend([("g", "graph"), ("f", "failed state")]),
+                (true, false) => hints.extend([("←→", "pan"), ("t", "timeline"), ("f", "failed state")]),
+                (false, _) => hints.push(("←→", "pan")),
+            }
+            if fv.execution {
+                hints.extend([("i/O", "input/output"), ("l", "logs"), ("c", "copy for AI")]);
+            }
+            hints.extend([("o", "console"), ("Esc", "back")]);
+            return hints;
+        }
         if let Some(dialog) = &self.dialog {
             return match dialog {
                 Dialog::Form { .. } => vec![("Tab", "next field"), ("Enter", "confirm"), ("Esc", "cancel")],
@@ -1148,14 +1500,15 @@ impl Module for StepFunctions {
         }
         match (&self.screen, &self.focus) {
             (Screen::Machines, _) => {
-                vec![("↑↓", "move"), ("Enter", "executions"), ("/", "search"), ("n", "start"), ("l", "logs"), ("o", "console"), ("r", "reload")]
+                vec![("↑↓", "move"), ("Enter", "executions"), ("g", "graph"), ("/", "search"), ("n", "start"), ("l", "logs"), ("o", "console"), ("r", "reload")]
             }
             (Screen::Executions, Focus::Steps) => {
-                vec![("↑↓", "step"), ("i/O", "step input/output"), ("l", "its logs"), ("c", "copy report"), ("Esc", "back")]
+                vec![("↑↓", "step"), ("g/t", "graph/timeline"), ("i/O", "step input/output"), ("l", "its logs"), ("c", "copy report"), ("Esc", "back")]
             }
             (Screen::Executions, Focus::List) => vec![
                 ("↑↓", "move"),
                 ("→", "steps"),
+                ("g/t", "graph/timeline"),
                 ("f", "filter"),
                 ("i/O", "input/output"),
                 ("l", "logs"),
@@ -1173,6 +1526,7 @@ impl Module for StepFunctions {
             || matches!(self.exec_load, LoadState::Loading)
             || self.pending_detail.is_some()
             || !self.detail_in_flight.is_empty()
+            || !self.diagram_in_flight.is_empty()
             || self.executions.iter().any(|e| e.status == "RUNNING")
             || matches!(self.dialog, Some(Dialog::Form { busy: true, .. }) | Some(Dialog::Confirm { busy: true, .. }))
     }
@@ -1202,4 +1556,121 @@ fn open_url(ctx: &mut Ctx, url: &str) {
     if !crate::platform::open_url(url) {
         ctx.toast(Level::Warn, format!("Could not open a browser: {url}"));
     }
+}
+
+/// The state selected in the graph or the timeline: what it is, what happened to it, where
+/// it goes next (the arm taken marked), and its input and output.
+#[allow(clippy::too_many_arguments)]
+fn render_state(
+    f: &mut Frame,
+    area: Rect,
+    name: Option<&str>,
+    machine: Option<&asl::Machine>,
+    trace: &Trace,
+    detail: Option<&Detail>,
+    execution: bool,
+    view: &View,
+) {
+    let Some(name) = name else {
+        f.render_widget(widgets::placeholder(Line::styled("Select a state", theme::muted())).block(widgets::panel(" State ", false)), area);
+        return;
+    };
+    let state = machine.and_then(|m| m.all().into_iter().map(|(s, _)| s).find(|s| s.name == name));
+    let run = trace.runs.get(name);
+    let (symbol, style) = sfn_flow::status_look(run.map(Run::status), view.tick);
+    let label = match run.map(Run::status) {
+        None if execution => "not run",
+        None => "",
+        Some(StepStatus::Running) => "running",
+        Some(StepStatus::Succeeded) => "succeeded",
+        Some(StepStatus::Failed) => "failed",
+        Some(StepStatus::Caught) => "failed, caught",
+    };
+    let mut block = widgets::panel(Line::from(format!(" {name} ")).bold(), false);
+    if !label.is_empty() {
+        block = block.title_top(Line::styled(format!(" {symbol} {label} "), style.bold()).right_aligned());
+    }
+    let kw = 8;
+    let mut lines = Vec::new();
+    if let Some(s) = state {
+        lines.push(widgets::kv("Type", s.kind.clone(), kw));
+        if s.summary != s.kind.to_lowercase() {
+            lines.push(widgets::kv("Does", s.summary.clone(), kw));
+        }
+    }
+    let steps: Vec<&Step> = detail.map(|d| d.steps.iter().filter(|s| s.name == name).collect()).unwrap_or_default();
+    match run {
+        Some(r) => {
+            if r.visits > 1 {
+                let mut ran = format!("{} times", r.visits);
+                if r.failed > 0 {
+                    ran.push_str(&format!(" · {} failed", r.failed));
+                }
+                lines.push(widgets::kv("Ran", ran, kw));
+            }
+            if let Some(start) = r.spans.iter().map(|s| s.0).reduce(f64::min) {
+                lines.push(widgets::kv("Started", format!("{} · {}", fmt_ago(start), fmt_utc(start)), kw));
+            }
+            lines.push(widgets::kv("Took", fmt_duration(r.busy(view.now)), kw));
+            if r.retries > 0 {
+                lines.push(widgets::kv("Retries", Span::styled(r.retries.to_string(), Style::new().fg(theme::WARN)), kw));
+            }
+        }
+        None if execution => lines.push(Line::styled("It has not run in this execution.", theme::muted())),
+        None => {}
+    }
+    if let Some(failed) = steps.iter().rev().find(|s| matches!(s.status, StepStatus::Failed | StepStatus::Caught)) {
+        let err = Style::new().fg(theme::ERR);
+        if let Some(e) = &failed.error {
+            lines.push(Line::from(vec![Span::styled(format!("{:<kw$} ", "Error"), theme::muted()), Span::styled(e.clone(), err.bold())]));
+        }
+        if let Some(cause) = &failed.cause {
+            let pretty = sfn::pretty_cause(cause);
+            for (i, l) in pretty.lines().take(8).enumerate() {
+                let key = if i == 0 { "Cause" } else { "" };
+                lines.push(Line::from(vec![Span::styled(format!("{key:<kw$} "), theme::muted()), Span::styled(l.to_string(), err)]));
+            }
+        }
+    }
+    if let Some(s) = state {
+        lines.push(Line::raw(""));
+        lines.push(widgets::section("Next"));
+        let mark = |taken: bool| Span::styled(if taken { "✓ " } else { "  " }, theme::accent());
+        if s.next.is_empty() {
+            lines.push(Line::styled("  the execution fails here", theme::muted()));
+        }
+        for (label, target) in &s.next {
+            let taken = trace.taken.contains(&(name.to_string(), target.clone()));
+            let target = if target == asl::END { "End".to_string() } else { target.clone() };
+            let mut spans = vec![mark(taken)];
+            if !label.is_empty() {
+                spans.push(Span::styled(format!("{label} → "), theme::muted()));
+            }
+            spans.push(Span::styled(target, if taken { theme::bold() } else { Style::new() }));
+            lines.push(Line::from(spans));
+        }
+        for (errors, target) in &s.catches {
+            let taken = trace.taken.contains(&(name.to_string(), target.clone()));
+            lines.push(Line::from(vec![
+                mark(taken),
+                Span::styled(format!("catch {errors} → "), Style::new().fg(theme::WARN)),
+                Span::styled(target.clone(), if taken { theme::bold() } else { Style::new() }),
+            ]));
+        }
+    }
+    if let Some(last) = steps.last() {
+        for (title, json) in [("Input", &last.input), ("Output", &last.output)] {
+            let Some(json) = json.as_deref().filter(|j| !j.is_empty()) else { continue };
+            lines.push(Line::raw(""));
+            lines.push(widgets::section(title));
+            let text = pretty_json(json).unwrap_or_else(|| json.to_string());
+            let total = text.lines().count();
+            lines.extend(text.lines().take(8).map(|l| Line::raw(l.to_string())));
+            if total > 8 {
+                let more = if total - 8 == 1 { "1 more line".to_string() } else { format!("{} more lines", total - 8) };
+                lines.push(Line::styled(format!("… {more} · {} full screen", if title == "Input" { "i" } else { "O" }), theme::muted()));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
 }

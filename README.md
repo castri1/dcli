@@ -118,7 +118,8 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Lambda | `/` search · `v` show env values · `c` copy ARN · `l` its logs · `o` open in console · `PgUp/PgDn` scroll |
 | Logs | `Enter` open a log group · `/` search groups · `t` time range · `f` filter pattern · `p` pause/resume live · `z` full screen · `y` copy · `o` console |
 | S3 | `Enter`/`←` open / go up · `/` filter · `p` preview (first 64 KB) · `u` download link (15 min, 1 h, 12 h) · `d` download to `~/Downloads` · `y` copy the `s3://` URI · `o` console · `r` reload |
-| Step Functions | `Enter` executions · `f` filter by status · `→` steps · `i`/`O` input/output · `l` logs · `c` copy a failure report · `R` redrive from the failed step · `n` start with the same input · `x` stop · `o` console |
+| Step Functions | `Enter` executions · `f` filter by status · `→` steps · `g` graph · `t` timeline · `i`/`O` input/output · `l` logs · `c` copy a failure report · `R` redrive from the failed step · `n` start with the same input · `x` stop · `o` console |
+| Step Functions (graph, timeline) | `↑↓` state · `←→` pan · `g`/`t` switch view · `f` the failed state · `i`/`O` its input/output · `l` its logs · `c` copy a failure report · click a state to select it |
 | DynamoDB | `Enter` open a table (scans the first 50 items) · `f` find by key (table or index) · `s` scan · `m` next page · `/` filter the items read · `y` copy the item · `z` full screen · `o` console |
 | EventBridge | `Enter` a bus's rules · `→` targets, `Enter` on one opens it (Lambda, Step Functions, Logs) · `t` send a test event · `y` copy the pattern · `o` console |
 | AppConfig | `Enter` application → profile → flags · `↑↓←→` flag × environment · `Enter` edit and deploy · `x` stop the deployment (rolls back) · `y` copy the document |
@@ -158,6 +159,13 @@ before deploying and before creating or changing parameters and secrets.
   your session, so they stop working when the session ends (dcli tells you when that comes
   first). The CLI allows up to 7 days (`--expires 7d`) with long-lived credentials.
 - **Step Functions**: a failed execution shows the step that failed, its error and cause.
+  `g` draws the execution like the console's graph: the state machine's flow (Choice branches
+  side by side, Parallel and Map states as frames with their flows inside, loops and catch
+  handlers), each state colored by what happened to it and the Choice branch taken
+  highlighted; beside it, the selected state's error, where it goes next and its input and
+  output. `t` shows a timeline instead: a bar for each state over the execution's time, so
+  slow steps, retries, polling loops and Map items running side by side stand out. On the
+  list of state machines, `g` draws a machine's definition.
   `c` copies the same kind of report as a failed pipeline. Redrive (`R`) restarts from the
   failed step without running the ones that succeeded; `n` starts a new execution with the
   selected one's input, editable first. Express workflows keep no execution list: their
@@ -257,6 +265,7 @@ src/
   modules/        one file per module: pipelines, matrix, parameters, secrets, lambda, cwlogs,
                   s3, sfn, dynamodb, events, appconfig
   clicmd/         the commands of the newer modules (dcli s3, sfn, ddb, events, flags)
+  asl.rs          Amazon States Language: a state machine's definition arranged for its graph
   pipeline.rs     CodePipeline domain logic shared by the UI and the CLI
   matrix.rs       applications × environments: grouping, deployed commit, drift
   cli.rs          non-interactive commands

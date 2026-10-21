@@ -15,6 +15,7 @@ mod pipelines;
 mod s3;
 mod secrets;
 mod sfn;
+mod sfn_flow;
 
 use crate::tui::module::Module;
 

@@ -15,7 +15,7 @@ use crate::util::{fmt_ago, fmt_duration, fmt_utc, pretty_json};
 pub const SERVICE: Service = Service { endpoint: "states", signing_name: "states", target_prefix: "AWSStepFunctions" };
 
 /// History events read at most per execution.
-const MAX_EVENTS: usize = 1000;
+pub const MAX_EVENTS: usize = 1000;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -285,6 +285,17 @@ pub fn list_executions(aws: &Aws, machine_arn: &str, status: Option<&str>, max: 
             _ => return Ok(all),
         }
     }
+}
+
+/// The definition an execution ran with (for a versioned machine, the version it started on).
+pub fn execution_definition(aws: &Aws, execution_arn: &str) -> Result<String> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Out {
+        definition: String,
+    }
+    let out: Out = aws.call_json10(&SERVICE, "DescribeStateMachineForExecution", &json!({ "executionArn": execution_arn }))?;
+    Ok(out.definition)
 }
 
 pub fn describe_execution(aws: &Aws, arn: &str) -> Result<ExecutionDetail> {
