@@ -220,14 +220,404 @@ def codepipeline(op, body):
     raise KeyError(op)
 
 
+# ---- CloudFormation (awsQuery, Version 2010-05-15) ------------------------------------------
+# Stacks for the CloudFormation module: a healthy API (JSON template, outputs, change sets),
+# a rolled-back update whose cause is inside a nested stack (YAML), a failed creation, an
+# update in progress and a drifted stack. The pipelines' "<pipeline>-stack" events (failure
+# reports) stay as they were.
+CFN_ARN = "arn:aws:cloudformation:us-east-1:123456789012:stack"
+CFN_ROLE = "arn:aws:iam::123456789012:role/cfn-deployer"
+
+
+def cfn_id(name):
+    return f"{CFN_ARN}/{name}/{hashlib.sha256(name.encode()).hexdigest()[:8]}-0f2b-11ef-9c1d-0a1b2c3d4e5f"
+
+
+CFN_ORDERS_TEMPLATE = json.dumps({
+    "AWSTemplateFormatVersion": "2010-09-09", "Description": "Orders API: function, queue, table",
+    "Parameters": {"Stage": {"Type": "String", "Default": "dev"},
+                   "DbPassword": {"Type": "String", "NoEcho": True}},
+    "Resources": {
+        "OrdersFunction": {"Type": "AWS::Lambda::Function", "Properties": {
+            "FunctionName": "orders-sync", "Runtime": "python3.13", "Handler": "app.handler", "MemorySize": 1024,
+            "Role": {"Fn::GetAtt": ["OrdersRole", "Arn"]}, "Environment": {"Variables": {"STAGE": {"Ref": "Stage"}}}}},
+        "OrdersRole": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17"}}},
+        "OrdersQueue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": "orders", "VisibilityTimeout": 60}},
+        "OrdersTable": {"Type": "AWS::DynamoDB::Table", "Properties": {"TableName": "orders", "BillingMode": "PAY_PER_REQUEST"}},
+        "AssetsBucket": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": "acme-app-assets"}},
+        "Fulfillment": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {"StateMachineName": "order-fulfillment"}},
+        "OrdersLogs": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": "/aws/lambda/orders-sync", "RetentionInDays": 30}},
+        "DbUrl": {"Type": "AWS::SSM::Parameter", "Properties": {"Name": "/app/db/url", "Type": "String", "Value": "postgres://db"}}},
+    "Outputs": {"ApiUrl": {"Value": "https://a1b2c3.execute-api.us-east-1.amazonaws.com/dev"},
+                "QueueUrl": {"Value": {"Ref": "OrdersQueue"}, "Export": {"Name": "orders-queue-url"}}}}, indent=2)
+
+CFN_PAYMENTS_TEMPLATE = """AWSTemplateFormatVersion: '2010-09-09'
+Description: Payments service
+Parameters:
+  Stage:
+    Type: String
+  StripeKey:
+    Type: String
+    NoEcho: true
+Resources:
+  WorkerStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/acme-templates/payments-worker.yaml
+      Parameters:
+        Stage: !Ref Stage
+  PaymentsApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub payments-${Stage}
+Outputs:
+  ApiId:
+    Value: !Ref PaymentsApi
+"""
+
+CFN_WORKER_TEMPLATE = """AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  Stage:
+    Type: String
+Resources:
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub payments-worker-${Stage}
+      Runtime: nodejs12.x
+      Handler: index.handler
+      Role: !GetAtt WorkerRole.Arn
+      Code:
+        S3Bucket: acme-artifacts
+        S3Key: payments/worker.zip
+  WorkerQueue:
+    Type: AWS::SQS::Queue
+"""
+
+CFN_NETWORK_TEMPLATE = """Resources:
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App servers
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: acme-logs-archive
+"""
+
+CFN_CRON_TEMPLATE = json.dumps({"Resources": {
+    "CronRole": {"Type": "AWS::IAM::Role", "Properties": {"RoleName": "reports-cron"}},
+    "CronFunction": {"Type": "AWS::Lambda::Function", "Properties": {"Runtime": "python3.13", "Role": {"Fn::GetAtt": ["CronRole", "Arn"]}}},
+    "CronSchedule": {"Type": "AWS::Events::Rule", "Properties": {"ScheduleExpression": "cron(0 6 * * ? *)"}}}}, indent=2)
+
+CFN_ANALYTICS_TEMPLATE = """Resources:
+  StreamProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: java21
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+"""
+
+
+def cfn_stacks():
+    """Each stack: its description, resources (logical id, type, physical id) and events
+    (seconds after its last update started, logical id, type, status, reason), oldest first."""
+    t, worker = T0 - 3 * 3600, "payments-WorkerStack-1ABC2DEF3GH4"
+    s = "AWS::CloudFormation::Stack"
+    return [
+        {"name": "orders-api", "status": "UPDATE_COMPLETE", "created": T0 - 90 * 86400, "updated": T0 - 2 * 86400,
+         "description": "Orders API: function, queue, table", "template": CFN_ORDERS_TEMPLATE,
+         "params": [("Stage", "dev"), ("DbPassword", "****")],
+         "outputs": [("ApiUrl", "https://a1b2c3.execute-api.us-east-1.amazonaws.com/dev", "The API's URL", None),
+                     ("QueueUrl", "https://sqs.us-east-1.amazonaws.com/123456789012/orders", None, "orders-queue-url")],
+         "resources": [("OrdersFunction", "AWS::Lambda::Function", "orders-sync"),
+                       ("OrdersRole", "AWS::IAM::Role", "orders-api-OrdersRole-7Q2W"),
+                       ("OrdersQueue", "AWS::SQS::Queue", "https://sqs.us-east-1.amazonaws.com/123456789012/orders"),
+                       ("OrdersTable", "AWS::DynamoDB::Table", "orders"),
+                       ("AssetsBucket", "AWS::S3::Bucket", "acme-app-assets"),
+                       ("Fulfillment", "AWS::StepFunctions::StateMachine",
+                        "arn:aws:states:us-east-1:123456789012:stateMachine:order-fulfillment"),
+                       ("OrdersLogs", "AWS::Logs::LogGroup", "/aws/lambda/orders-sync"),
+                       ("DbUrl", "AWS::SSM::Parameter", "/app/db/url")],
+         "events": [(0, "orders-api", s, "UPDATE_IN_PROGRESS", "User Initiated"),
+                    (9, "OrdersFunction", "AWS::Lambda::Function", "UPDATE_IN_PROGRESS", ""),
+                    (21, "OrdersFunction", "AWS::Lambda::Function", "UPDATE_COMPLETE", ""),
+                    (25, "orders-api", s, "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS", ""),
+                    (27, "orders-api", s, "UPDATE_COMPLETE", "")]},
+        {"name": "payments", "status": "UPDATE_ROLLBACK_COMPLETE", "created": T0 - 200 * 86400, "updated": t,
+         "description": "Payments service", "template": CFN_PAYMENTS_TEMPLATE,
+         "params": [("Stage", "dev"), ("StripeKey", "****")], "outputs": [("ApiId", "p4y5x9", None, None)],
+         "resources": [("WorkerStack", s, cfn_id(worker)), ("PaymentsApi", "AWS::ApiGateway::RestApi", "p4y5x9")],
+         "events": [(0, "payments", s, "UPDATE_IN_PROGRESS", "User Initiated"),
+                    (3, "WorkerStack", s, "UPDATE_IN_PROGRESS", ""),
+                    (4, "PaymentsApi", "AWS::ApiGateway::RestApi", "UPDATE_IN_PROGRESS", ""),
+                    (19, "WorkerStack", s, "UPDATE_FAILED",
+                     f"Embedded stack {cfn_id(worker)} was not successfully updated. Currently in UPDATE_ROLLBACK_IN_PROGRESS "
+                     "with reason: The following resource(s) failed to update: [WorkerFunction]."),
+                    (20, "PaymentsApi", "AWS::ApiGateway::RestApi", "UPDATE_FAILED", "Resource update cancelled"),
+                    (21, "payments", s, "UPDATE_ROLLBACK_IN_PROGRESS",
+                     "The following resource(s) failed to update: [PaymentsApi, WorkerStack]."),
+                    (48, "WorkerStack", s, "UPDATE_COMPLETE", ""),
+                    (50, "payments", s, "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS", ""),
+                    (52, "payments", s, "UPDATE_ROLLBACK_COMPLETE", "")]},
+        {"name": worker, "status": "UPDATE_ROLLBACK_COMPLETE", "created": T0 - 200 * 86400, "updated": t + 3,
+         "parent": "payments", "template": CFN_WORKER_TEMPLATE, "params": [("Stage", "dev")], "outputs": [],
+         "resources": [("WorkerRole", "AWS::IAM::Role", "payments-worker-role"),
+                       ("WorkerFunction", "AWS::Lambda::Function", "payments-worker-dev"),
+                       ("WorkerQueue", "AWS::SQS::Queue", "https://sqs.us-east-1.amazonaws.com/123456789012/payments-worker")],
+         "events": [(0, worker, s, "UPDATE_IN_PROGRESS", ""),
+                    (2, "WorkerRole", "AWS::IAM::Role", "UPDATE_IN_PROGRESS", ""),
+                    (6, "WorkerRole", "AWS::IAM::Role", "UPDATE_COMPLETE", ""),
+                    (7, "WorkerFunction", "AWS::Lambda::Function", "UPDATE_IN_PROGRESS", ""),
+                    (14, "WorkerFunction", "AWS::Lambda::Function", "UPDATE_FAILED",
+                     'Resource handler returned message: "The runtime parameter of nodejs12.x is no longer supported for '
+                     'creating or updating AWS Lambda functions. We recommend you use a supported runtime while creating '
+                     'or updating functions. (Service: Lambda, Status Code: 400, Request ID: 6c1e0f2a)" '
+                     '(RequestToken: 3f7a, HandlerErrorCode: InvalidRequest)'),
+                    (15, "WorkerQueue", "AWS::SQS::Queue", "UPDATE_FAILED", "Resource update cancelled"),
+                    (16, worker, s, "UPDATE_ROLLBACK_IN_PROGRESS", "The following resource(s) failed to update: [WorkerFunction]."),
+                    (40, worker, s, "UPDATE_ROLLBACK_COMPLETE", "")]},
+        {"name": "reports-cron", "status": "ROLLBACK_COMPLETE", "created": T0 - 5 * 3600, "updated": None,
+         "reason": "The following resource(s) failed to create: [CronRole]. Rollback requested by user.",
+         "template": CFN_CRON_TEMPLATE, "params": [], "outputs": [], "resources": [],
+         "events": [(0, "reports-cron", s, "CREATE_IN_PROGRESS", "User Initiated"),
+                    (2, "CronRole", "AWS::IAM::Role", "CREATE_IN_PROGRESS", ""),
+                    (3, "CronRole", "AWS::IAM::Role", "CREATE_FAILED",
+                     "Resource handler returned message: \"User: arn:aws:sts::123456789012:assumed-role/cfn-deployer/session "
+                     "is not authorized to perform: iam:CreateRole on resource: arn:aws:iam::123456789012:role/reports-cron "
+                     "because no identity-based policy allows the iam:CreateRole action (Service: Iam, Status Code: 403)\""),
+                    (4, "CronSchedule", "AWS::Events::Rule", "CREATE_FAILED", "Resource creation cancelled"),
+                    (5, "reports-cron", s, "ROLLBACK_IN_PROGRESS",
+                     "The following resource(s) failed to create: [CronRole, CronSchedule]. Rollback requested by user."),
+                    (12, "CronSchedule", "AWS::Events::Rule", "DELETE_COMPLETE", ""),
+                    (13, "reports-cron", s, "ROLLBACK_COMPLETE", "")]},
+        {"name": "analytics-pipeline", "status": "UPDATE_IN_PROGRESS", "created": T0 - 30 * 86400, "updated": T0 - 30,
+         "template": CFN_ANALYTICS_TEMPLATE, "params": [], "outputs": [],
+         "resources": [("StreamProcessor", "AWS::Lambda::Function", "report-builder"),
+                       ("Dashboard", "AWS::CloudWatch::Dashboard", "analytics")],
+         "events": [(0, "analytics-pipeline", s, "UPDATE_IN_PROGRESS", "User Initiated"),
+                    (4, "StreamProcessor", "AWS::Lambda::Function", "UPDATE_IN_PROGRESS", ""),
+                    (40, "StreamProcessor", "AWS::Lambda::Function", "UPDATE_COMPLETE", ""),
+                    (45, "Dashboard", "AWS::CloudWatch::Dashboard", "UPDATE_IN_PROGRESS", "")]},
+        {"name": "shared-network", "status": "CREATE_COMPLETE", "created": T0 - 400 * 86400, "updated": None,
+         "drift": "DRIFTED", "drift_checked": T0 - 3 * 86400, "template": CFN_NETWORK_TEMPLATE, "params": [],
+         "outputs": [("SecurityGroupId", "sg-0a1b2c3d", None, "app-sg")],
+         "resources": [("AppSecurityGroup", "AWS::EC2::SecurityGroup", "sg-0a1b2c3d"),
+                       ("LogsBucket", "AWS::S3::Bucket", "acme-logs-archive")],
+         "events": [(0, "shared-network", s, "CREATE_IN_PROGRESS", "User Initiated"),
+                    (40, "shared-network", s, "CREATE_COMPLETE", "")]},
+    ]
+
+
+# Drift detections started: id → (stack name, when). Each takes 4 seconds.
+CFN_DRIFTS = {}
+
+
+def cfn_find(stacks, name):
+    return next((x for x in stacks if name in (x["name"], cfn_id(x["name"]))), None)
+
+
+def cfn_drift(st):
+    """(drift status, last check) after the detections run so far."""
+    done = [at for (n, at) in CFN_DRIFTS.values() if n == st["name"] and time.time() - at >= 4]
+    if done:
+        return ("DRIFTED" if st["name"] == "shared-network" else "IN_SYNC"), max(done) + 4
+    return st.get("drift", "NOT_CHECKED"), st.get("drift_checked")
+
+
+def cfn_resource_drifts(st):
+    out = []
+    for lid, rtype, phys in st["resources"]:
+        if st["name"] == "shared-network" and lid == "AppSecurityGroup":
+            out.append((lid, rtype, phys, "MODIFIED", [
+                ("/SecurityGroupIngress/1", None, '{"CidrIp":"0.0.0.0/0","FromPort":22,"IpProtocol":"tcp","ToPort":22}', "ADD"),
+                ("/GroupDescription", "App servers", "App servers (temp ssh)", "NOT_EQUAL")]))
+        else:
+            out.append((lid, rtype, phys, "IN_SYNC", []))
+    return out
+
+
+def cfn_iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+
 def cloudformation(params):
     """Query protocol: form-encoded request, XML response."""
     action = params.get("Action", [""])[0]
     stack = params.get("StackName", [""])[0]
-    name = stack.removesuffix("-stack")
-    if action != "DescribeStackEvents" or name not in PIPES:
-        return 400, ("<ErrorResponse><Error><Type>Sender</Type><Code>ValidationError</Code>"
-                     f"<Message>Stack with id {stack} does not exist</Message></Error></ErrorResponse>")
+    if action == "DescribeStackDriftDetectionStatus":
+        return cfn_drift_status(params)
+    if action == "DescribeStackEvents" and stack.removesuffix("-stack") in PIPES:
+        return cfn_pipeline_events(stack, stack.removesuffix("-stack"))
+    stacks = cfn_stacks()
+    st = cfn_find(stacks, stack)
+    if action == "DescribeStacks":
+        if stack and st is None:
+            return cfn_missing(stack)
+        return 200, cfn_wrap("DescribeStacks", f"<Stacks>{''.join(cfn_stack_xml(c) for c in ([st] if stack else stacks))}</Stacks>")
+    if st is None:
+        return cfn_missing(stack)
+    handler = {"DescribeStackEvents": cfn_events, "ListStackResources": cfn_resources, "GetTemplate": cfn_template,
+               "DetectStackDrift": cfn_detect, "ListChangeSets": cfn_change_sets, "DescribeChangeSet": cfn_change_set,
+               "DescribeStackResourceDrifts": cfn_resource_drifts_xml}.get(action)
+    if handler is None:
+        return 400, query_error("InvalidAction", f"{action} is not in the mock")
+    return 200, cfn_wrap(action, handler(st, params))
+
+
+def cfn_wrap(action, body):
+    return f"<{action}Response><{action}Result>{body}</{action}Result></{action}Response>"
+
+
+def cfn_missing(stack):
+    return 400, query_error("ValidationError", f"Stack with id {xml_escape(stack)} does not exist")
+
+
+def cfn_stack_xml(c):
+    x = lambda v: xml_escape(str(v))
+    drift, checked = cfn_drift(c)
+    parent = cfn_id(c["parent"]) if c.get("parent") else None
+    return (f"<member><StackId>{cfn_id(c['name'])}</StackId><StackName>{c['name']}</StackName>"
+            + (f"<Description>{x(c['description'])}</Description>" if c.get("description") else "")
+            + "<Parameters>" + "".join(f"<member><ParameterKey>{k}</ParameterKey><ParameterValue>{x(v)}</ParameterValue></member>"
+                                       for k, v in c["params"]) + "</Parameters>"
+            + f"<CreationTime>{cfn_iso(c['created'])}</CreationTime>"
+            + (f"<LastUpdatedTime>{cfn_iso(c['updated'])}</LastUpdatedTime>" if c.get("updated") else "")
+            + f"<StackStatus>{c['status']}</StackStatus>"
+            + (f"<StackStatusReason>{x(c['reason'])}</StackStatusReason>" if c.get("reason") else "")
+            + "<Outputs>" + "".join(
+                f"<member><OutputKey>{k}</OutputKey><OutputValue>{x(v)}</OutputValue>"
+                + (f"<Description>{x(d)}</Description>" if d else "") + (f"<ExportName>{x(e)}</ExportName>" if e else "")
+                + "</member>" for k, v, d, e in c["outputs"]) + "</Outputs>"
+            + (f"<ParentId>{parent}</ParentId><RootId>{parent}</RootId>" if parent else "")
+            + f"<DriftInformation><StackDriftStatus>{drift}</StackDriftStatus>"
+            + (f"<LastCheckTimestamp>{cfn_iso(checked)}</LastCheckTimestamp>" if checked else "") + "</DriftInformation>"
+            + f"<EnableTerminationProtection>{'true' if c['name'] == 'shared-network' else 'false'}</EnableTerminationProtection>"
+            + f"<RoleARN>{CFN_ROLE}</RoleARN></member>")
+
+
+def cfn_events(st, params):
+    x = lambda v: xml_escape(str(v))
+    base = st.get("updated") or st["created"]
+    phys = {lid: p for lid, _, p in st["resources"]}
+    events = [e for e in st["events"] if base + e[0] <= time.time()][::-1]
+    members = "".join(
+        f"<member><StackId>{cfn_id(st['name'])}</StackId><EventId>{lid}-{i}</EventId><StackName>{st['name']}</StackName>"
+        f"<LogicalResourceId>{lid}</LogicalResourceId>"
+        f"<PhysicalResourceId>{x(cfn_id(st['name']) if lid == st['name'] else phys.get(lid, ''))}</PhysicalResourceId>"
+        f"<ResourceType>{rtype}</ResourceType><Timestamp>{cfn_iso(base + dt)}</Timestamp><ResourceStatus>{status}</ResourceStatus>"
+        + (f"<ResourceStatusReason>{x(reason)}</ResourceStatusReason>" if reason else "") + "</member>"
+        for i, (dt, lid, rtype, status, reason) in enumerate(events))
+    return f"<StackEvents>{members}</StackEvents>"
+
+
+def cfn_resources(st, params):
+    x = lambda v: xml_escape(str(v))
+    drifts = {d[0]: d[3] for d in cfn_resource_drifts(st)} if cfn_drift(st)[0] != "NOT_CHECKED" else {}
+    in_progress = st["status"] == "UPDATE_IN_PROGRESS" and time.time() - st["updated"] < 40
+    status = {"CREATE_COMPLETE": "CREATE_COMPLETE"}.get(st["status"], "UPDATE_COMPLETE")
+    members = "".join(
+        f"<member><LogicalResourceId>{lid}</LogicalResourceId><PhysicalResourceId>{x(p)}</PhysicalResourceId>"
+        f"<ResourceType>{rtype}</ResourceType><LastUpdatedTimestamp>{cfn_iso(st.get('updated') or st['created'])}</LastUpdatedTimestamp>"
+        f"<ResourceStatus>{'UPDATE_IN_PROGRESS' if (in_progress and lid == 'StreamProcessor') or lid == 'Dashboard' and st['status'] == 'UPDATE_IN_PROGRESS' else status}</ResourceStatus>"
+        f"<DriftInformation><StackResourceDriftStatus>{drifts.get(lid, 'NOT_CHECKED')}</StackResourceDriftStatus></DriftInformation></member>"
+        for lid, rtype, p in st["resources"])
+    return f"<StackResourceSummaries>{members}</StackResourceSummaries>"
+
+
+def cfn_template(st, params):
+    return f"<TemplateBody>{xml_escape(st['template'])}</TemplateBody><StagesAvailable><member>Original</member></StagesAvailable>"
+
+
+def cfn_detect(st, params):
+    did = str(uuid.uuid4())
+    CFN_DRIFTS[did] = (st["name"], time.time())
+    return f"<StackDriftDetectionId>{did}</StackDriftDetectionId>"
+
+
+def cfn_drift_status(params):
+    did = params.get("StackDriftDetectionId", [""])[0]
+    name, at = CFN_DRIFTS.get(did, (None, 0))
+    if name is None:
+        return 400, query_error("ValidationError", f"No drift detection {did}")
+    done = time.time() - at >= 4
+    drift = "DRIFTED" if name == "shared-network" else "IN_SYNC"
+    body = (f"<StackId>{cfn_id(name)}</StackId><StackDriftDetectionId>{did}</StackDriftDetectionId>"
+            f"<DetectionStatus>{'DETECTION_COMPLETE' if done else 'DETECTION_IN_PROGRESS'}</DetectionStatus>"
+            + (f"<StackDriftStatus>{drift}</StackDriftStatus><DriftedStackResourceCount>{1 if drift == 'DRIFTED' else 0}"
+               "</DriftedStackResourceCount>" if done else "")
+            + f"<Timestamp>{cfn_iso(time.time())}</Timestamp>")
+    return 200, cfn_wrap("DescribeStackDriftDetectionStatus", body)
+
+
+def cfn_resource_drifts_xml(st, params):
+    x = lambda v: xml_escape(str(v))
+    members = "".join(
+        f"<member><StackId>{cfn_id(st['name'])}</StackId><LogicalResourceId>{lid}</LogicalResourceId>"
+        f"<PhysicalResourceId>{x(p)}</PhysicalResourceId><ResourceType>{rtype}</ResourceType>"
+        f"<ExpectedProperties>{{}}</ExpectedProperties><ActualProperties>{{}}</ActualProperties>"
+        f"<StackResourceDriftStatus>{status}</StackResourceDriftStatus><PropertyDifferences>"
+        + "".join(f"<member><PropertyPath>{path}</PropertyPath>"
+                  + (f"<ExpectedValue>{x(e)}</ExpectedValue>" if e is not None else "")
+                  + (f"<ActualValue>{x(a)}</ActualValue>" if a is not None else "")
+                  + f"<DifferenceType>{kind}</DifferenceType></member>" for path, e, a, kind in diffs)
+        + f"</PropertyDifferences><Timestamp>{cfn_iso(time.time())}</Timestamp></member>"
+        for lid, rtype, p, status, diffs in cfn_resource_drifts(st))
+    return f"<StackResourceDrifts>{members}</StackResourceDrifts>"
+
+
+CFN_CHANGE_SETS = [("add-dlq", "CREATE_COMPLETE", "AVAILABLE", T0 - 1800, "Adds a dead-letter queue to orders"),
+                   ("bump-memory", "CREATE_COMPLETE", "EXECUTE_COMPLETE", T0 - 3 * 86400, "")]
+
+
+def cfn_change_sets(st, params):
+    sets = CFN_CHANGE_SETS if st["name"] == "orders-api" else []
+    members = "".join(
+        f"<member><StackId>{cfn_id(st['name'])}</StackId><StackName>{st['name']}</StackName>"
+        f"<ChangeSetId>arn:aws:cloudformation:us-east-1:123456789012:changeSet/{n}/1</ChangeSetId><ChangeSetName>{n}</ChangeSetName>"
+        f"<ExecutionStatus>{ex}</ExecutionStatus><Status>{status}</Status><CreationTime>{cfn_iso(t)}</CreationTime>"
+        + (f"<Description>{xml_escape(d)}</Description>" if d else "") + "</member>"
+        for n, status, ex, t, d in sets)
+    return f"<Summaries>{members}</Summaries>"
+
+
+def cfn_change_set(st, params):
+    x = lambda v: xml_escape(str(v))
+    changes = [("Add", "OrdersDLQ", "AWS::SQS::Queue", None, "", []),
+               ("Modify", "OrdersQueue", "AWS::SQS::Queue", "https://sqs.us-east-1.amazonaws.com/123456789012/orders", "False",
+                [("Properties", "RedrivePolicy", "Never")]),
+               ("Modify", "OrdersTable", "AWS::DynamoDB::Table", "orders", "True", [("Properties", "KeySchema", "Always")]),
+               ("Modify", "OrdersFunction", "AWS::Lambda::Function", "orders-sync", "False",
+                [("Properties", "Environment", "Never"), ("Properties", "Environment", "Never")])]
+    if "bump-memory" in params.get("ChangeSetName", [""])[0]:
+        changes = [("Modify", "OrdersFunction", "AWS::Lambda::Function", "orders-sync", "False", [("Properties", "MemorySize", "Never")])]
+    members = "".join(
+        f"<member><Type>Resource</Type><ResourceChange><Action>{a}</Action><LogicalResourceId>{lid}</LogicalResourceId>"
+        + (f"<PhysicalResourceId>{x(p)}</PhysicalResourceId>" if p else "")
+        + f"<ResourceType>{rtype}</ResourceType>" + (f"<Replacement>{rep}</Replacement>" if rep else "")
+        + "<Scope>" + "".join(f"<member>{attr}</member>" for attr, _, _ in details) + "</Scope>"
+        + "<Details>" + "".join(
+            f"<member><Target><Attribute>{attr}</Attribute><Name>{name}</Name><RequiresRecreation>{rr}</RequiresRecreation></Target>"
+            "<Evaluation>Static</Evaluation><ChangeSource>DirectModification</ChangeSource></member>"
+            for attr, name, rr in details) + "</Details></ResourceChange></member>"
+        for a, lid, rtype, p, rep, details in changes)
+    return (f"<StackName>{st['name']}</StackName><Status>CREATE_COMPLETE</Status>"
+            f"<ExecutionStatus>AVAILABLE</ExecutionStatus><Changes>{members}</Changes>")
+
+
+def cfn_pipeline_events(stack, name):
+    """The events of a pipeline's deploy stack, for its failure report."""
     start = timeline(PIPES[name])["Production"][1] or time.time()
     iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
     events = [  # newest first, as CloudFormation returns them
