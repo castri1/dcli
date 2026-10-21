@@ -1,15 +1,19 @@
 # dcli
 
-Terminal UI and CLI to deploy and explore AWS: **CodePipeline** (with a matrix of what is deployed
-where), **Parameter Store**, **Secrets Manager**, **Lambda**, **CloudWatch Logs**, **S3**,
-**Step Functions**, **DynamoDB**, **EventBridge** and **AppConfig** feature flags.
-A single ~3 MB binary for macOS, Linux and Windows. No Node.js, no AWS SDK, no runtime.
+Terminal UI and CLI to deploy and explore AWS: **CodePipeline** (a matrix of what is deployed
+where, promote and rollback, an inbox of approvals), **CloudWatch** alarms, Logs and Logs
+Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke),
+**CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **EventBridge** and
+**AppConfig** feature flags. Failures (pipelines, executions, functions, stacks) can be copied
+as Markdown reports for an AI agent.
+A single ~5 MB binary (about 2.5 MB to download) for macOS, Linux and Windows. No Node.js, no AWS
+SDK, no runtime.
 
 It reads the same config as the Node.js `deploy-cli` it replaces (`~/.deployment-cli/config.yaml`),
 so an existing setup works as is.
 
 ```
- ◆ dcli   1 Pipelines   2 Parameters   3 Lambda                               ● dev corp-dev · us-east-1
+ ◆ dcli   Pipelines   : modules   Approvals 2   Alarms ● 3                    ● dev corp-dev · us-east-1
 ╭ Pipelines · 3 ──────────────────────╮╭ app-dev ─────────────────────────────── ⠦ In progress · 3m 16s ╮
 │ ⠦ app-dev                    3m 16s ││  ▸ 96f81235 · push · started 3m ago                              │
 │   Main application - Dev            ││    3f9e1a2 "fix(payments): retry on timeout" (main)              │
@@ -68,6 +72,9 @@ dcli login                # AWS SSO sign-in for the current environment
 dcli status app-dev       # --json for scripts
 dcli history dev app-dev -n 20
 dcli matrix               # what is deployed where: commit per environment, drift (--json)
+dcli promote app --to prod      # deploy to prod the commit the environment before it runs (--from qa)
+dcli rollback prod app-prod     # back to the previous successful deploy (--stage, --to, --rerun)
+dcli approvals            # approvals waiting in every environment (--json)
 dcli deploy               # picks a pipeline, runs hooks, starts and follows it (exit code = result)
 dcli approve dev app-dev  # --reject, -m "comment"
 dcli stop dev app-dev     # --abandon
@@ -79,6 +86,20 @@ dcli secret prod/payments/stripe                                  # print a secr
 dcli secret dev/api-key --set - --yes < key.txt                   # create or update from stdin
 dcli tail /aws/lambda/orders --since 1h --filter ERROR -f         # CloudWatch Logs, every stream
 dcli lambda dev my-function --json
+dcli lambda payments-webhook --metrics --since 7d                 # invocations, errors, p95, concurrency, throttles
+dcli lambda payments-webhook --report                             # Markdown report for an AI agent
+dcli lambda payments-webhook --invoke '{"orderId": "ORD-1"}'      # asks first; exit 1 on a function error
+dcli insights /aws/lambda/orders -q 'fields @timestamp, @message | filter @message like /ERROR/' --since 2h
+dcli insights --saved "Errors per 5 minutes" /aws/lambda/orders  # a saved query (--json, --csv)
+dcli alarms                                                       # firing first; exit code 1 when any is firing
+dcli alarms --all-envs --state alarm --json
+dcli cfn                                                          # stacks, nested ones under their parent
+dcli cfn payments --report                                        # why the last update failed, for an AI agent
+dcli cfn shared-network --drift                                   # detect drift and show what changed
+dcli cfn orders-api --change-set add-dlq                          # what a change set would do (--report)
+dcli sqs                                                          # queues, counts, dead-letter queues
+dcli sqs peek orders-dlq -n 20                                    # messages of a dead-letter queue, not consumed
+dcli sqs redrive orders-dlq                                       # back to their source queues (--to QUEUE, --yes)
 dcli s3 ls s3://my-bucket/exports/                                # buckets without a URI
 dcli s3 url s3://my-bucket/exports/report.csv --expires 12h       # presigned download link
 dcli s3 get s3://my-bucket/exports/report.csv ~/Downloads/
@@ -108,17 +129,22 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 
 | Where | Keys |
 |---|---|
-| Everywhere | `:` / `Ctrl+K` go to a module or environment · `Tab` / `1`-`9` switch module · `e` environment · `L` SSO login · `?` help · `q` quit |
-| Pipelines | `↑↓` pipeline · `←→` stage · `d` deploy · `a` approve/reject · `s` stop · `l` logs · `h` history · `o` open in console · `r` refresh · `n` search the account and add pipelines · `x` remove from config · `c` copy a failure report · `C` save it with the full log |
-| Matrix | `↑↓←→` move · `Enter` open the pipeline in that environment (or sign in) · `g` compare with the environment to the left · `r` refresh |
+| Everywhere | `:` / `Ctrl+K` go to a module, an environment or (type its name) any resource of the environment · `Tab` / `1`-`9` switch module · `e` environment · `L` SSO login · `?` help · `q` quit |
+| Pipelines | `↑↓` pipeline · `←→` stage · `d` deploy · `a` approve/reject · `s` stop · `R` roll back · `l` logs · `h` history · `o` open in console · `r` refresh · `n` search the account and add pipelines · `x` remove from config · `c` copy a failure report · `C` save it with the full log |
+| Matrix | `↑↓←→` move · `Enter` open the pipeline in that environment (or sign in) · `p` promote what the environment to the left runs · `R` roll back · `g` compare with the environment to the left · `r` refresh |
+| Approvals | `↑↓` move · `a` approve / reject (with a comment) · `Enter` open the pipeline (or sign in) · `o` open the approval's link · `r` refresh |
+| Alarms | `Enter` open the alarm's resource (Lambda, SQS, DynamoDB, Step Functions; switches environment) · `/` filter · `a` every environment / this one · `y` copy a Markdown summary · `o` console · `r` refresh · `PgUp/PgDn` scroll the detail |
 | Pipelines (logs) | `l` build log · `z` full screen · `g` compare the commits since the last success |
 | Full-screen logs | `/` search · `n`/`N` next/previous match · `e`/`E` next/previous error · `y` copy every line · `Esc` back. The mouse is left to the terminal: drag to select and copy |
 | Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name · `n` new parameter · `u` new value |
 | Secrets | `/` search · `v` reveal · `c` copy value · `y` copy name · `n` new secret · `u` new value · `o` open in console |
-| Lambda | `/` search · `v` show env values · `c` copy ARN · `l` its logs · `o` open in console · `PgUp/PgDn` scroll |
-| Logs | `Enter` open a log group · `/` search groups · `t` time range · `f` filter pattern · `p` pause/resume live · `z` full screen · `y` copy · `o` console |
+| Lambda | `/` search · `m` metrics 1h/24h/7d · `i` invoke with a payload · `c` copy a report for an AI agent · `y` copy ARN · `v` show env values · `l` its logs · `o` console · `r` refresh · `PgUp/PgDn` scroll |
+| Logs | `Enter` open a log group · `/` search groups · `t` time range · `f` filter pattern · `p` pause/resume live · `z` full screen · `y` copy · `o` console · `Space` mark groups · `i` Logs Insights on them |
+| Logs Insights | `Enter` run (`Alt+Enter` new line) · `i` edit · `r` run again · `t` range · `g` log groups · `s` saved and recent queries · `Enter` on a row: the whole record · `←→` columns · `y`/`Y` copy the table as Markdown/CSV · `c` copy for AI · `Esc` stop / back |
+| CloudFormation | `↑↓` stack · `←→` overview / events / resources / outputs / drift / change sets · `Enter` its rows (a resource opens in its module, a nested stack is selected, a change set shows its changes) · `c` copy for AI (why it failed; on Drift the drift; on Change sets the change set) · `d` detect drift · `T` template · `y` copy · `/` search · `o` console · `r` reload |
 | S3 | `Enter`/`←` open / go up · `/` filter · `p` preview (first 64 KB) · `u` download link (15 min, 1 h, 12 h) · `d` download to `~/Downloads` · `y` copy the `s3://` URI · `o` console · `r` reload |
 | Step Functions | `Enter` executions · `f` filter by status · `→` steps · `g` graph · `t` timeline · `i`/`O` input/output · `l` logs · `c` copy a failure report · `R` redrive from the failed step · `n` start with the same input · `x` stop · `o` console |
+| SQS | `→`/`Enter` its DLQ or source queue · `m` messages (dead-letter queues only) · `R` redrive · `x` cancel the redrive · `/` search · `y` copy URL · `o` console · `r` reload |
 | Step Functions (graph, timeline) | `↑↓` state · `←→` pan · `g`/`t` switch view · `f` the failed state · `i`/`O` its input/output · `l` its logs · `c` copy a failure report · click a state to select it |
 | DynamoDB | `Enter` open a table (scans the first 50 items) · `f` find by key (table or index) · `s` scan · `m` next page · `/` filter the items read · `y` copy the item · `z` full screen · `o` console |
 | EventBridge | `Enter` a bus's rules · `→` targets, `Enter` on one opens it (Lambda, Step Functions, Logs) · `t` send a test event · `y` copy the pattern · `o` console |
@@ -128,7 +154,13 @@ Lists with a search box (`:`, `e`, `n`) filter as you type; `Space` marks severa
 where that makes sense and `Ctrl+A` marks every match.
 
 The header shows every module while they fit; with more modules (or a narrow terminal) it
-shows only the current one, and `:` reaches the rest by name.
+shows only the current one, and `:` reaches the rest by name. Modules with something to say
+show it there: approvals waiting, alarms firing.
+
+Typing in `:` also searches the environment's resources by name: pipelines, functions, log
+groups, parameters, secrets, stacks, buckets, state machines, queues, tables, event buses,
+AppConfig applications and alarms (listed in the background the first time, then kept for
+five minutes). Enter opens the resource in its module.
 
 The mouse works too: wheel to scroll, click to select and switch modules. Forms accept pasted
 text (multi-line JSON included); `Ctrl+R` shows a hidden value while typing it.
@@ -176,14 +208,39 @@ before deploying and before creating or changing parameters and secrets.
 - **EventBridge**: `t` prefills an event that the selected rule's pattern accepts. The first
   Enter checks it against the pattern (nothing is sent); the next one sends it to the bus,
   where every matching rule receives it, so its targets run.
+- **Lambda**: charts of the last hour, day or week: invocations with their errors, p95
+  duration against the timeout, concurrency and throttles. `i` invokes the function for real
+  (type the environment name in production) and shows its response and the end of its log;
+  it is never sent twice. `c` copies a report for an AI agent: the configuration (environment
+  variable names, never their values), the last 24 hours of metrics, and the errors,
+  timeouts and crashes in its logs grouped by kind with their stack traces.
+- **Logs Insights**: `i` in Logs runs a query over the selected group, or several marked with
+  `Space`, showing results as they arrive with the records matched and data scanned
+  (Insights is billed by the data it scans: narrow the range or the groups on big ones).
+  `stats … by …` results get bars. Saved queries from the account and this session's queries
+  are under `s`; `c` copies the query and results as Markdown for an AI agent.
+- **CloudFormation**: a failed or rolled-back stack shows its root cause, the first resource
+  that failed in the latest operation (not the resources cancelled because of it), followed
+  into nested stacks. `c` copies a report with that cause, the timeline, the failing
+  resource's piece of the template and the parameters (NoEcho masked). `d` runs a drift
+  detection (a read). The Change sets tab shows what an update would do, replacements
+  highlighted, before anyone executes it.
+- **SQS**: dead-letter queues holding messages come first. Messages are read only in
+  dead-letter queues, and not consumed: in a normal queue, reading counts as a receive and
+  could push messages to their DLQ. Redrive sends a DLQ's messages back to the queues they
+  came from (or another queue), shows its progress and can be cancelled.
 - **AppConfig**: each cell is what that environment serves now. Editing starts from that
   version, so other environments' changes do not slip in; you see the change, pick a
   deployment strategy, and dcli creates the new version, deploys it and follows it. Freeform
   profiles (JSON, YAML, text) are shown read-only.
 
 Production-looking environments ask for their name before these writes too (redrive, start,
-stop, test events, flag deploys; for AppConfig, also when its environment is named like
-production).
+stop, test events, flag deploys, invoking a function, SQS redrives, promote and rollback; for
+AppConfig, also when its environment is named like production).
+
+Reports for AI agents quote logs, failure reasons and templates as data: in code blocks they
+cannot close, marked as material to analyse rather than instructions. Logs can still contain
+secrets your code printed; read a report before sharing it outside your team.
 
 ### What is deployed where
 
@@ -209,6 +266,28 @@ environments:
 
 Every environment is queried, so each needs a valid AWS session: an expired one shows
 "sign in" in its cells, and Enter there signs in.
+
+### Promote, roll back, approve
+
+In the Matrix, `p` on a cell that is behind deploys there exactly the commit the environment
+to its left runs, through the usual deploy (hooks, confirmation, typed name in production).
+`R` (also in Pipelines) goes back to the previous successful deploy with another commit: on
+V2 pipelines with CodePipeline's stage rollback (fast, nothing rebuilt, you pick the stage),
+on V1 pipelines by running the whole pipeline again at that commit. Pinning a commit works for
+CodeCommit and CodeStar connection sources (GitHub, GitLab, Bitbucket), S3 object versions and
+ECR digests.
+
+The Approvals module lists every manual approval waiting in every environment, with what is
+being approved and the approval's link; the header counts them and dcli notifies new ones.
+
+### Alarms
+
+The Alarms module lists CloudWatch alarms (metric and composite) of every environment, firing
+ones first, with what makes each fire, its recent state changes and a graph of its metric
+against the threshold, the firing periods marked. The header counts the alarms firing in the
+current environment (refreshed every minute, also while you use other modules), and a desktop
+notification tells when one starts firing (`defaults.notifications`). `dcli alarms` exits
+with 1 when an alarm is firing, for scripts and CI checks.
 
 ### Updates
 
@@ -256,15 +335,20 @@ src/
     mod.rs        Aws::call (awsJson1_1/1_0), Aws::rest (restJson1), Aws::query (XML), retries,
                   Aws::raw (any request), Aws::presign (presigned URLs), Aws::download
     codepipeline.rs codebuild.rs cloudformation.rs logs.rs ssm.rs secrets.rs lambda.rs
-    s3.rs sfn.rs dynamodb.rs events.rs appconfig.rs
+    s3.rs sfn.rs sqs.rs dynamodb.rs events.rs appconfig.rs
+    cloudwatch.rs alarms.rs metrics.rs   CloudWatch (awsQuery): alarms and GetMetricData
   tui/            app shell: header, module palette, environment, toasts, help, SSO login, event loop
     module.rs     the Module trait every module implements
     picker.rs     searchable list, in the UI and inline in the shell
     logview.rs    log viewer with full screen, search and error jumps (Pipelines, Logs)
     form.rs       modal forms (new parameter, new secret…)
-  modules/        one file per module: pipelines, matrix, parameters, secrets, lambda, cwlogs,
-                  s3, sfn, dynamodb, events, appconfig
-  clicmd/         the commands of the newer modules (dcli s3, sfn, ddb, events, flags)
+    chart.rs      terminal charts (Lambda metrics)
+  modules/        one file per module: pipelines, matrix, approvals, alarms, parameters,
+                  secrets, lambda, cwlogs (+ cwlogs/insights.rs), cfn, s3, sfn, sqs,
+                  dynamodb, events, appconfig
+  clicmd/         the commands of the newer modules (dcli s3, sfn, ddb, events, flags, lambda,
+                  alarms, approvals, promote, rollback, sqs, insights, cfn)
+  catalog.rs      every resource of an environment by name, for the `:` search
   asl.rs          Amazon States Language: a state machine's definition arranged for its graph
   pipeline.rs     CodePipeline domain logic shared by the UI and the CLI
   matrix.rs       applications × environments: grouping, deployed commit, drift
@@ -276,7 +360,7 @@ src/
 Background work runs on plain threads and reports back through a channel, so the UI never
 blocks. There is no async runtime and no AWS SDK: each service is a handful of typed JSON calls.
 
-### Adding a module (e.g. ECS, SQS)
+### Adding a module (e.g. ECS, API Gateway)
 
 1. **AWS calls**: create `src/aws/<service>.rs` with a `Service` constant and functions that
    call `aws.call(&SERVICE, "Operation", &json!({...}))` (or `aws.rest(...)` for REST APIs),
@@ -285,7 +369,8 @@ blocks. There is no async runtime and no AWS SDK: each service is a handful of t
    `title` and `description` (shown in the `:` palette), `reset` (environment changed),
    `activate` (load lazily), `key`, `task` (results from `ctx.spawn`), `render`, `hints`.
    `parameters.rs` is a compact example.
-3. **Register** it in `src/modules/mod.rs`. It appears in the header and the palette.
+3. **Register** it in `src/modules/mod.rs`. It appears in the header and the palette. To make
+   its resources searchable from `:`, add a lister to `src/catalog.rs` and implement `open`.
 4. **CLI** (optional): a `src/clicmd/<name>.rs` with a clap `Args` struct and `run`, added to
    the `Command` enum in `src/cli.rs`.
 
