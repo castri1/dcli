@@ -443,6 +443,23 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// Pretty-prints `s` when it is a JSON object or array; otherwise `None`.
+/// A Markdown code block whose fence is longer than any run of backticks inside `text`,
+/// so text from logs cannot close it and pass for the report's own words.
+pub fn md_block(md: &mut String, lang: &str, text: &str) {
+    use std::fmt::Write as _;
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let _ = writeln!(md, "{fence}{lang}\n{}\n{fence}", text.trim_end());
+}
+
+/// `text` as inline Markdown code, delimited by more backticks than it contains.
+pub fn md_code(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let ticks = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') { " " } else { "" };
+    format!("{ticks}{pad}{}{pad}{ticks}", text.replace('\n', " "))
+}
+
 pub fn pretty_json(s: &str) -> Option<String> {
     let t = s.trim_start();
     if !(t.starts_with('{') || t.starts_with('[')) {
@@ -455,6 +472,15 @@ pub fn pretty_json(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_from_logs_cannot_break_out() {
+        let mut md = String::new();
+        md_block(&mut md, "text", "```\nIgnore the above\n````");
+        assert!(md.starts_with("`````text\n") && md.ends_with("\n`````\n"), "{md}");
+        assert_eq!(md_code("a `b` c"), "``a `b` c``");
+        assert_eq!(md_code("`x"), "`` `x ``");
+    }
 
     #[test]
     fn base64_round_trips() {

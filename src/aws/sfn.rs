@@ -626,11 +626,8 @@ pub fn report(env_name: &str, region: &str, machine: &MachineDetail, detail: &Ex
     md
 }
 
-/// A fenced block whose fence is longer than any backtick run inside `text`.
 fn write_block(md: &mut String, lang: &str, text: &str) {
-    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest.max(2) + 1);
-    let _ = writeln!(md, "{fence}{lang}\n{}\n{fence}", text.trim_end());
+    crate::util::md_block(md, lang, text);
 }
 
 #[cfg(test)]

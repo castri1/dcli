@@ -19,14 +19,19 @@ impl AwsError {
 
     pub fn is_retryable(&self) -> bool {
         match self {
-            AwsError::Api { status, code, .. } => {
-                *status == 429
-                    || *status >= 500
-                    || code.contains("Throttl")
-                    || code == "TooManyRequestsException"
-                    || code == "RequestLimitExceeded"
-            }
+            AwsError::Api { status, .. } => *status >= 500 || self.is_throttling(),
             AwsError::Network(_) => true,
+            _ => false,
+        }
+    }
+
+    /// AWS turned the request away before doing anything: sending it again is safe even
+    /// when it has effects.
+    pub fn is_throttling(&self) -> bool {
+        match self {
+            AwsError::Api { status, code, .. } => {
+                *status == 429 || code.contains("Throttl") || code == "TooManyRequestsException" || code == "RequestLimitExceeded"
+            }
             _ => false,
         }
     }

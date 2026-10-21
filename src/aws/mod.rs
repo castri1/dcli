@@ -167,6 +167,20 @@ impl Aws {
         self.send(svc, method, segments, query, headers, body)
     }
 
+    /// Like [`Aws::raw`] for a request that must not run twice (invoking a function): sent
+    /// again only when AWS throttled it, not after a server error or a lost connection,
+    /// when it may already have run.
+    pub fn raw_once(
+        &self,
+        svc: &Service,
+        method: &str,
+        segments: &[&str],
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Result<http::RawResponse> {
+        self.send_with(svc, method, segments, &[], headers, body, false)
+    }
+
     /// A URL anyone can GET until `expires` seconds from now, or until the credentials
     /// that signed it expire, whichever comes first (SSO sessions last hours).
     pub fn presign(&self, svc: &Service, segments: &[&str], expires: u64) -> Result<String> {
@@ -218,6 +232,21 @@ impl Aws {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> Result<http::RawResponse> {
+        self.send_with(svc, method, segments, query, headers, body, true)
+    }
+
+    /// `idempotent`: may be sent again after a server error or a network failure.
+    #[allow(clippy::too_many_arguments)]
+    fn send_with(
+        &self,
+        svc: &Service,
+        method: &str,
+        segments: &[&str],
+        query: &[(String, String)],
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        idempotent: bool,
+    ) -> Result<http::RawResponse> {
         let mut refreshed = false;
         let mut attempt = 0;
         loop {
@@ -235,7 +264,7 @@ impl Aws {
                 Err(e) if e.is_expired_credentials() => {
                     return Err(AwsError::LoginRequired { profile: self.profile.clone(), detail: e.short() });
                 }
-                Err(e) if e.is_retryable() && attempt < MAX_ATTEMPTS => {
+                Err(e) if (if idempotent { e.is_retryable() } else { e.is_throttling() }) && attempt < MAX_ATTEMPTS => {
                     std::thread::sleep(Duration::from_millis(250 * 2u64.pow(attempt)));
                 }
                 Err(e) => return Err(e),
