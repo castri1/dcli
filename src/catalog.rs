@@ -1,9 +1,9 @@
 //! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, log
-//! groups, parameters, secrets, buckets, state machines, tables, event buses and AppConfig
-//! applications, each with the module that opens it. Services are listed in parallel and
+//! groups, parameters, secrets, buckets, state machines, queues, tables, event buses and
+//! AppConfig applications, each with the module that opens it. Services are listed in parallel and
 //! capped; a service the user cannot read is left out.
 
-use crate::aws::{self, Aws, appconfig, dynamodb, events, lambda, logs, s3, secrets, sfn, ssm};
+use crate::aws::{self, Aws, appconfig, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
 
 /// Resources listed at most per service (some accounts have thousands of log groups).
 const MAX: usize = 2000;
@@ -27,7 +27,8 @@ impl Resource {
 
 type Lister = fn(&Aws) -> aws::Result<Vec<Resource>>;
 
-const LISTERS: &[Lister] = &[functions, log_groups, parameters, secret_list, buckets, state_machines, tables, buses, applications];
+const LISTERS: &[Lister] =
+    &[functions, log_groups, parameters, secret_list, buckets, state_machines, queues, tables, buses, applications];
 
 /// The resources of the environment `aws` points at, `pipelines` being those in its config,
 /// and how many services could be listed (none: the session has probably expired).
@@ -82,6 +83,11 @@ fn buckets(aws: &Aws) -> aws::Result<Vec<Resource>> {
 fn state_machines(aws: &Aws) -> aws::Result<Vec<Resource>> {
     let list = sfn::all_state_machines(aws)?;
     Ok(list.iter().map(|m| Resource::new("Step Functions", &m.name, m.state_machine_arn.clone(), &m.kind.to_lowercase())).collect())
+}
+
+fn queues(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    let urls = sqs::list_queue_urls(aws)?;
+    Ok(urls.iter().map(|u| Resource::new("SQS", sqs::queue_name(u), u.clone(), "queue")).collect())
 }
 
 fn tables(aws: &Aws) -> aws::Result<Vec<Resource>> {
