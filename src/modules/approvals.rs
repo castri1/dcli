@@ -238,6 +238,9 @@ impl Approvals {
         let url = w.link.clone().unwrap_or_else(|| {
             aws::console_url(region, &format!("codesuite/codepipeline/pipelines/{}/view?region={region}", w.pipeline))
         });
+        if !crate::platform::is_web_url(&url) {
+            return ctx.toast(Level::Warn, format!("The approval's link is not a web address; dcli does not open it: {url}"));
+        }
         if !crate::platform::open_url(&url) {
             ctx.toast(Level::Warn, format!("Could not open a browser: {url}"));
         }

@@ -89,7 +89,7 @@ pub fn open_url(url: &str) -> bool {
     spawn_quiet(cmd)
 }
 
-fn is_web_url(url: &str) -> bool {
+pub fn is_web_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else { return false };
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
