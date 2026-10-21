@@ -249,8 +249,13 @@ impl Message {
     }
 
     /// The body on one line, envelopes unwrapped: an EventBridge event as its detail type
-    /// and detail, an SNS notification as its message.
+    /// and detail, an SNS notification as its message. Sanitized: decoding the JSON turns
+    /// `\u001b` escapes in the body into real control characters.
     pub fn preview(&self) -> String {
+        crate::util::sanitize(&self.unwrapped())
+    }
+
+    fn unwrapped(&self) -> String {
         let Ok(v) = serde_json::from_str::<Value>(&self.body) else {
             return self.body.split_whitespace().collect::<Vec<_>>().join(" ");
         };
@@ -410,6 +415,12 @@ pub fn fmt_seconds(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previews_cannot_carry_escape_sequences() {
+        let m = Message { body: r#"{"Type": "Notification", "Message": "boom \u001b]0;pwned\u0007 done"}"#.into(), ..Default::default() };
+        assert!(!m.preview().chars().any(crate::util::is_unsafe), "{:?}", m.preview());
+    }
 
     #[test]
     fn names_and_policies() {

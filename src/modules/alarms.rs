@@ -104,6 +104,8 @@ pub struct Alarms {
     pending_detail: Option<(Key, Instant)>,
     detail_scroll: u16,
     list_area: Rect,
+    /// An alarm of the current environment to select once read (from the `:` search).
+    open_target: Option<String>,
 }
 
 fn look(state: State) -> (&'static str, Style, &'static str) {
@@ -279,6 +281,23 @@ impl Alarms {
             pending_detail: None,
             detail_scroll: 0,
             list_area: Rect::default(),
+            open_target: None,
+        }
+    }
+
+    /// Selects the alarm asked for by `open`, once the current environment's are read.
+    fn try_open(&mut self) {
+        let Some(name) = self.open_target.clone() else { return };
+        if !matches!(self.envs.get(self.current).map(|e| &e.load), Some(Load::Ready(_))) {
+            return;
+        }
+        self.open_target = None;
+        self.filter.clear();
+        self.filtering = false;
+        self.refilter();
+        let row = self.rows.iter().position(|r| matches!(r, Row::Alarm(e, i) if *e == self.current && self.alarm(*e, *i).is_some_and(|a| a.name == name)));
+        if let Some(index) = row {
+            self.select(index);
         }
     }
 
@@ -435,6 +454,7 @@ impl Alarms {
             Err(e) => env.load = Load::Failed(e.short()),
         }
         self.refilter();
+        self.try_open();
     }
 
     fn open_selected(&mut self, ctx: &mut Ctx) {
@@ -737,6 +757,12 @@ impl Module for Alarms {
     fn activate(&mut self, ctx: &mut Ctx) {
         self.opened = true;
         self.refresh_due(ctx, true);
+    }
+
+    /// Selects alarm `target` of the current environment, now or once read.
+    fn open(&mut self, target: &str, _ctx: &mut Ctx) {
+        self.open_target = Some(target.to_string());
+        self.try_open();
     }
 
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {

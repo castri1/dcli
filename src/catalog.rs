@@ -1,9 +1,10 @@
 //! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, log
-//! groups, parameters, secrets, buckets, state machines, queues, tables, event buses and
-//! AppConfig applications, each with the module that opens it. Services are listed in parallel and
+//! groups, parameters, secrets, buckets, state machines, queues, tables, event buses,
+//! AppConfig applications and alarms, each with the module that opens it. Services are listed in parallel and
 //! capped; a service the user cannot read is left out.
 
-use crate::aws::{self, Aws, appconfig, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
+use crate::aws::{self, Aws, alarms, appconfig, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
+use crate::util::show_invisible;
 
 /// Resources listed at most per service (some accounts have thousands of log groups).
 const MAX: usize = 2000;
@@ -28,7 +29,7 @@ impl Resource {
 type Lister = fn(&Aws) -> aws::Result<Vec<Resource>>;
 
 const LISTERS: &[Lister] =
-    &[functions, log_groups, parameters, secret_list, buckets, state_machines, queues, tables, buses, applications];
+    &[functions, log_groups, parameters, secret_list, buckets, state_machines, queues, tables, buses, applications, alarm_list];
 
 /// The resources of the environment `aws` points at, `pipelines` being those in its config,
 /// and how many services could be listed (none: the session has probably expired).
@@ -96,6 +97,12 @@ fn tables(aws: &Aws) -> aws::Result<Vec<Resource>> {
 
 fn buses(aws: &Aws) -> aws::Result<Vec<Resource>> {
     Ok(events::list_event_buses(aws)?.iter().map(|b| Resource::new("EventBridge", &b.name, b.name.clone(), "event bus")).collect())
+}
+
+fn alarm_list(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    // Alarm names are kept byte-exact for the API: shown with their invisible characters made visible.
+    let list = alarms::describe_alarms(aws)?;
+    Ok(list.iter().map(|a| Resource::new("Alarms", &show_invisible(&a.name), a.name.clone(), "alarm")).collect())
 }
 
 fn applications(aws: &Aws) -> aws::Result<Vec<Resource>> {
