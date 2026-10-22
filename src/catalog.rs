@@ -129,8 +129,9 @@ fn db_clusters(aws: &Aws) -> aws::Result<Vec<Resource>> {
 }
 
 /// Redshift provisioned clusters; the target is the cluster identifier.
-fn redshift_clusters(_aws: &Aws) -> aws::Result<Vec<Resource>> {
-    Ok(Vec::new())
+fn redshift_clusters(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    let list = aws::redshift::describe_clusters(aws, None)?;
+    Ok(list.iter().map(|c| Resource::new("Redshift", &c.id, c.id.clone(), &c.shape())).collect())
 }
 
 /// DMS replication tasks; the target is the task identifier.
