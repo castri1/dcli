@@ -22,7 +22,7 @@ use super::lambda::Range;
 use super::metrics::{self, Query, Series};
 use super::{Aws, AwsError, Result, Service, logs};
 use crate::tui::chart::fmt_count;
-use crate::util::{fmt_ago, fmt_bytes, fmt_utc, md_block, md_code, sanitize};
+use crate::util::{fmt_ago, fmt_bytes, fmt_utc, json_in_text, md_block, md_code, sanitize};
 
 pub const SERVICE: Service = Service { endpoint: "dms", signing_name: "dms", target_prefix: "AmazonDMSv20160101" };
 
@@ -191,7 +191,7 @@ impl Replication {
     /// The log group and stream of a task: from its logging settings when they say, else
     /// DMS's own names (`dms-tasks-<instance>`, `dms-task-<resource id>`).
     pub fn log_location(&self) -> Option<(String, String)> {
-        let logging = self.settings.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).and_then(|v| v.get("Logging").cloned());
+        let logging = self.settings.as_deref().and_then(json_in_text).and_then(|v| v.get("Logging").cloned());
         let named = |key: &str| logging.as_ref().and_then(|l| l.get(key)).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
         if let (Some(group), Some(stream)) = (named("CloudWatchLogGroup"), named("CloudWatchLogStream")) {
             return Some((group, stream));
@@ -1189,7 +1189,7 @@ pub enum PrepMode {
 impl PrepMode {
     pub fn of(settings: Option<&str>) -> PrepMode {
         let mode = settings
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(json_in_text)
             .and_then(|v| v.pointer("/FullLoadSettings/TargetTablePrepMode").and_then(Value::as_str).map(str::to_string));
         match mode.as_deref() {
             Some("DROP_AND_CREATE") => PrepMode::DropAndCreate,
@@ -1224,7 +1224,7 @@ impl PrepMode {
 
 /// The settings worth knowing, as (name, value) lines.
 pub fn settings_summary(settings: &str) -> Vec<(String, String)> {
-    let Ok(v) = serde_json::from_str::<Value>(settings) else { return vec![("Settings".into(), "not valid JSON".into())] };
+    let Some(v) = json_in_text(settings) else { return vec![("Settings".into(), "not valid JSON".into())] };
     let get = |path: &str| v.pointer(path);
     let flag = |path: &str| get(path).and_then(Value::as_bool).unwrap_or(false);
     let num = |path: &str| get(path).and_then(Value::as_f64);
@@ -1270,7 +1270,7 @@ pub fn settings_summary(settings: &str) -> Vec<(String, String)> {
 /// The selection and transformation rules of a task's table mappings, one readable line
 /// each: `include public.%`, `rename schema public → app`.
 pub fn mapping_lines(mappings: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<Value>(mappings) else { return vec!["(table mappings are not valid JSON)".into()] };
+    let Some(v) = json_in_text(mappings) else { return vec!["(table mappings are not valid JSON)".into()] };
     let rules = v.get("rules").and_then(Value::as_array).cloned().unwrap_or_default();
     let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let locator = |r: &Value| {
@@ -1607,6 +1607,16 @@ pub fn report(p: &ReportParts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_inside_settings_and_mappings_is_cleaned() {
+        let mappings = r#"{"rules":[{"rule-type":"selection","rule-action":"include","object-locator":{"schema-name":"pub\u001b[2Jlic","table-name":"%"}}]}"#;
+        let lines = mapping_lines(mappings);
+        assert!(lines.iter().all(|l| !l.chars().any(crate::util::is_unsafe)), "{lines:?}");
+        let settings = r#"{"ErrorBehavior":{"TableErrorPolicy":"SUSPEND\u202e_TABLE"},"Logging":{"CloudWatchLogGroup":"g\u009b2J","CloudWatchLogStream":"s"}}"#;
+        let summary = settings_summary(settings);
+        assert!(summary.iter().all(|(k, v)| !k.chars().chain(v.chars()).any(crate::util::is_unsafe)), "{summary:?}");
+    }
 
     const TASK: &str = r#"{"ReplicationTasks":[{
         "ReplicationTaskIdentifier":"orders-cdc",

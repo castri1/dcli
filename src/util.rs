@@ -470,6 +470,15 @@ pub fn md_code(text: &str) -> String {
     format!("{ticks}{pad}{}{pad}{ticks}", text.replace('\n', " "))
 }
 
+/// JSON held in a string of a response (task settings, table mappings…), parsed and
+/// sanitized: the response was cleaned while these escapes were still text, and decoding
+/// them (`\u001b`, `\u202e`) brings back what was removed.
+pub fn json_in_text(s: &str) -> Option<serde_json::Value> {
+    let mut v: serde_json::Value = serde_json::from_str(s).ok()?;
+    sanitize_json(&mut v);
+    Some(v)
+}
+
 pub fn pretty_json(s: &str) -> Option<String> {
     let t = s.trim_start();
     if !(t.starts_with('{') || t.starts_with('[')) {
