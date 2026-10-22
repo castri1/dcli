@@ -30,16 +30,21 @@ fn error_line(e: &AwsError) -> Line<'static> {
     Line::styled(e.short(), Style::new().fg(theme::ERR))
 }
 
-/// The formatter of a unit, for a chart's scale.
+/// The formatter of a unit for a chart's scale, which has six columns: `20.7G`, `4.0`.
 fn unit_fmt(unit: Unit) -> fn(f64) -> String {
     match unit {
         Unit::Percent => |v| Unit::Percent.fmt(v),
         Unit::Count => |v| Unit::Count.fmt(v),
         Unit::PerSecond => |v| Unit::PerSecond.fmt(v),
-        Unit::Bytes => |v| Unit::Bytes.fmt(v),
+        Unit::Bytes => |v| {
+            // `20.7 GB` → `20.7G`
+            let size = rds::fmt_size(v);
+            let (n, unit) = size.split_once(' ').unwrap_or((&size, ""));
+            format!("{n}{}", unit.trim_end_matches('B'))
+        },
         Unit::Seconds => |v| Unit::Seconds.fmt(v),
         Unit::Millis => |v| Unit::Millis.fmt(v),
-        Unit::Acu => |v| Unit::Acu.fmt(v),
+        Unit::Acu => |v| format!("{v:.1}"),
         Unit::Sessions => |v| Unit::Sessions.fmt(v),
     }
 }
@@ -425,6 +430,15 @@ pub fn node_bar(node: &Instance, index: usize, count: usize, range: Option<Range
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chart_scales_fit_six_columns() {
+        let gb = 1024.0 * 1024.0 * 1024.0;
+        assert_eq!(unit_fmt(Unit::Bytes)(20.7 * gb), "20.7G");
+        assert_eq!(unit_fmt(Unit::Bytes)(512.0 * 1024.0 * 1024.0), "512M");
+        assert_eq!(unit_fmt(Unit::Bytes)(12.0), "12");
+        assert_eq!(unit_fmt(Unit::Acu)(4.0), "4.0");
+    }
 
     #[test]
     fn statements_fit_on_one_line() {
