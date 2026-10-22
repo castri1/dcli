@@ -4,9 +4,10 @@ Terminal UI and CLI to deploy and explore AWS: **CodePipeline** (a matrix of wha
 where, promote and rollback, an inbox of approvals), **CloudWatch** alarms, Logs and Logs
 Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke), **API
 Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **Aurora**
-(topology, performance, top SQL), **EventBridge** and **AppConfig** feature flags, plus a
+(topology, performance, top SQL, failover), **Redshift** (nodes, queries, table health),
+**DMS** (tasks, tables, CDC latency), **EventBridge** and **AppConfig** feature flags, plus a
 **Savings** scan of what could cost less. Failures (pipelines, executions, functions, stacks,
-routes) and slow databases can be copied as Markdown reports for an AI agent.
+routes, migration tasks) and slow databases can be copied as Markdown reports for an AI agent.
 A single ~5 MB binary (about 2.5 MB to download) for macOS, Linux and Windows. No Node.js, no AWS
 SDK, no runtime.
 
@@ -123,13 +124,28 @@ dcli aurora                                                       # Aurora clust
 dcli aurora prod orders-prod                                      # topology: endpoints → writer and readers
 dcli aurora prod orders-prod --metrics --range 7d                 # also --top-sql [--instance X], --events
 dcli aurora prod orders-prod --report > diagnosis.md              # performance diagnosis for an AI agent
+dcli aurora prod orders-prod --failover --to orders-2             # also --reboot X, --stop, --start, --snapshot
+dcli aurora prod orders-prod --class orders-2=db.r7g.xlarge       # in the maintenance window (--now: right away)
+dcli aurora dev sessions-dev --acu 0.5:8                          # Serverless v2 range
+dcli redshift prod analytics-prod                                 # nodes: CPU, disk, skew
+dcli redshift prod analytics-prod --queries --db-user admin --save-identity   # running and queued (Data API)
+dcli redshift prod analytics-prod --slow                          # also --tables, --metrics, --events, --report
+dcli redshift prod analytics-prod --cancel 1073
+dcli redshift dev analytics-dev --pause                           # also --resume, --resize, --snapshot
+dcli dms                                                          # tasks; exit code 1 when one failed or has tables in error
+dcli dms orders-cdc                                               # status, latency diagnosis, settings, table mappings
+dcli dms orders-cdc --tables --state error                        # also --metrics, --report
+dcli dms billing-cdc --resume                                     # also --stop
+dcli dms orders-cdc --reload errors                               # or schema.t1,schema.t2; alone: every table
+dcli dms --scale dms-prod-1 --class dms.r5.xlarge                 # also --instances, --endpoints, --test-endpoint
 dcli optimize                                                     # what could cost less (--json, --report)
 dcli optimize --service lambda,logs --days 7
 dcli optimize --lambda-memory                                     # memory used vs assigned (Logs Insights; asks first)
 dcli update                # update dcli (npm installs update through npm); --check only tells
 ```
 
-Writes (`--set`, `events send`, API Gateway stage changes and tests) ask for confirmation, or for the environment name in
+Writes (`--set`, `events send`, API Gateway stage changes and tests, Aurora, Redshift and DMS
+actions) ask for confirmation, or for the environment name in
 production-looking environments; `--yes` skips it (needed when the value comes from stdin).
 
 The environment argument is optional everywhere: without it, commands use the current
@@ -164,7 +180,9 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | SQS | `→`/`Enter` its DLQ or source queue · `m` messages (dead-letter queues only) · `R` redrive · `x` cancel the redrive · `/` search · `y` copy URL · `o` console · `r` reload |
 | Step Functions (graph, timeline) | `↑↓` state · `←→` pan · `g`/`t` switch view · `f` the failed state · `i`/`O` its input/output · `l` its logs · `c` copy a failure report · click a state to select it |
 | DynamoDB | `Enter` open a table (scans the first 50 items) · `f` find by key (table or index) · `s` scan · `m` next page · `/` filter the items read · `y` copy the item · `z` full screen · `o` console |
-| Aurora | `Enter`/`Esc` open a cluster / back · `←→` topology / performance / top SQL / events / configuration · `↑↓` endpoint or node (a statement in Top SQL) · `Enter` a node's metrics; in Top SQL select a statement, again to read it whole · `m` 1h/24h/7d · `y` copy the endpoint (or statement) · `Y` copy a `psql`/`mysql` command · `c` copy a performance diagnosis for AI · `/` search · `o` console · `r` reload |
+| Aurora | `Enter`/`Esc` open a cluster / back · `←→` topology / performance / top SQL / events / configuration · `↑↓` endpoint or node (a statement in Top SQL) · `Enter` a node's metrics; in Top SQL select a statement, again to read it whole · `f` fail over (to the selected reader) · `b` reboot the node · `M` change the node's class (Serverless v2: the cluster's ACU range) · `x` stop / start the cluster · `S` manual snapshot · `m` 1h/24h/7d · `y` copy the endpoint (or statement) · `Y` copy a `psql`/`mysql` command · `c` copy a performance diagnosis for AI · `/` search · `o` console · `r` reload |
+| Redshift | `Enter`/`Esc` open a cluster / back · `←→` nodes / performance / queries / tables / events / configuration · `↑↓` node, or a query after `Enter` in Queries · `Enter` a node's metrics; in Queries select, then the whole SQL · `x` cancel the selected query · `t` sort tables · `i` database identity · `p` pause / resume · `R` resize · `s` manual snapshot · `m` 1h/24h/7d · `y` copy endpoint (or query) · `Y` copy a `psql` command · `c` copy a performance diagnosis for AI · `/` search · `o` console · `r` reload |
+| DMS | `←→` tasks / instances / endpoints (in a task: overview / tables / settings) · `Enter` open a task (on an instance: its tasks; on an endpoint: test it) · `s` resume or start · `x` stop · `R` reload (marked tables, those in error, or every table) · `S` change the instance class · `t` test an endpoint's connection · `Space` / `E` mark a table / those in error · `f` filter tables · `/` search · `c` copy a report for AI · `l` its logs · `m` 1h/24h/7d · `y` copy ARN · `o` console · `r` refresh |
 | EventBridge | `Enter` a bus's rules · `→` targets, `Enter` on one opens it (Lambda, Step Functions, Logs) · `t` send a test event · `y` copy the pattern · `o` console |
 | AppConfig | `Enter` application → profile → flags · `↑↓←→` flag × environment · `Enter` edit and deploy · `x` stop the deployment (rolls back) · `y` copy the document |
 
@@ -173,11 +191,11 @@ where that makes sense and `Ctrl+A` marks every match.
 
 The header shows every module while they fit; with more modules (or a narrow terminal) it
 shows only the current one, and `:` reaches the rest by name. Modules with something to say
-show it there: approvals waiting, alarms firing.
+show it there: approvals waiting, alarms firing, DMS tasks failed.
 
 Typing in `:` also searches the environment's resources by name: pipelines, functions, log
-groups, parameters, secrets, stacks, buckets, state machines, queues, tables, APIs, Aurora
-clusters, event buses, AppConfig applications and alarms (listed in the background the first time, then kept for
+groups, parameters, secrets, stacks, buckets, state machines, queues, tables, APIs, Aurora and
+Redshift clusters, DMS tasks, event buses, AppConfig applications and alarms (listed in the background the first time, then kept for
 five minutes). Enter opens the resource in its module.
 
 The mouse works too: wheel to scroll, click to select and switch modules. Forms accept pasted
@@ -262,9 +280,32 @@ before deploying and before creating or changing parameters and secrets.
   failover tier) with their CPU, connections and replica lag, and the cluster volume. Charts
   per node and range are under Performance; Top SQL shows the database load, wait events and
   heaviest statements from Performance Insights (when it is on; dcli never turns it on).
-  Events puts failovers, reboots and maintenance on a timeline. Read-only: nothing is changed.
-  `Y` copies a connection command; with IAM authentication its password comes from `aws rds
+  Events puts failovers, reboots and maintenance on a timeline. Actions: fail over (to the
+  selected reader), reboot a node, stop and start the cluster (AWS starts a stopped cluster
+  again after 7 days), change a node's class or a Serverless v2 range (now or in the
+  maintenance window), take a manual snapshot; each form says what happens first. `Y` copies
+  a connection command; with IAM authentication its password comes from `aws rds
   generate-db-auth-token` when you run it, so dcli never handles a token or password.
+- **Redshift**: the Nodes tab draws the leader and compute nodes with their CPU and disk; a
+  node far above the others is marked as skewed (usually the distribution key). Queries and
+  Tables read the system tables with SQL through the Redshift Data API, as a database identity
+  you choose once per cluster: a database user with temporary credentials, or a Secrets
+  Manager secret (saved in `~/.deployment-cli/redshift.json`, without passwords). Queries shows
+  what runs and waits now, the slowest queries and longest queue waits of the day and who
+  blocks whom (users who are not superusers see only their own queries); `x` cancels one.
+  Tables flags those that need VACUUM or ANALYZE, are skewed or uncompressed. `p` pauses or
+  resumes the cluster, `R` resizes it among the shapes elastic resize allows, with their
+  estimated disk use, and `s` takes a snapshot.
+- **DMS**: tasks in trouble come first. A task's overview says where its CDC latency comes
+  from (reading the source or applying to the target), whether changes wait on disk, and
+  whether its replication instance is short of memory or CPU, with the charts behind it and
+  the distinct error lines of its log. Tables shows each table's state, rows, changes and
+  validation. Resume warns when a task has been stopped long (the source may no longer keep
+  the changes it needs); reloading every table always asks for the task's name and says what
+  happens to the target tables, and tables in error can be reloaded alone. `S` changes the
+  instance class (it restarts; the form says which tasks stop meanwhile), `t` tests an
+  endpoint's connection. The header counts failed tasks and a notification tells when one
+  fails.
 - **AppConfig**: each cell is what that environment serves now. Editing starts from that
   version, so other environments' changes do not slip in; you see the change, pick a
   deployment strategy, and dcli creates the new version, deploys it and follows it. Freeform
@@ -272,8 +313,9 @@ before deploying and before creating or changing parameters and secrets.
 
 Production-looking environments ask for their name before these writes too (redrive, start,
 stop, test events, flag deploys, invoking a function, SQS redrives, promote and rollback, API
-Gateway stage changes and route tests, savings fixes; for AppConfig, also when its environment
-is named like production, and for API Gateway when the stage is).
+Gateway stage changes and route tests, Aurora, Redshift and DMS actions, savings fixes; for
+AppConfig, also when its environment is named like production, and for API Gateway when the
+stage is).
 
 Reports for AI agents quote logs, failure reasons and templates as data: in code blocks they
 cannot close, marked as material to analyse rather than instructions. Logs can still contain
@@ -336,7 +378,9 @@ unused tables, steady on-demand tables, tables that are mostly storage; S3 bucke
 lifecycle rules, abandoned multipart uploads, old versions kept forever; busy Standard state
 machines of short executions; secrets nobody reads; alarms without data; REST APIs that could
 be HTTP APIs and stage caches that rarely hit; idle or oversized Aurora instances, Serverless
-minimums above use, heavy I/O on Standard storage, old manual snapshots.
+minimums above use, heavy I/O on Standard storage, old manual snapshots; Redshift clusters idle
+for hours (to pause on a schedule), nodes to spare, old snapshots, heavy concurrency scaling;
+DMS replication instances with nothing running, oversized ones, Multi-AZ outside production.
 
 There are no prices in dcli: each finding says how much usage the change removes, in the
 unit AWS bills for it (GB-seconds, GB stored, requests, capacity-unit hours, instance hours),
@@ -394,6 +438,8 @@ src/
     codepipeline.rs codebuild.rs cloudformation.rs logs.rs ssm.rs secrets.rs lambda.rs
     s3.rs sfn.rs sqs.rs dynamodb.rs events.rs appconfig.rs apigateway.rs
     rds.rs pi.rs  Aurora (awsQuery) and Performance Insights
+    redshift.rs redshift_data.rs dms.rs
+    xml.rs        reading awsQuery XML responses
     cloudwatch.rs alarms.rs metrics.rs   CloudWatch (awsQuery): alarms and GetMetricData
   tui/            app shell: header, module palette, environment, toasts, help, SSO login, event loop
     module.rs     the Module trait every module implements
@@ -404,10 +450,10 @@ src/
     canvas.rs     box-drawing canvas for diagrams (Step Functions graph, Aurora topology)
   modules/        one file (or folder) per module: pipelines, matrix, approvals, alarms,
                   savings, parameters, secrets, lambda, apigateway, cwlogs, cfn, s3, sfn,
-                  sqs, dynamodb, aurora, events, appconfig
+                  sqs, dynamodb, aurora, redshift, dms, events, appconfig
   clicmd/         the commands of the newer modules (dcli s3, sfn, ddb, events, flags, lambda,
                   alarms, approvals, promote, rollback, sqs, insights, cfn, apigw, aurora,
-                  optimize)
+                  redshift, dms, optimize)
   savings/        one check per service for the Savings module and `dcli optimize`
   catalog.rs      every resource of an environment by name, for the `:` search
   asl.rs          Amazon States Language: a state machine's definition arranged for its graph
