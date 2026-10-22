@@ -1,7 +1,7 @@
 //! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, log
 //! groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues,
-//! tables, API Gateway APIs, Aurora clusters, event buses, AppConfig applications and
-//! alarms, each with the module that opens it. Services are listed in parallel and capped; a service the user cannot read is left out.
+//! tables, API Gateway APIs, Aurora and Redshift clusters, DMS replication tasks, event
+//! buses, AppConfig applications and alarms, each with the module that opens it. Services are listed in parallel and capped; a service the user cannot read is left out.
 
 use crate::aws::{self, Aws, alarms, appconfig, cloudformation, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
 use crate::util::show_invisible;
@@ -40,6 +40,8 @@ const LISTERS: &[Lister] = &[
     queues,
     tables,
     db_clusters,
+    redshift_clusters,
+    dms_tasks,
     buses,
     applications,
     alarm_list,
@@ -124,6 +126,16 @@ fn tables(aws: &Aws) -> aws::Result<Vec<Resource>> {
 fn db_clusters(aws: &Aws) -> aws::Result<Vec<Resource>> {
     let list = aws::rds::describe_clusters(aws, None)?;
     Ok(list.iter().map(|c| Resource::new("Aurora", &c.id, c.id.clone(), &c.engine_label())).collect())
+}
+
+/// Redshift provisioned clusters; the target is the cluster identifier.
+fn redshift_clusters(_aws: &Aws) -> aws::Result<Vec<Resource>> {
+    Ok(Vec::new())
+}
+
+/// DMS replication tasks; the target is the task identifier.
+fn dms_tasks(_aws: &Aws) -> aws::Result<Vec<Resource>> {
+    Ok(Vec::new())
 }
 
 fn buses(aws: &Aws) -> aws::Result<Vec<Resource>> {

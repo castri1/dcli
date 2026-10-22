@@ -3461,6 +3461,22 @@ def performance_insights(op, body):
     raise KeyError(f"InvalidArgumentException: {op} is not in the mock yet")
 
 
+# ---- DMS (awsJson1_1, X-Amz-Target AmazonDMSv20160101.*) -------------------------------------
+def dms(op, body):
+    raise KeyError(f"InvalidParameterValueException: {op} is not in the mock yet")
+
+
+# ---- Redshift (awsQuery, Version 2012-12-01) ---------------------------------------------------
+def redshift(params):
+    action = params.get("Action", [""])[0]
+    return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
+
+
+# ---- Redshift Data API (awsJson1_1, X-Amz-Target RedshiftData.*) -------------------------------
+def redshift_data(op, body):
+    raise KeyError(f"ValidationException: {op} is not in the mock yet")
+
+
 def is_appconfig(path):
     return path.startswith("/applications") or path.startswith("/deploymentstrategies")
 
@@ -3549,7 +3565,7 @@ class H(BaseHTTPRequestHandler):
         if self.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
             # awsQuery services, told apart by their API version.
             params = parse_qs(raw.decode())
-            service = {"2010-08-01": cloudwatch, "2014-10-31": rds}.get(params.get("Version", [""])[0], cloudformation)
+            service = {"2010-08-01": cloudwatch, "2014-10-31": rds, "2012-12-01": redshift}.get(params.get("Version", [""])[0], cloudformation)
             return self.reply_xml(*service(params))
         body = json.loads(raw or b"{}")
         target = self.headers.get("x-amz-target", "")
@@ -3557,7 +3573,8 @@ class H(BaseHTTPRequestHandler):
         handler = {"CodePipeline_20150709": codepipeline, "CodeBuild_20161006": codebuild,
                    "Logs_20140328": cwlogs, "AmazonSSM": ssm, "secretsmanager": secretsmanager,
                    "AWSStepFunctions": stepfunctions, "DynamoDB_20120810": dynamodb, "AWSEvents": eventbridge,
-                   "AmazonSQS": sqs, "PerformanceInsightsv20180227": performance_insights}.get(prefix)
+                   "AmazonSQS": sqs, "PerformanceInsightsv20180227": performance_insights,
+                   "AmazonDMSv20160101": dms, "RedshiftData": redshift_data}.get(prefix)
         try:
             self.reply(200, handler(op, body))
         except Exception as e:

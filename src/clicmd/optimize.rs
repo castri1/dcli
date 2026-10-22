@@ -19,7 +19,7 @@ use crate::util::{rfc3339, sanitize};
 pub struct Args {
     /// Environment (default: the current one, see `use`)
     env: Option<String>,
-    /// Only these services: lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, apigw, aurora
+    /// Only these services: lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, apigw, aurora, redshift, dms
     #[arg(long, value_delimiter = ',', value_name = "SERVICES")]
     service: Vec<String>,
     /// Days of usage to look at

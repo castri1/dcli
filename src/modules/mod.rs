@@ -11,12 +11,14 @@ mod aurora;
 mod cfn;
 mod common;
 mod cwlogs;
+mod dms;
 mod dynamodb;
 mod events;
 mod lambda;
 mod matrix;
 mod parameters;
 mod pipelines;
+mod redshift;
 mod s3;
 mod savings;
 mod secrets;
@@ -44,6 +46,8 @@ pub fn all() -> Vec<Box<dyn Module>> {
         Box::new(sqs::Sqs::new()),
         Box::new(dynamodb::DynamoDb::new()),
         Box::new(aurora::Aurora::new()),
+        Box::new(redshift::Redshift::new()),
+        Box::new(dms::Dms::new()),
         Box::new(events::EventBridge::new()),
         Box::new(appconfig::AppConfig::new()),
     ]

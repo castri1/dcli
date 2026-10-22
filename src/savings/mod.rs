@@ -11,9 +11,11 @@
 pub mod alarms;
 pub mod apigateway;
 pub mod aurora;
+pub mod dms;
 pub mod dynamodb;
 pub mod lambda;
 pub mod logs;
+pub mod redshift;
 pub mod s3;
 pub mod secrets;
 pub mod sfn;
@@ -183,6 +185,8 @@ pub const CHECKS: &[(&str, Check)] = &[
     ("CloudWatch alarms", alarms::check),
     ("API Gateway", apigateway::check),
     ("Aurora", aurora::check),
+    ("Redshift", redshift::check),
+    ("DMS", dms::check),
 ];
 
 /// The service of [`CHECKS`] a command-line name stands for: `lambda`, `logs`, `sqs`,
