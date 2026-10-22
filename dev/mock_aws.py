@@ -2029,6 +2029,13 @@ def cw_parse(s):
     return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
 
 
+# Metric synthesizers of other sections, tried before cw_metric_value: each is called as
+# hook(namespace, name, dims, stat, period, ts) and returns a value, CW_NO_DATA (no
+# datapoint at ts) or None (not its metric). Each section appends its own.
+CW_METRIC_HOOKS = []
+CW_NO_DATA = object()
+
+
 def cw_metric_value(name, dims, ts):
     """A plausible, repeatable value of a metric at `ts`: daily waves, a little noise, and
     error spikes for payments-webhook."""
@@ -2063,10 +2070,18 @@ def cw_metrics(action, params):
         while get(f"{p}.MetricStat.Metric.Dimensions.member.{j}.Name"):
             dims[get(f"{p}.MetricStat.Metric.Dimensions.member.{j}.Name")] = get(f"{p}.MetricStat.Metric.Dimensions.member.{j}.Value")
             j += 1
+        namespace, stat = get(f"{p}.MetricStat.Metric.Namespace"), get(f"{p}.MetricStat.Stat")
         times = list(range(int(start) // period * period, int(end), period))[-1440:]
-        stamps = "".join(f"<member>{cw_iso(t)}</member>" for t in times)
-        scale = {"p95": 1.7, "p99": 2.4, "Maximum": 2.6}.get(get(f"{p}.MetricStat.Stat"), 1.0) if name == "Duration" else 1.0
-        values = "".join(f"<member>{round(cw_metric_value(name, dims, t) * scale, 2)}</member>" for t in times)
+        scale = {"p95": 1.7, "p99": 2.4, "Maximum": 2.6}.get(stat, 1.0) if name == "Duration" else 1.0
+        points = []
+        for t in times:
+            v = next((r for r in (h(namespace, name, dims, stat, period, t) for h in CW_METRIC_HOOKS) if r is not None), None)
+            if v is None:
+                v = cw_metric_value(name, dims, t) * scale
+            if v is not CW_NO_DATA:
+                points.append((t, round(v, 2)))
+        stamps = "".join(f"<member>{cw_iso(t)}</member>" for t, _ in points)
+        values = "".join(f"<member>{v}</member>" for _, v in points)
         results.append(f"<member><Timestamps>{stamps}</Timestamps><Values>{values}</Values><Label>{name}</Label>"
                        f"<Id>{get(p + '.Id')}</Id><StatusCode>Complete</StatusCode></member>")
         i += 1
