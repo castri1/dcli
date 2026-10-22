@@ -1,6 +1,7 @@
 //! Interactive terminal UI.
 
 mod app;
+pub mod canvas;
 pub mod chart;
 pub mod form;
 pub mod logview;
