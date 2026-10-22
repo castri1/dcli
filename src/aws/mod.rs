@@ -144,7 +144,36 @@ impl Aws {
         query: &[(String, String)],
         body: Option<&Value>,
     ) -> Result<T> {
+        self.rest_with(svc, method, segments, query, body, true)
+    }
+
+    /// Like [`Aws::rest`] for a request that must not run twice (testing an API Gateway
+    /// method runs its integration): sent again only when AWS throttled it.
+    pub fn rest_once<T: DeserializeOwned>(
+        &self,
+        svc: &Service,
+        method: &str,
+        segments: &[&str],
+        query: &[(String, String)],
+        body: Option<&Value>,
+    ) -> Result<T> {
+        self.rest_with(svc, method, segments, query, body, false)
+    }
+
+    fn rest_with<T: DeserializeOwned>(
+        &self,
+        svc: &Service,
+        method: &str,
+        segments: &[&str],
+        query: &[(String, String)],
+        body: Option<&Value>,
+        idempotent: bool,
+    ) -> Result<T> {
         let mut headers = Vec::new();
+        // API Gateway answers in HAL (`_embedded`, `_links`) unless asked for plain JSON, as the SDKs do.
+        if svc.signing_name == "apigateway" {
+            headers.push(("accept".to_string(), "application/json".to_string()));
+        }
         let payload = match body {
             Some(b) => {
                 headers.push(("content-type".to_string(), "application/json".to_string()));
@@ -152,7 +181,7 @@ impl Aws {
             }
             None => Vec::new(),
         };
-        let resp = self.send(svc, method, segments, query, headers, payload)?;
+        let resp = self.send_with(svc, method, segments, query, headers, payload, idempotent)?;
         parse(&resp.body)
     }
 

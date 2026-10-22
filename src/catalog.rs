@@ -77,8 +77,9 @@ fn functions(aws: &Aws) -> aws::Result<Vec<Resource>> {
 }
 
 /// API Gateway APIs (REST, HTTP and WebSocket); the target is the API id.
-fn apis(_aws: &Aws) -> aws::Result<Vec<Resource>> {
-    Ok(Vec::new())
+fn apis(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    let list = crate::aws::apigateway::list_apis(aws)?;
+    Ok(list.iter().map(|a| Resource::new("API Gateway", &a.name, a.id.clone(), a.kind.label())).collect())
 }
 
 fn log_groups(aws: &Aws) -> aws::Result<Vec<Resource>> {
