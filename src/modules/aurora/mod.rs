@@ -1,9 +1,14 @@
 //! Aurora: clusters with their health; a cluster's topology (its endpoints and the nodes each
 //! one serves, the nodes by zone with live CPU, connections and replica lag), each node's
 //! metrics, its database load (top SQL and wait events, from Performance Insights), the
-//! cluster's events and pending maintenance, and its configuration. Read-only: nothing here
-//! changes a cluster. Copies endpoints and ready connection commands, and writes a
-//! performance diagnosis for an AI agent.
+//! cluster's events and pending maintenance, and its configuration. Copies endpoints and
+//! ready connection commands, and writes a performance diagnosis for an AI agent.
+//!
+//! Changes, each explained and confirmed first (the environment's name typed in
+//! production): fail over (to the selected reader), reboot a node, stop and start the
+//! cluster, change a node's class (or a Serverless v2 cluster's ACU range), take a manual
+//! snapshot. The cluster is then read again until it settles, so the change shows as it
+//! happens.
 
 mod topology;
 mod views;
@@ -21,11 +26,14 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use super::common::{LoadState, filter_bar, matches_filter};
 use crate::aws::lambda::Range;
 use crate::aws::pi;
-use crate::aws::rds::{self, Cluster, Endpoint, Event, Instance, Inventory, Maintenance, Metrics};
+use crate::aws::rds::{self, Action, Cluster, Endpoint, Event, Instance, Inventory, Maintenance, Metrics};
 use crate::aws;
+use crate::config::is_production;
 use crate::tui::chart::{Agg, columns, fmt_ms, sparkline_to};
+use crate::tui::form::{Field, Form, FormEvent};
 use crate::tui::logview::{LogKey, LogView};
 use crate::tui::module::{Ctx, Handled, Level, Module, Payload, View};
+use crate::tui::picker::{Item, Outcome, Picker};
 use crate::tui::theme;
 use crate::tui::widgets::{self, InputEvent, TextInput};
 use crate::util::{ellipsize, now_secs};
@@ -36,7 +44,9 @@ const PULSE_EVERY: Duration = Duration::from_secs(60);
 /// Clusters are listed again after this when the module is opened again.
 const LIST_FRESH: Duration = Duration::from_secs(300);
 /// …and this often while a cluster or instance is changing (modifying, rebooting…).
-const CHANGING_EVERY: Duration = Duration::from_secs(20);
+const CHANGING_EVERY: Duration = Duration::from_secs(10);
+/// After a change, how long the list is read again even before AWS shows it under way.
+const WATCH_AFTER_CHANGE: Duration = Duration::from_secs(90);
 /// Metrics and Performance Insights older than this are read again when shown.
 const DATA_FRESH: Duration = Duration::from_secs(120);
 const EVENTS_FRESH: Duration = Duration::from_secs(300);
@@ -66,6 +76,19 @@ impl Tab {
     }
 }
 
+/// A change being prepared or confirmed.
+enum Dialog {
+    /// Reading the classes AWS offers for the instance.
+    Classes { instance: String },
+    /// Choosing a class: the picker, the instance, the classes by item.
+    Class(Picker, String, Vec<String>),
+    /// What a change does, with its confirmation; the form holds what can still be edited
+    /// (a snapshot's name, an ACU range, when a class change applies).
+    Confirm { action: Action, form: Form, busy: bool },
+}
+
+const APPLY: [&str; 2] = ["now", "in the maintenance window"];
+
 enum Msg {
     Inventory(aws::Result<Inventory>),
     Pulse(aws::Result<Metrics>),
@@ -74,6 +97,8 @@ enum Msg {
     Events(aws::Result<Vec<Event>>),
     Maintenance(aws::Result<Vec<Maintenance>>),
     Report { cluster: String, result: aws::Result<String> },
+    Classes { instance: String, result: aws::Result<Vec<String>> },
+    Applied { action: Action, result: aws::Result<()> },
 }
 
 pub struct Aurora {
@@ -112,6 +137,9 @@ pub struct Aurora {
     list_area: Rect,
     /// Where the topology's boxes are on screen, for clicks.
     hits: Vec<(Rect, usize)>,
+    dialog: Option<Dialog>,
+    /// Until when the list is read again after a change, as if something were changing.
+    watch_until: Option<Instant>,
 }
 
 fn copy(ctx: &mut Ctx, label: &str, text: &str, what: &str) {
@@ -154,6 +182,8 @@ impl Aurora {
             profile: String::new(),
             list_area: Rect::default(),
             hits: Vec::new(),
+            dialog: None,
+            watch_until: None,
         }
     }
 
@@ -426,6 +456,224 @@ impl Aurora {
         self.zoom = Some((format!("{node} · statement {}", n + 1), view));
     }
 
+    // ---- changes -----------------------------------------------------------------------------
+
+    /// The cluster a cluster change is about: the one open, or the one under the list's cursor.
+    fn target_cluster(&self) -> Option<Cluster> {
+        if self.open.is_some() { self.cluster() } else { self.list_cluster() }.cloned()
+    }
+
+    /// The node a node change is about: the node selected in the topology (not an endpoint),
+    /// or the node the other tabs show.
+    fn target_node(&self, ctx: &mut Ctx) -> Option<Instance> {
+        if self.open.is_none() {
+            ctx.toast(Level::Info, "Open the cluster and select a node first");
+            return None;
+        }
+        if self.tab == Tab::Topology && self.pick < self.endpoints().len() {
+            ctx.toast(Level::Info, "Select a node (↑↓) first");
+            return None;
+        }
+        self.node().cloned()
+    }
+
+    fn start_failover(&mut self, ctx: &mut Ctx) {
+        let Some(c) = self.target_cluster() else { return };
+        // The reader selected in the topology becomes the writer; otherwise AWS picks one.
+        let to = (self.open.is_some() && self.tab == Tab::Topology && self.pick >= self.endpoints().len())
+            .then(|| self.node().filter(|n| !n.writer).map(|n| n.id.clone()))
+            .flatten();
+        self.ask(Action::Failover { cluster: c.id, to }, ctx);
+    }
+
+    fn start_reboot(&mut self, ctx: &mut Ctx) {
+        if let Some(node) = self.target_node(ctx) {
+            self.ask(Action::Reboot { instance: node.id }, ctx);
+        }
+    }
+
+    fn start_stop(&mut self, ctx: &mut Ctx) {
+        let Some(c) = self.target_cluster() else { return };
+        let action = if c.status == "stopped" { Action::Start { cluster: c.id } } else { Action::Stop { cluster: c.id } };
+        self.ask(action, ctx);
+    }
+
+    fn start_snapshot(&mut self, ctx: &mut Ctx) {
+        let Some(c) = self.target_cluster() else { return };
+        let id = rds::snapshot_name(&c.id, now_secs());
+        self.ask(Action::Snapshot { cluster: c.id, id }, ctx);
+    }
+
+    /// A Serverless v2 node changes its cluster's ACU range; any other, its class (picked
+    /// among those AWS offers for its engine version).
+    fn start_resize(&mut self, ctx: &mut Ctx) {
+        let Some(node) = self.target_node(ctx) else { return };
+        if node.serverless() {
+            let Some(c) = self.cluster().cloned() else { return };
+            let range = c.serverless.clone().unwrap_or(rds::Capacity { min: 0.5, max: 16.0 });
+            return self.ask(Action::SetCapacity { cluster: c.id, min: range.min, max: range.max }, ctx);
+        }
+        if !self.in_flight.insert(format!("classes {}", node.id)) {
+            return;
+        }
+        self.dialog = Some(Dialog::Classes { instance: node.id.clone() });
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || Msg::Classes { result: rds::orderable_classes(&aws, &node.engine, &node.engine_version), instance: node.id });
+    }
+
+    fn on_classes(&mut self, instance: String, result: aws::Result<Vec<String>>, ctx: &mut Ctx) {
+        self.in_flight.remove(&format!("classes {instance}"));
+        if !matches!(&self.dialog, Some(Dialog::Classes { instance: i }) if *i == instance) {
+            return;
+        }
+        let Some(node) = self.inventory.instances.iter().find(|i| i.id == instance).cloned() else {
+            self.dialog = None;
+            return;
+        };
+        let has_range = self.inventory.cluster(&node.cluster).is_some_and(|c| c.serverless.is_some());
+        let classes: Vec<String> = match result {
+            Ok(classes) => classes.into_iter().filter(|c| c != "db.serverless" || has_range).collect(),
+            Err(e) => {
+                self.dialog = None;
+                return ctx.toast(Level::Error, format!("Could not read the classes AWS offers: {}", e.short()));
+            }
+        };
+        if classes.is_empty() {
+            self.dialog = None;
+            return ctx.toast(Level::Warn, format!("AWS offers no class for {} {}", node.engine, node.engine_version));
+        }
+        let items = classes
+            .iter()
+            .map(|c| {
+                let mut detail = rds::class_detail(c);
+                if node.pending_class.as_deref() == Some(c.as_str()) {
+                    detail.push_str(" · pending");
+                }
+                Item::new(c.as_str(), detail).current(*c == node.class)
+            })
+            .collect();
+        let cursor = classes.iter().position(|c| *c == node.class).unwrap_or(0);
+        let title = format!("New class for {} (now {})", node.id, node.class);
+        self.dialog = Some(Dialog::Class(Picker::new(title, "choose", items, false).with_cursor(cursor), instance, classes));
+    }
+
+    /// Explains `action` and asks for it, unless the cluster cannot take it as it is now.
+    fn ask(&mut self, action: Action, ctx: &mut Ctx) {
+        let Some(cluster) = action.cluster(&self.inventory.instances).map(str::to_string) else { return };
+        let Some(c) = self.inventory.cluster(&cluster).cloned() else { return };
+        let instances = self.inventory.instances_of(&cluster);
+        // What the form then edits (a name, a range) is checked again on submit.
+        if let Some(why) = rds::refusal(&action, &c, &instances) {
+            self.dialog = None;
+            return ctx.toast(Level::Warn, why);
+        }
+        let form = action_form(&action, &c, &instances, &self.env_name);
+        self.dialog = Some(Dialog::Confirm { action, form, busy: false });
+    }
+
+    fn submit_change(&mut self, ctx: &mut Ctx) {
+        let Some(Dialog::Confirm { action, form, busy }) = &mut self.dialog else { return };
+        let action = match with_form(action, form) {
+            Ok(a) => a,
+            Err(e) => return form.fail(e),
+        };
+        let Some(c) = action.cluster(&self.inventory.instances).and_then(|id| self.inventory.cluster(id)) else { return };
+        if let Some(why) = rds::refusal(&action, c, &self.inventory.instances_of(&c.id)) {
+            return form.fail(why);
+        }
+        *busy = true;
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || Msg::Applied { result: rds::apply(&aws, &action), action });
+    }
+
+    fn on_applied(&mut self, action: Action, result: aws::Result<()>, ctx: &mut Ctx) {
+        match result {
+            Ok(()) => {
+                self.dialog = None;
+                ctx.toast(Level::Success, action.accepted());
+                self.watch_until = Some(Instant::now() + WATCH_AFTER_CHANGE);
+                // The change shows in the events too.
+                self.events = None;
+                self.load_inventory(ctx);
+                self.fetch_tab(ctx, true);
+            }
+            Err(e) => match &mut self.dialog {
+                Some(Dialog::Confirm { form, busy, .. }) => {
+                    *busy = false;
+                    form.fail(e.short());
+                }
+                _ => ctx.toast(Level::Error, e.short()),
+            },
+        }
+    }
+
+    fn dialog_key(&mut self, key: KeyEvent, ctx: &mut Ctx) {
+        let Some(dialog) = &mut self.dialog else { return };
+        match dialog {
+            Dialog::Classes { .. } => {
+                if key.code == KeyCode::Esc {
+                    self.dialog = None;
+                }
+            }
+            Dialog::Class(picker, instance, classes) => match picker.handle(key) {
+                Outcome::Pending => {}
+                Outcome::Cancel => self.dialog = None,
+                Outcome::Done(chosen) => {
+                    let Some(class) = chosen.first().and_then(|&i| classes.get(i)).cloned() else { return };
+                    let instance = instance.clone();
+                    // A writer restarting stops writes: the maintenance window is offered first.
+                    let writer = self.inventory.instances.iter().any(|i| i.id == instance && i.writer);
+                    self.ask(Action::SetClass { instance, class, now: !writer }, ctx);
+                }
+            },
+            Dialog::Confirm { busy: true, .. } => {}
+            Dialog::Confirm { action, form, .. } => match form.handle(key) {
+                FormEvent::Submit => self.submit_change(ctx),
+                FormEvent::Cancel => self.dialog = None,
+                FormEvent::Pending => {
+                    // What a class change does depends on when it applies.
+                    if let (Action::SetClass { .. }, Ok(edited)) = (&*action, with_form(action, form)) {
+                        let cluster = edited.cluster(&self.inventory.instances).and_then(|id| self.inventory.cluster(id));
+                        if let Some(c) = cluster {
+                            form.note = Some(rds::explain(&edited, c, &self.inventory.instances_of(&c.id)));
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    fn render_dialog(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        let color = if is_production(&self.env_name) { theme::ERR } else { theme::ACCENT };
+        match &mut self.dialog {
+            None => {}
+            Some(Dialog::Classes { instance }) => {
+                let body = Text::from(vec![
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled(format!("{} ", theme::spinner(view.tick)), theme::accent()),
+                        Span::raw(format!("Reading the classes AWS offers for {instance}…")),
+                    ]),
+                ]);
+                widgets::popup(f, widgets::popup_area(area, 64, 5), "Instance class", theme::ACCENT, body);
+            }
+            Some(Dialog::Class(picker, ..)) => {
+                let rect = widgets::popup_area(area, 76, picker.height(area.height.saturating_sub(4)));
+                picker.render(f, rect, color);
+            }
+            Some(Dialog::Confirm { form, busy, .. }) => {
+                form.render(f, area, color);
+                if *busy {
+                    let body = Text::from(vec![
+                        Line::raw(""),
+                        Line::from(vec![Span::styled(format!("{} ", theme::spinner(view.tick)), theme::accent()), Span::raw("Asking AWS…")]),
+                    ]);
+                    widgets::popup(f, widgets::popup_area(area, 34, 5), "Aurora", theme::ACCENT, body);
+                }
+            }
+        }
+    }
+
     // ---- rendering ---------------------------------------------------------------------------
 
     fn cluster_health(&self, c: &Cluster) -> rds::Health {
@@ -670,6 +918,82 @@ impl Aurora {
     }
 }
 
+/// The confirmation of `action`: what it is about, what can still be edited, what it does,
+/// and the environment's name to type in production.
+fn action_form(action: &Action, c: &Cluster, instances: &[&Instance], env: &str) -> Form {
+    let node = |id: &str| {
+        instances.iter().find(|i| i.id == id).map(|i| format!("{} · {} · {}", i.id, i.role(), i.class)).unwrap_or_else(|| id.to_string())
+    };
+    let cluster = Field::fixed("Cluster", format!("{} · {} · {}", c.id, c.engine_label(), c.status));
+    let (title, fields, submit) = match action {
+        Action::Failover { to, .. } => (
+            action.title(),
+            vec![
+                cluster,
+                Field::fixed("Writer now", c.writer().map(node).unwrap_or_else(|| "none".into())),
+                Field::fixed("New writer", to.as_deref().map(node).unwrap_or_else(|| "the reader AWS picks by promotion tier".into())),
+            ],
+            "fail over",
+        ),
+        Action::Reboot { instance } => (action.title(), vec![Field::fixed("Instance", node(instance)), cluster], "reboot"),
+        Action::Stop { .. } | Action::Start { .. } => {
+            let names: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
+            let submit = if matches!(action, Action::Stop { .. }) { "stop" } else { "start" };
+            (action.title(), vec![cluster, Field::fixed("Instances", names.join(", "))], submit)
+        }
+        Action::SetClass { instance, class, now } => (
+            format!("Change the class of {instance}"),
+            vec![
+                Field::fixed("Instance", node(instance)),
+                Field::fixed("New class", format!("{class} · {}", rds::class_detail(class))),
+                Field::choice("Apply", &APPLY, if *now { APPLY[0] } else { APPLY[1] }),
+            ],
+            "change",
+        ),
+        Action::SetCapacity { min, max, .. } => (
+            format!("Serverless v2 range of {}", c.id),
+            vec![cluster, Field::text("Minimum ACU", rds::fmt_acu(*min)), Field::text("Maximum ACU", rds::fmt_acu(*max))],
+            "change",
+        ),
+        Action::Snapshot { id, .. } => (format!("Snapshot {}", c.id), vec![cluster, Field::text("Name", id.clone())], "create"),
+    };
+    let mut form = Form::new(title, fields).submit_label(submit).enter_submits();
+    form.note = Some(rds::explain(action, c, instances));
+    if is_production(env) {
+        form = form.confirm_with(env);
+        if matches!(action, Action::Failover { .. } | Action::Reboot { .. } | Action::Stop { .. } | Action::Start { .. }) {
+            // Nothing to edit: straight to typing the environment's name.
+            form.handle(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+    }
+    form
+}
+
+/// `action` with what its form edits: a class change's timing, an ACU range, a snapshot's
+/// name.
+fn with_form(action: &Action, form: &Form) -> Result<Action, String> {
+    Ok(match action {
+        Action::SetClass { instance, class, .. } => {
+            Action::SetClass { instance: instance.clone(), class: class.clone(), now: form.get("Apply") == APPLY[0] }
+        }
+        Action::SetCapacity { cluster, .. } => {
+            let number = |label: &str| {
+                let text = form.get(label).trim();
+                text.parse::<f64>().map_err(|_| format!("{label}: '{text}' is not a number"))
+            };
+            let (min, max) = (number("Minimum ACU")?, number("Maximum ACU")?);
+            rds::check_acu(min, max)?;
+            Action::SetCapacity { cluster: cluster.clone(), min, max }
+        }
+        Action::Snapshot { cluster, .. } => {
+            let id = form.get("Name").trim().to_string();
+            rds::check_snapshot_name(&id)?;
+            Action::Snapshot { cluster: cluster.clone(), id }
+        }
+        other => other.clone(),
+    })
+}
+
 impl Module for Aurora {
     fn title(&self) -> &'static str {
         "Aurora"
@@ -707,6 +1031,10 @@ impl Module for Aurora {
     }
 
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Handled {
+        if self.dialog.is_some() {
+            self.dialog_key(key, ctx);
+            return Handled::Yes;
+        }
         if let Some((_, view)) = &mut self.zoom {
             if let LogKey::Copy = view.key(key) {
                 let text = view.lines().join("\n");
@@ -758,6 +1086,26 @@ impl Module for Aurora {
                 self.load_inventory(ctx);
                 self.fetch_pulse(ctx);
                 self.fetch_tab(ctx, true);
+                return Handled::Yes;
+            }
+            KeyCode::Char('f') => {
+                self.start_failover(ctx);
+                return Handled::Yes;
+            }
+            KeyCode::Char('x') => {
+                self.start_stop(ctx);
+                return Handled::Yes;
+            }
+            KeyCode::Char('S') => {
+                self.start_snapshot(ctx);
+                return Handled::Yes;
+            }
+            KeyCode::Char('b') => {
+                self.start_reboot(ctx);
+                return Handled::Yes;
+            }
+            KeyCode::Char('M') => {
+                self.start_resize(ctx);
                 return Handled::Yes;
             }
             _ => {}
@@ -873,11 +1221,21 @@ impl Module for Aurora {
                 self.in_flight.remove("inventory");
                 match result {
                     Ok(inventory) => {
+                        // The selected node stays selected when the order changes (a failover
+                        // moves the new writer first).
+                        let kept = self.node().map(|n| n.id.clone());
+                        let on_node = self.pick >= self.endpoints().len();
                         self.inventory = inventory;
                         self.load = LoadState::Loaded;
                         self.refilter();
                         if self.open.as_deref().is_some_and(|id| self.inventory.cluster(id).is_none()) {
                             self.open = None;
+                        }
+                        if let Some(at) = kept.and_then(|id| self.instances().iter().position(|i| i.id == id)) {
+                            self.node = at;
+                            if on_node {
+                                self.pick = self.endpoints().len() + at;
+                            }
                         }
                         let items = self.endpoints().len() + self.instances().len();
                         self.pick = self.pick.min(items.saturating_sub(1));
@@ -923,6 +1281,8 @@ impl Module for Aurora {
                     Err(e) => ctx.toast(Level::Error, format!("Could not write the diagnosis: {}", e.short())),
                 }
             }
+            Msg::Classes { instance, result } => self.on_classes(instance, result, ctx),
+            Msg::Applied { action, result } => self.on_applied(action, result, ctx),
         }
     }
 
@@ -934,9 +1294,10 @@ impl Module for Aurora {
             self.fetch_pulse(ctx);
         }
         let changing = self.inventory.clusters.iter().map(|c| &c.status).chain(self.inventory.instances.iter().map(|i| &i.status)).any(|s| {
-            matches!(rds::status_health(s), rds::Health::Changing)
+            matches!(rds::status_health(s), rds::Health::Changing) || s == "stopping"
         });
-        if changing && self.loaded_at.elapsed() >= CHANGING_EVERY {
+        let watching = self.watch_until.is_some_and(|t| Instant::now() < t);
+        if (changing || watching) && self.loaded_at.elapsed() >= CHANGING_EVERY {
             self.load_inventory(ctx);
         }
     }
@@ -952,9 +1313,16 @@ impl Module for Aurora {
         } else {
             self.render_list(f, area, view);
         }
+        self.render_dialog(f, area, view);
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        match &self.dialog {
+            Some(Dialog::Classes { .. }) => return vec![("Esc", "cancel")],
+            Some(Dialog::Class(..)) => return vec![("↑↓", "class"), ("Enter", "choose"), ("Esc", "cancel")],
+            Some(Dialog::Confirm { .. }) => return vec![("Enter", "confirm"), ("Tab", "next field"), ("Esc", "cancel")],
+            None => {}
+        }
         if self.zoom.is_some() {
             return vec![("/", "search"), ("y", "copy"), ("Esc", "back")];
         }
@@ -968,6 +1336,9 @@ impl Module for Aurora {
                 ("y", "copy writer endpoint"),
                 ("Y", "copy connect command"),
                 ("c", "copy diagnosis for AI"),
+                ("f", "fail over"),
+                ("x", "stop / start"),
+                ("S", "snapshot"),
                 ("/", "search"),
                 ("o", "console"),
                 ("r", "reload"),
@@ -981,16 +1352,22 @@ impl Module for Aurora {
             Tab::Sql => hints.extend([("↑↓", "node"), ("Enter", "statements"), ("m", "range")]),
             Tab::Events | Tab::Config => hints.extend([("↑↓", "scroll")]),
         }
+        if self.tab == Tab::Topology && self.pick >= self.endpoints().len() && self.node().is_some_and(|n| !n.writer) {
+            hints.push(("f", "fail over to this reader"));
+        } else {
+            hints.push(("f", "fail over"));
+        }
+        hints.extend([("b", "reboot node"), ("M", "class / ACU"), ("x", "stop / start"), ("S", "snapshot")]);
         hints.extend([("c", "copy diagnosis for AI"), ("o", "console"), ("r", "reload"), ("Esc", "clusters")]);
         hints
     }
 
     fn animating(&self) -> bool {
-        matches!(self.load, LoadState::Loading) || !self.in_flight.is_empty()
+        matches!(self.load, LoadState::Loading) || !self.in_flight.is_empty() || matches!(self.dialog, Some(Dialog::Confirm { busy: true, .. }))
     }
 
     fn capturing(&self) -> bool {
-        self.filtering || self.zoom.is_some()
+        self.filtering || self.zoom.is_some() || self.dialog.is_some()
     }
 
     fn wants_mouse(&self) -> bool {
@@ -998,9 +1375,72 @@ impl Module for Aurora {
     }
 
     fn paste(&mut self, text: &str, _ctx: &mut Ctx) {
+        match &mut self.dialog {
+            Some(Dialog::Confirm { form, busy: false, .. }) => return form.paste(text),
+            Some(Dialog::Class(picker, ..)) => return picker.paste(text),
+            _ => {}
+        }
         if self.filtering {
             self.filter.insert_str(text, false);
             self.refilter();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cluster() -> Cluster {
+        Cluster {
+            id: "c".into(),
+            status: "available".into(),
+            engine: "aurora-postgresql".into(),
+            engine_version: "16.4".into(),
+            serverless: Some(rds::Capacity { min: 4.0, max: 16.0 }),
+            ..Default::default()
+        }
+    }
+
+    fn press(form: &mut Form, code: KeyCode) -> FormEvent {
+        form.handle(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn forms_read_what_they_edit() {
+        let c = cluster();
+        let acu = Action::SetCapacity { cluster: "c".into(), min: 4.0, max: 16.0 };
+        let mut form = action_form(&acu, &c, &[], "dev");
+        form.field_mut("Minimum ACU").unwrap().input = TextInput::with_value("1");
+        assert_eq!(with_form(&acu, &form), Ok(Action::SetCapacity { cluster: "c".into(), min: 1.0, max: 16.0 }));
+        form.field_mut("Maximum ACU").unwrap().input = TextInput::with_value("lots");
+        assert!(with_form(&acu, &form).unwrap_err().contains("not a number"));
+
+        let snapshot = Action::Snapshot { cluster: "c".into(), id: "c-2026-10-22-1730".into() };
+        let mut form = action_form(&snapshot, &c, &[], "dev");
+        assert_eq!(with_form(&snapshot, &form), Ok(snapshot.clone()));
+        form.field_mut("Name").unwrap().input = TextInput::with_value("before upgrade");
+        assert!(with_form(&snapshot, &form).is_err());
+
+        let node = Instance { id: "r".into(), cluster: "c".into(), class: "db.r6g.large".into(), status: "available".into(), ..Default::default() };
+        let class = Action::SetClass { instance: "r".into(), class: "db.r7g.large".into(), now: true };
+        let mut form = action_form(&class, &c, &[&node], "dev");
+        assert_eq!(form.focused_label(), Some("Apply"));
+        press(&mut form, KeyCode::Right);
+        assert_eq!(with_form(&class, &form), Ok(Action::SetClass { instance: "r".into(), class: "db.r7g.large".into(), now: false }));
+    }
+
+    #[test]
+    fn production_asks_for_its_name_first() {
+        let c = cluster();
+        let stop = Action::Stop { cluster: "c".into() };
+        let mut dev = action_form(&stop, &c, &[], "dev");
+        assert!(matches!(press(&mut dev, KeyCode::Enter), FormEvent::Submit));
+        let mut prod = action_form(&stop, &c, &[], "prod");
+        assert!(matches!(press(&mut prod, KeyCode::Enter), FormEvent::Pending));
+        for ch in "prod".chars() {
+            press(&mut prod, KeyCode::Char(ch));
+        }
+        assert!(matches!(press(&mut prod, KeyCode::Enter), FormEvent::Submit));
     }
 }
