@@ -290,15 +290,15 @@ impl Estimate {
 
 /// What analysing the memory of `functions` (every function when `None`) would scan.
 pub fn memory_estimate(aws: &Aws, functions: Option<Vec<FunctionConfiguration>>, days: u32) -> aws::Result<Estimate> {
-    let functions = match functions {
-        Some(list) => list,
-        None => all_functions(aws)?,
-    };
+    // A log group is shared when any function of the account writes to it, not only one of
+    // those analysed: one function's own analysis would otherwise count every writer's lines.
+    let all = all_functions(aws)?;
     let mut writers: HashMap<String, usize> = HashMap::new();
-    for f in &functions {
+    for f in &all {
         *writers.entry(f.log_group()).or_default() += 1;
     }
-    let (functions, shared): (Vec<_>, Vec<_>) = functions.into_iter().partition(|f| writers.get(&f.log_group()) == Some(&1));
+    let functions = functions.unwrap_or(all);
+    let (functions, shared): (Vec<_>, Vec<_>) = functions.into_iter().partition(|f| writers.get(&f.log_group()).is_none_or(|n| *n <= 1));
     let queries: Vec<_> = functions
         .iter()
         .enumerate()

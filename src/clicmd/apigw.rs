@@ -470,6 +470,9 @@ fn metrics(aws: &Aws, api: &Api, args: &Args, range: Range) -> Result<ExitCode> 
 fn test(aws: &Aws, env: &str, api: &Api, request: &str, args: &Args) -> Result<ExitCode> {
     let (method, path) = request.trim().split_once(' ').ok_or_else(|| anyhow!("--test takes 'METHOD /path', like 'GET /orders/42'"))?;
     let (method, path) = (method.to_uppercase(), path.trim().to_string());
+    if !path.starts_with('/') {
+        bail!("the path starts with '/': --test '{method} /orders/42'");
+    }
     let (path, query) = match path.split_once('?') {
         Some((p, q)) => (p.to_string(), args.query.clone().unwrap_or_else(|| q.to_string())),
         None => (path, args.query.clone().unwrap_or_default()),
@@ -493,7 +496,7 @@ fn test(aws: &Aws, env: &str, api: &Api, request: &str, args: &Args) -> Result<E
             let question = format!(
                 "Test {} on {} {}? The integration runs for real (the authorizer is skipped).",
                 route.key(),
-                api.name,
+                api.title(),
                 stage.name
             );
             if !confirm(env, &stage.name, &question, args.yes)? {
@@ -502,8 +505,8 @@ fn test(aws: &Aws, env: &str, api: &Api, request: &str, args: &Args) -> Result<E
             apigw::test_invoke(aws, api, route, &req, &stage.variables)?
         }
         Kind::Http => {
-            let url = format!("{}{}", api.invoke_url(&stage.name, &aws.region), req.path_and_query());
-            if !confirm(env, &stage.name, &format!("Send {method} {url}? It is a real request."), args.yes)? {
+            let url = apigw::test_url(api, &stage.name, &aws.region, &req)?;
+            if !confirm(env, &stage.name, &format!("Send {method} {url} ({})? It is a real request.", api.title()), args.yes)? {
                 bail!("not sent");
             }
             apigw::call(&method, &url, &req.headers, &req.body)?
@@ -514,7 +517,13 @@ fn test(aws: &Aws, env: &str, api: &Api, request: &str, args: &Args) -> Result<E
             "status": result.status,
             "latencyMs": result.latency_ms,
             "headers": result.headers.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<String, Value>>(),
-            "body": serde_json::from_str::<Value>(&result.body).unwrap_or(Value::String(result.body.clone())),
+            "body": serde_json::from_str::<Value>(&result.body)
+                .map(|mut v| {
+                    // Decoded escapes would bring back what the body was sanitized of.
+                    crate::util::sanitize_json(&mut v);
+                    v
+                })
+                .unwrap_or(Value::String(result.body.clone())),
             "truncated": result.truncated,
             "log": result.log,
         }));
@@ -533,7 +542,7 @@ fn redeploy(aws: &Aws, env: &str, api: &Api, stage: &str, args: &Args) -> Result
         bail!("{} deploys by itself on every change (auto-deploy): nothing to redeploy", s.name);
     }
     let now = detail.deployment(s.deployment_id.as_deref()).map(describe).unwrap_or_else(|| "no deployment".into());
-    let question = format!("Deploy {} as it is now to {} (it runs {now})?", api.name, s.name);
+    let question = format!("Deploy {} as it is now to {} (it runs {now})?", api.title(), s.name);
     if !confirm(env, &s.name, &question, args.yes)? {
         bail!("not deployed");
     }
@@ -557,7 +566,7 @@ fn rollback(aws: &Aws, env: &str, api: &Api, stage: &str, args: &Args) -> Result
         return Ok(ExitCode::SUCCESS);
     }
     let now = detail.deployment(s.deployment_id.as_deref()).map(describe).unwrap_or_else(|| "no deployment".into());
-    let question = format!("Point {} {} from {now} back to {}?", api.name, s.name, describe(target));
+    let question = format!("Point {} {} from {now} back to {}?", api.title(), s.name, describe(target));
     if !confirm(env, &s.name, &question, args.yes)? {
         bail!("not changed");
     }
@@ -580,7 +589,7 @@ fn promote(aws: &Aws, env: &str, api: &Api, from: &str, to: &str, yes: bool) -> 
     }
     let what = detail.deployment(Some(&id)).map(describe).unwrap_or_else(|| id.clone());
     let now = detail.deployment(target.deployment_id.as_deref()).map(describe).unwrap_or_else(|| "no deployment".into());
-    let question = format!("Point {} {} from {now} to {what}, the deployment {} runs?", api.name, target.name, source.name);
+    let question = format!("Point {} {} from {now} to {what}, the deployment {} runs?", api.title(), target.name, source.name);
     if !confirm(env, &target.name, &question, yes)? {
         bail!("not changed");
     }

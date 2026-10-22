@@ -475,13 +475,23 @@ pub fn pretty_json(s: &str) -> Option<String> {
     if !(t.starts_with('{') || t.starts_with('[')) {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let mut v: serde_json::Value = serde_json::from_str(s).ok()?;
+    // Decoding turns escapes like `\u009b` or `\u202e` back into the characters the text was
+    // sanitized of; serializing again would write them out raw.
+    sanitize_json(&mut v);
     serde_json::to_string_pretty(&v).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pretty_json_does_not_decode_unsafe_characters() {
+        let text = pretty_json(r#"{"note":"a\u009b2Jb\u202ec","k\u001b[31m":1}"#).unwrap();
+        assert!(!text.chars().any(is_unsafe), "{text:?}");
+        assert!(text.contains("\"note\": \"a2Jbc\""), "{text}");
+    }
 
     #[test]
     fn markdown_from_logs_cannot_break_out() {

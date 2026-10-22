@@ -120,5 +120,10 @@ pub fn load(aws: &Aws, resource: &str, start: f64, end: f64, period: u32) -> Res
 
 /// How to turn Performance Insights on for an instance (dcli does not change it).
 pub fn how_to_enable(instance: &str, region: &str) -> String {
-    format!("aws rds modify-db-instance --db-instance-identifier {instance} --enable-performance-insights --region {region}")
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    format!(
+        "aws rds modify-db-instance --db-instance-identifier {} --enable-performance-insights --region {}",
+        quote(instance),
+        quote(region)
+    )
 }

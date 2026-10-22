@@ -38,6 +38,23 @@ pub fn agent() -> &'static Agent {
     })
 }
 
+/// For requests to addresses that are not AWS (testing an HTTP API route): redirects are
+/// returned as they are, never followed, so headers the user typed (API keys, tokens) cannot
+/// be sent on to another host.
+pub fn agent_without_redirects() -> &'static Agent {
+    static AGENT: OnceLock<Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let config = Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_global(Some(Duration::from_secs(30)))
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .user_agent(concat!("dcli/", env!("CARGO_PKG_VERSION")))
+            .build();
+        Agent::new_with_config(config)
+    })
+}
+
 pub fn send(method: &str, url: &str, headers: &[(String, String)], body: Vec<u8>) -> Result<RawResponse> {
     let mut builder = ureq::http::Request::builder().method(method).uri(url);
     for (k, v) in headers {

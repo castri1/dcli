@@ -80,6 +80,12 @@ impl Api {
     }
 
     /// The base URL of `stage` on the default endpoint.
+    /// `public-api (REST API a1b2c3)`: says which API a confirmation is about, names being
+    /// shared at times.
+    pub fn title(&self) -> String {
+        format!("{} ({} {})", self.name, self.kind.label(), self.id)
+    }
+
     pub fn invoke_url(&self, stage: &str, region: &str) -> String {
         let base = self.endpoint(region);
         // An HTTP API's `$default` stage is served at the root.
@@ -247,19 +253,31 @@ pub fn list_v2_apis(aws: &Aws) -> Result<Vec<Api>> {
         .collect())
 }
 
-/// The API with this id or name.
+/// The API with this id or name. Both kinds must be listed: names are not unique (a REST API
+/// and the HTTP API replacing it can share one), and a name that fits several APIs is refused
+/// rather than guessed, since commands act on what this returns.
 pub fn find_api(aws: &Aws, id_or_name: &str) -> Result<Api> {
-    let apis = list_apis(aws)?;
-    let found = apis.iter().find(|a| a.id == id_or_name).or_else(|| apis.iter().find(|a| a.name == id_or_name));
-    match found {
-        Some(a) => Ok(a.clone()),
-        None => {
-            let same: Vec<&Api> = apis.iter().filter(|a| a.name.eq_ignore_ascii_case(id_or_name)).collect();
-            match same.as_slice() {
-                [one] => Ok((*one).clone()),
-                _ => Err(AwsError::Config(format!("no API named or with the id '{}'", sanitize(id_or_name)))),
-            }
-        }
+    let apis: Vec<Api> = list_rest_apis(aws)?.into_iter().chain(list_v2_apis(aws)?).collect();
+    pick_api(&apis, id_or_name).cloned()
+}
+
+fn pick_api<'a>(apis: &'a [Api], id_or_name: &str) -> Result<&'a Api> {
+    if let Some(a) = apis.iter().find(|a| a.id == id_or_name) {
+        return Ok(a);
+    }
+    let mut same: Vec<&Api> = apis.iter().filter(|a| a.name == id_or_name).collect();
+    if same.is_empty() {
+        same = apis.iter().filter(|a| a.name.eq_ignore_ascii_case(id_or_name)).collect();
+    }
+    match same.as_slice() {
+        [one] => Ok(one),
+        [] => Err(AwsError::Config(format!("no API named or with the id '{}'", sanitize(id_or_name)))),
+        many => Err(AwsError::Config(format!(
+            "{} APIs are named '{}': use the id ({})",
+            many.len(),
+            sanitize(id_or_name),
+            many.iter().map(|a| format!("{} {}", a.id, a.kind.label())).collect::<Vec<_>>().join(", ")
+        ))),
     }
 }
 
@@ -1334,6 +1352,22 @@ impl TestRequest {
     }
 }
 
+/// Where a test request to an HTTP API goes: the stage's URL followed by the typed path, which
+/// must start with `/` so that it cannot change the host (`.other.example/x`, `@host/`,
+/// `:8443/`).
+pub fn test_url(api: &Api, stage: &str, region: &str, req: &TestRequest) -> Result<String> {
+    if !req.path.starts_with('/') {
+        return Err(AwsError::Config(format!("the path starts with '/' (not {})", sanitize(&req.path))));
+    }
+    let base = api.invoke_url(stage, region);
+    let url = format!("{base}{}", req.path_and_query());
+    let host = |u: &str| u.split_once("://").map_or("", |(_, rest)| rest).split(['/', '?', '#']).next().unwrap_or("").to_string();
+    if host(&url) != host(&base) {
+        return Err(AwsError::Config(format!("{} is not on the API's host", sanitize(&url))));
+    }
+    Ok(url)
+}
+
 /// The route that serves `method` `path` (`GET /orders/42` → `GET /orders/{id}`): exact
 /// paths first, then the fewest parameters; `ANY` and HTTP APIs' `$default` last. A path
 /// written as the template itself (`/orders/{id}`) matches its route too.
@@ -1431,7 +1465,7 @@ pub fn call(method: &str, url: &str, headers: &[(String, String)], body: &str) -
     }
     let request = builder.body(body.as_bytes().to_vec()).map_err(|e| AwsError::Network(e.to_string()))?;
     let started = Instant::now();
-    let mut response = http::agent().run(request).map_err(|e| AwsError::Network(e.to_string()))?;
+    let mut response = http::agent_without_redirects().run(request).map_err(|e| AwsError::Network(e.to_string()))?;
     let status = response.status().as_u16();
     let mut headers: Vec<(String, String)> = response
         .headers()
@@ -1493,6 +1527,7 @@ pub fn shell_quote(text: &str) -> String {
 pub fn curl(api: &Api, stage: &str, route: &Route, region: &str) -> String {
     let url = format!("{}{}", api.invoke_url(stage, region), if route.path.starts_with('/') { route.path.as_str() } else { "" });
     let method = if route.method.is_empty() || route.method == "ANY" { "GET" } else { route.method.as_str() };
+    let method = if method.chars().all(|c| c.is_ascii_alphabetic()) { method.to_string() } else { shell_quote(method) };
     let mut cmd = format!("curl -i --globoff -X {method} {}", shell_quote(&url));
     match route.auth {
         Auth::Cognito | Auth::Jwt | Auth::Lambda => cmd.push_str(" -H 'Authorization: <token>'"),
@@ -1505,7 +1540,7 @@ pub fn curl(api: &Api, stage: &str, route: &Route, region: &str) -> String {
     if route.api_key_required {
         cmd.push_str(" -H 'x-api-key: <api key>'");
     }
-    if matches!(method, "POST" | "PUT" | "PATCH") {
+    if matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
         cmd.push_str(" -H 'Content-Type: application/json' -d '{}'");
     }
     cmd
@@ -1978,6 +2013,47 @@ mod tests {
         let mut names = vec!["prod", "qa", "zeta", "dev", "$default", "staging"];
         names.sort_by_key(|n| stage_rank(n));
         assert_eq!(names, ["$default", "dev", "qa", "staging", "prod", "zeta"]);
+    }
+
+    #[test]
+    fn shared_names_are_refused_and_tests_stay_on_the_api_host() {
+        let rest = Api {
+            id: "a1b2c3".into(),
+            name: "orders".into(),
+            kind: Kind::Rest,
+            description: None,
+            endpoint_type: "REGIONAL".into(),
+            created: None,
+            api_endpoint: None,
+            default_endpoint_disabled: false,
+            has_policy: false,
+        };
+        let http = Api {
+            id: "z9y8x7".into(),
+            kind: Kind::Http,
+            api_endpoint: Some("https://z9y8x7.execute-api.us-east-1.amazonaws.com".into()),
+            ..rest.clone()
+        };
+        let apis = [rest.clone(), http.clone()];
+        let err = pick_api(&apis, "orders").unwrap_err().short();
+        assert!(err.contains("2 APIs are named 'orders'") && err.contains("a1b2c3 REST API") && err.contains("z9y8x7 HTTP API"), "{err}");
+        assert_eq!(pick_api(&apis, "z9y8x7").unwrap().kind, Kind::Http);
+        assert_eq!(pick_api(&apis[..1], "ORDERS").unwrap().id, "a1b2c3");
+        assert!(pick_api(&apis, "billing").is_err());
+        assert_eq!(rest.title(), "orders (REST API a1b2c3)");
+
+        let req = |path: &str| TestRequest { path: path.into(), query: "a=1".into(), ..Default::default() };
+        assert_eq!(
+            test_url(&http, "$default", "us-east-1", &req("/orders/42")).unwrap(),
+            "https://z9y8x7.execute-api.us-east-1.amazonaws.com/orders/42?a=1"
+        );
+        assert_eq!(
+            test_url(&http, "$default", "us-east-1", &req("//other.example/x")).unwrap(),
+            "https://z9y8x7.execute-api.us-east-1.amazonaws.com//other.example/x?a=1"
+        );
+        for bad in [".other.example/x", "@other.example/x", ":8443/x", "orders"] {
+            assert!(test_url(&http, "$default", "us-east-1", &req(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

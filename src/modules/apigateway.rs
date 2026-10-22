@@ -606,8 +606,7 @@ impl ApiGateway {
                 Kind::Rest => apigw::test_invoke(&aws, &api, &route, &req, &stage.variables),
                 _ => {
                     let method = if route.method == "ANY" || route.method.is_empty() { "GET" } else { route.method.as_str() };
-                    let url = format!("{}{}", api.invoke_url(&stage.name, &region), req.path_and_query());
-                    apigw::call(method, &url, &req.headers, &req.body)
+                    apigw::test_url(&api, &stage.name, &region, &req).and_then(|url| apigw::call(method, &url, &req.headers, &req.body))
                 }
             };
             Msg::Tested { title, result: Box::new(result) }
@@ -642,7 +641,7 @@ impl ApiGateway {
         }
         let now = detail.deployment(stage.deployment_id.as_deref()).map(describe).unwrap_or_else(|| "no deployment".into());
         let mut form = Form::new(
-            format!("Redeploy · {} · {}", api.name, stage.name),
+            format!("Redeploy · {} · {}", api.title(), stage.name),
             vec![Field::fixed("Stage", stage.name.clone()), Field::fixed("Runs now", now), Field::text("Description", "").optional("what changed")],
         )
         .submit_label("deploy")
@@ -737,13 +736,13 @@ impl ApiGateway {
         let now = detail.deployment(s.deployment_id.as_deref()).map(describe).unwrap_or_else(|| "no deployment".into());
         let to = detail.deployment(Some(&deployment)).map(describe).unwrap_or_else(|| deployment.clone());
         let lines = vec![
-            format!("Point {} {stage} from {now}", api.name),
+            format!("Point {} {stage} from {now}", api.title()),
             format!("to {to}{why}?"),
             "Requests use that deployment's routes and integrations right away.".to_string(),
         ];
         let typed = self.typed_name(&stage).map(|n| (n, TextInput::default()));
         let action = Action::Point { what: format!("{stage} now runs deployment {deployment}"), api: api.clone(), stage: stage.clone(), deployment };
-        self.dialog = Some(Dialog::Confirm { title: format!("{} · {stage}", api.name), lines, typed, action, busy: false, error: None });
+        self.dialog = Some(Dialog::Confirm { title: format!("{} · {stage}", api.title()), lines, typed, action, busy: false, error: None });
     }
 
     fn run(&mut self, action: Action, ctx: &mut Ctx) {

@@ -335,7 +335,7 @@ fn clean(value: &mut Value) {
             map.values_mut().for_each(clean);
         }
         Value::Array(items) => items.iter_mut().for_each(clean),
-        Value::String(s) if s.chars().any(char::is_control) => *s = crate::util::sanitize(s),
+        Value::String(s) if s.chars().any(crate::util::is_unsafe) => *s = crate::util::sanitize(s),
         _ => {}
     }
 }

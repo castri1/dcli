@@ -1030,7 +1030,16 @@ pub fn connect_command(cluster: &Cluster, host: &str, region: &str, profile: &st
     );
     let db = cluster.database_name.clone().unwrap_or_else(|| if cluster.postgres() { "postgres".into() } else { String::new() });
     if cluster.postgres() {
-        let conn = format!("host={host} port={port} user={user} dbname={db} sslmode=require");
+        // A libpq conninfo value with anything but letters, digits, `.`, `_` and `-` goes in
+        // single quotes with `\` and `'` escaped, so that it cannot add a key.
+        let value = |s: &str| {
+            if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+                s.to_string()
+            } else {
+                format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+            }
+        };
+        let conn = format!("host={} port={port} user={} dbname={} sslmode=require", value(host), value(&user), value(&db));
         if cluster.iam_auth { format!("PGPASSWORD={token} psql {}", quote(&conn)) } else { format!("psql {}", quote(&conn)) }
     } else {
         let mut cmd = format!("mysql -h {} -P {port} -u {} --ssl-mode=REQUIRED", quote(host), quote(&user));
@@ -1439,6 +1448,11 @@ mod tests {
         assert!(cmd.starts_with("PGPASSWORD=\"$(aws rds generate-db-auth-token --hostname 'orders-prod.cluster-x"));
         assert!(cmd.contains("--username 'orders_admin' --region 'us-east-1' --profile 'prod')\""));
         assert!(cmd.ends_with("psql 'host=orders-prod.cluster-x.us-east-1.rds.amazonaws.com port=5432 user=orders_admin dbname=orders sslmode=require'"));
+        // A value cannot add a conninfo key (another host would receive the token).
+        c.database_name = Some("x host=other.example".into());
+        let cmd = connect_command(&c, "h", "us-east-1", "default");
+        assert!(cmd.ends_with("psql 'host=h port=5432 user=orders_admin dbname='\\''x host=other.example'\\'' sslmode=require'"), "{cmd}");
+        c.database_name = Some("orders".into());
         c.iam_auth = false;
         c.engine = "aurora-mysql".into();
         c.port = Some(3306);
