@@ -138,10 +138,22 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
     if let Some(pid) = args.cancel {
         let identity = need(identity, &c)?;
         let pid_ok = redshift::valid_pid(pid).ok_or_else(|| anyhow!("--cancel takes a process id (a positive number): {pid}"))?;
-        if !confirm_write(&env, &format!("Cancel the query of session {pid_ok} on {} ({env})? Its transaction rolls back.", c.id), args.yes)? {
+        // What the session runs now: the confirmation shows it, and only that query is cancelled.
+        let running = redshift::running(&aws, &c.id, &identity)?;
+        let Some(q) = running.iter().find(|q| q.pid == Some(pid)) else {
+            bail!("session {pid_ok} runs no query on {} now", c.id);
+        };
+        let question = format!(
+            "Cancel the {} query of session {pid_ok} on {} ({env}), by {}: {}? Its transaction rolls back.",
+            q.status,
+            c.id,
+            q.user,
+            ellipsize(&q.text.split_whitespace().collect::<Vec<_>>().join(" "), 200)
+        );
+        if !confirm_write(&env, &question, args.yes)? {
             bail!("not cancelled");
         }
-        redshift::cancel_query(&aws, &c.id, &identity, pid)?;
+        redshift::cancel_query(&aws, &c.id, &identity, q)?;
         println!("{} cancelled the query of session {pid_ok}", paint("✓", "32"));
         return Ok(ExitCode::SUCCESS);
     }

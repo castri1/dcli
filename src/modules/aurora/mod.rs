@@ -266,12 +266,25 @@ impl Aurora {
         }
     }
 
+    /// The rows again after the filter changed: the selected cluster stays selected while it
+    /// shows, else the first row is.
     fn refilter(&mut self) {
         let keep = self.list_cluster().map(|c| c.id.clone());
+        self.rebuild(keep, false);
+    }
+
+    /// The rows after `keep` (the id of the cluster selected before new data replaced the
+    /// list) was looked for: wherever it moved it stays selected; when it is gone after a
+    /// refresh (`new_data`), nothing is, so that a key cannot act on whatever took its row.
+    fn rebuild(&mut self, keep: Option<String>, new_data: bool) {
         let query = self.filter.value.trim().to_lowercase();
         self.rows = (0..self.inventory.clusters.len()).filter(|i| matches_filter(&self.inventory.clusters[*i].id, &query)).collect();
-        let index = keep.and_then(|k| self.rows.iter().position(|i| self.inventory.clusters[*i].id == k)).unwrap_or(0);
-        self.list_state.select(if self.rows.is_empty() { None } else { Some(index) });
+        let index = match keep.map(|k| self.rows.iter().position(|i| self.inventory.clusters[*i].id == k)) {
+            Some(found) if new_data => found,
+            Some(Some(found)) => Some(found),
+            _ => Some(0),
+        };
+        self.list_state.select(if self.rows.is_empty() { None } else { index });
     }
 
     /// Opens the cluster asked for by another module, once the list has it.
@@ -1225,9 +1238,10 @@ impl Module for Aurora {
                         // moves the new writer first).
                         let kept = self.node().map(|n| n.id.clone());
                         let on_node = self.pick >= self.endpoints().len();
+                        let keep = self.list_cluster().map(|c| c.id.clone());
                         self.inventory = inventory;
                         self.load = LoadState::Loaded;
-                        self.refilter();
+                        self.rebuild(keep, true);
                         if self.open.as_deref().is_some_and(|id| self.inventory.cluster(id).is_none()) {
                             self.open = None;
                         }

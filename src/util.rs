@@ -470,6 +470,12 @@ pub fn md_code(text: &str) -> String {
     format!("{ticks}{pad}{}{pad}{ticks}", text.replace('\n', " "))
 }
 
+/// `text` as a code span inside a Markdown table cell: a `|` would end the cell even inside
+/// the span, so it is escaped too.
+pub fn md_cell(text: &str) -> String {
+    md_code(text).replace('|', "\\|")
+}
+
 /// JSON held in a string of a response (task settings, table mappings…), parsed and
 /// sanitized: the response was cleaned while these escapes were still text, and decoding
 /// them (`\u001b`, `\u202e`) brings back what was removed.
@@ -500,6 +506,12 @@ mod tests {
         let text = pretty_json(r#"{"note":"a\u009b2Jb\u202ec","k\u001b[31m":1}"#).unwrap();
         assert!(!text.chars().any(is_unsafe), "{text:?}");
         assert!(text.contains("\"note\": \"a2Jbc\""), "{text}");
+    }
+
+    #[test]
+    fn table_cells_cannot_add_columns() {
+        assert_eq!(md_cell("a|b"), "`a\\|b`");
+        assert!(!md_cell("x | y | z").replace("\\|", "").contains('|'));
     }
 
     #[test]

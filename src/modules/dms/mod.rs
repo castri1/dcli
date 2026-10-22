@@ -340,15 +340,19 @@ impl Dms {
         match result {
             Ok((instances, tasks)) => {
                 self.notify_new_trouble(&tasks, ctx);
+                let keep = self.selected_key();
                 self.instances = instances;
                 self.tasks = tasks;
                 self.load = LoadState::Loaded;
+                self.reselect(keep);
             }
             // A failed refresh keeps what was read before.
-            Err(_) if matches!(self.load, LoadState::Loaded) => {}
-            Err(e) => self.load = LoadState::Failed(e),
+            Err(_) if matches!(self.load, LoadState::Loaded) => self.refilter(),
+            Err(e) => {
+                self.load = LoadState::Failed(e);
+                self.refilter();
+            }
         }
-        self.refilter();
         if let Some(target) = self.pending_open.take() {
             self.open(&target, ctx);
         }
@@ -490,19 +494,36 @@ impl Dms {
         }
     }
 
-    /// Tasks in trouble first, then running ones, then by name.
+    /// The rows again after the filter or the page changed (the data did not): the selected
+    /// row stays selected while it shows, else the cursor stays where it was.
     fn refilter(&mut self) {
         let keep = self.selected_key();
+        self.rebuild(keep, false);
+    }
+
+    /// The rows again after new data replaced the list: `keep` (the key of the row selected
+    /// before) stays selected wherever it moved; when it is gone nothing is selected, so that
+    /// a key cannot act on whatever took its place.
+    fn reselect(&mut self, keep: Option<String>) {
+        self.rebuild(keep, true);
+    }
+
+    /// Tasks in trouble first, then running ones, then by name.
+    fn rebuild(&mut self, keep: Option<String>, new_data: bool) {
         let query = self.filter.value.trim().to_lowercase();
         let mut visible: Vec<usize> = (0..self.page_len()).filter(|&i| self.row_matches(i, &query)).collect();
         if self.page == Page::Tasks {
             visible.sort_by_key(|&i| (self.tasks[i].health(), self.tasks[i].id.to_lowercase()));
         }
         self.visible = visible;
-        let index = keep.and_then(|k| self.visible.iter().position(|&i| self.key_of(i) == k));
-        let index = index.or(self.state().selected()).unwrap_or(0).min(self.visible.len().saturating_sub(1));
+        let last = self.visible.len().saturating_sub(1);
+        let index = match keep.map(|k| self.visible.iter().position(|&i| self.key_of(i) == k)) {
+            Some(found) if new_data => found,
+            Some(Some(found)) => Some(found),
+            _ => Some(self.state().selected().unwrap_or(0).min(last)),
+        };
         let empty = self.visible.is_empty();
-        self.state().select(if empty { None } else { Some(index) });
+        self.state().select(if empty { None } else { index });
         self.queue_metrics();
     }
 
@@ -581,7 +602,8 @@ impl Dms {
         self.filter.clear();
         self.filtering = false;
         self.detail_scroll = 0;
-        self.refilter();
+        // The visible rows are still the other page's: no key to keep from them.
+        self.rebuild(None, false);
     }
 
     fn show_page(&mut self, page: Page) {
@@ -589,7 +611,7 @@ impl Dms {
         self.filter.clear();
         self.filtering = false;
         self.detail_scroll = 0;
-        self.refilter();
+        self.rebuild(None, false);
     }
 
     fn open_view(&mut self, arn: String, ctx: &mut Ctx) {
@@ -634,7 +656,17 @@ impl Dms {
         if let Some(f) = &t.last_failure {
             lines.push(format!("It stopped with: {}", crate::util::ellipsize(f, 200)));
         }
-        self.dialog = Some(self.confirm(format!("{} {}", how.verb(), t.id), lines, Action::Start { arn: t.arn.clone(), how }));
+        let title = format!("{} {}", how.verb(), t.id);
+        let action = Action::Start { arn: t.arn.clone(), how };
+        let prep = PrepMode::of(t.settings.as_deref());
+        if how == StartType::Start && prep.rewrites_target() {
+            // A first start loads the tables like a full reload: the same name to type.
+            lines.push(format!("Loading, the task {}.", prep.effect()));
+            let typed = Some((t.id.clone(), TextInput::default()));
+            self.dialog = Some(Dialog::Confirm { title, lines, typed, action, busy: false, error: None });
+        } else {
+            self.dialog = Some(self.confirm(title, lines, action));
+        }
     }
 
     fn open_stop(&mut self, ctx: &mut Ctx) {
@@ -1430,6 +1462,7 @@ impl Module for Dms {
         match *msg {
             Msg::Listed(result) => self.on_listed(result, ctx),
             Msg::Inventory(result) => {
+                let keep = (self.page == Page::Endpoints).then(|| self.selected_key()).flatten();
                 match result {
                     Ok((endpoints, connections)) => {
                         self.endpoints = endpoints;
@@ -1439,7 +1472,7 @@ impl Module for Dms {
                     Err(e) => self.inventory = LoadState::Failed(e),
                 }
                 if self.page == Page::Endpoints {
-                    self.refilter();
+                    self.reselect(keep);
                 }
                 if let Some(target) = self.pending_open.take() {
                     self.open(&target, ctx);
@@ -1461,10 +1494,18 @@ impl Module for Dms {
                 if let Some(view) = self.open.as_mut().filter(|v| v.arn == arn) {
                     view.tables_in_flight = false;
                     if result.is_ok() || !matches!(view.tables, Some(Ok(_))) {
+                        // The selected table stays selected wherever the new numbers put it;
+                        // when it is gone nothing is, so Space or a reload cannot take another.
+                        let keep = view.selected_table().map(|t| (t.schema_name.clone(), t.table_name.clone()));
                         view.tables = Some(result);
-                    }
-                    if view.table_state.selected().is_none() {
-                        view.table_state.select(Some(0));
+                        let at = keep.map(|(schema, table)| {
+                            view.shown().iter().position(|t| t.schema_name == schema && t.table_name == table)
+                        });
+                        match at {
+                            Some(index) => view.table_state.select(index),
+                            None if view.table_state.selected().is_none() => view.table_state.select(Some(0)),
+                            None => {}
+                        }
                     }
                 }
             }

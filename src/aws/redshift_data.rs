@@ -80,10 +80,7 @@ pub fn identities_path() -> Option<std::path::PathBuf> {
 }
 
 fn read_identities() -> std::collections::BTreeMap<String, Identity> {
-    identities_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    identities_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
 /// The identity saved for `cluster` in `env`.
@@ -93,12 +90,30 @@ pub fn saved_identity(env: &str, cluster: &str) -> Option<Identity> {
 
 pub fn save_identity(env: &str, cluster: &str, identity: &Identity) -> std::io::Result<()> {
     let path = identities_path().ok_or_else(|| std::io::Error::other("cannot find the home directory"))?;
-    let mut all = read_identities();
+    // A file that cannot be read back is left alone rather than replaced by this one entry.
+    let mut all = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| std::io::Error::other(format!("{} is not valid JSON ({e}): fix or delete it", path.display())))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::collections::BTreeMap::new(),
+        Err(e) => return Err(e),
+    };
     all.insert(format!("{env}/{cluster}"), identity.clone());
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    let dir = path.parent().ok_or_else(|| std::io::Error::other("no folder for the identities file"))?;
+    std::fs::create_dir_all(dir)?;
+    // Written whole to a new private file, then moved over the old one.
+    let tmp = dir.join(format!(".redshift.json.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&all).unwrap_or_default() + "\n")
+    std::io::Write::write_all(&mut options.open(&tmp)?, (serde_json::to_string_pretty(&all).unwrap_or_default() + "\n").as_bytes())?;
+    std::fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// `prod/analytics/redshift` from its ARN (`…:secret:prod/analytics/redshift-AbCdEf`).
@@ -295,7 +310,14 @@ pub fn run(aws: &Aws, target: &Target, identity: &Identity, sql: &str) -> Result
     let started = Instant::now();
     let mut wait = Duration::from_millis(150);
     loop {
-        let s = describe(aws, &id)?;
+        let s = match describe(aws, &id) {
+            Ok(s) => s,
+            Err(e) => {
+                // Not left running unwatched.
+                let _ = cancel(aws, &id);
+                return Err(e);
+            }
+        };
         if s.done() {
             return match s.status.as_str() {
                 "FINISHED" if s.has_result_set => results(aws, &id),

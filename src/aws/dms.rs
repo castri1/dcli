@@ -29,6 +29,10 @@ pub const SERVICE: Service = Service { endpoint: "dms", signing_name: "dms", tar
 /// Pages read at most by the list calls (100 records each; 500 for table statistics).
 const MAX_PAGES: usize = 20;
 
+/// Parts of an extra connection attribute's name that say its value is a credential
+/// (`password`, `pwd`, Oracle's `securityDbEncryption`…): the value is masked.
+const SECRET_WORDS: [&str; 10] = ["password", "passwd", "pwd", "secret", "token", "key", "credential", "auth", "encryption", "cert"];
+
 // ---- replications ------------------------------------------------------------------------------
 
 /// What runs a replication. Serverless replications would be a second kind (see the module
@@ -385,6 +389,7 @@ pub fn stop(aws: &Aws, r: &Replication) -> Result<Replication> {
 pub fn reload_tables(aws: &Aws, r: &Replication, tables: &[(String, String)], validate_only: bool) -> Result<()> {
     match r.kind {
         Kind::Task => {
+            check_reloadable(&raw_table_names(aws, r)?, tables)?;
             let list: Vec<Value> = tables.iter().map(|(s, t)| json!({ "SchemaName": s, "TableName": t })).collect();
             let input = json!({
                 "ReplicationTaskArn": r.arn,
@@ -395,6 +400,50 @@ pub fn reload_tables(aws: &Aws, r: &Replication, tables: &[(String, String)], va
             Ok(())
         }
     }
+}
+
+/// The task's table names exactly as DMS has them. Responses are cleaned of invisible and
+/// control characters for display, so `orders` and `orders` with a zero-width space show
+/// alike; the names sent back to reload are checked against these.
+fn raw_table_names(aws: &Aws, r: &Replication) -> Result<Vec<(String, String)>> {
+    let mut input = json!({ "ReplicationTaskArn": r.arn, "MaxRecords": 500 });
+    let headers = || {
+        vec![
+            ("content-type".to_string(), "application/x-amz-json-1.1".to_string()),
+            ("x-amz-target".to_string(), format!("{}.DescribeTableStatistics", SERVICE.target_prefix)),
+        ]
+    };
+    let mut names = Vec::new();
+    for _ in 0..MAX_PAGES {
+        let resp = aws.raw(&SERVICE, "POST", &[], &[], headers(), serde_json::to_vec(&input).unwrap_or_default())?;
+        let out: Value = serde_json::from_slice(&resp.body).map_err(|e| AwsError::Network(format!("unexpected response from AWS: {e}")))?;
+        for t in out.get("TableStatistics").and_then(Value::as_array).into_iter().flatten() {
+            let field = |k: &str| t.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            names.push((field("SchemaName"), field("TableName")));
+        }
+        match out.get("Marker").and_then(Value::as_str).filter(|m| !m.is_empty()) {
+            Some(m) => input["Marker"] = json!(m),
+            None => break,
+        }
+    }
+    Ok(names)
+}
+
+/// Refuses to reload a table unless exactly one of the task's tables (`raw`, as DMS names
+/// them) shows as that name, and is named just so: a name with invisible characters would
+/// otherwise reload the table it looks like.
+fn check_reloadable(raw: &[(String, String)], tables: &[(String, String)]) -> Result<()> {
+    for (schema, table) in tables {
+        let alike = raw.iter().filter(|(s, t)| sanitize(s) == *schema && sanitize(t) == *table).count();
+        let exact = raw.iter().any(|(s, t)| s == schema && t == table);
+        if alike != 1 || !exact {
+            return Err(AwsError::Config(format!(
+                "{schema}.{table}: {}; reload it from the AWS console",
+                if alike == 0 { "the task has no such table" } else { "its name has invisible characters, or another table's name looks the same" }
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---- tables ------------------------------------------------------------------------------------
@@ -812,7 +861,7 @@ impl From<EndpointOut> for Endpoint {
 pub fn mask_attributes(text: &str) -> String {
     text.split(';')
         .map(|pair| match pair.split_once('=') {
-            Some((k, _)) if ["password", "secret", "token", "key"].iter().any(|w| k.to_lowercase().contains(w)) => format!("{k}=••••"),
+            Some((k, _)) if SECRET_WORDS.iter().any(|w| k.to_lowercase().contains(w)) => format!("{k}=••••"),
             _ => pair.to_string(),
         })
         .collect::<Vec<_>>()
@@ -1209,6 +1258,12 @@ impl PrepMode {
     }
 
     /// What reloading does to each target table.
+    /// Whether loading drops or empties the target tables (or might: the mode is unknown),
+    /// which asks for the task's name before a full reload or a first start.
+    pub fn rewrites_target(self) -> bool {
+        !matches!(self, PrepMode::DoNothing)
+    }
+
     pub fn effect(self) -> &'static str {
         match self {
             PrepMode::DropAndCreate => {
@@ -1607,6 +1662,16 @@ pub fn report(p: &ReportParts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tables_that_only_look_alike_are_not_reloaded() {
+        let pair = |s: &str, t: &str| (s.to_string(), t.to_string());
+        let raw = [pair("public", "orders"), pair("public", "orders\u{200b}"), pair("public", "lines"), pair("app", "us\u{202e}ers")];
+        assert!(check_reloadable(&raw, &[pair("public", "lines")]).is_ok());
+        assert!(check_reloadable(&raw, &[pair("public", "orders")]).is_err(), "two tables show as public.orders");
+        assert!(check_reloadable(&raw, &[pair("app", "users")]).is_err(), "the real name has a bidi override");
+        assert!(check_reloadable(&raw, &[pair("public", "missing")]).is_err());
+    }
 
     #[test]
     fn json_inside_settings_and_mappings_is_cleaned() {

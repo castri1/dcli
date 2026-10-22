@@ -22,7 +22,7 @@ use super::redshift_data::{self, Identity, Rows, Target};
 use super::xml::{self, El};
 use super::{Aws, AwsError, Result, Service};
 use crate::tui::chart::{fmt_count, fmt_ms};
-use crate::util::{fmt_utc, md_block, md_code, sanitize};
+use crate::util::{fmt_utc, md_block, md_cell, md_code, sanitize};
 
 pub const SERVICE: Service = Service { endpoint: "redshift", signing_name: "redshift", target_prefix: "" };
 pub const VERSION: &str = "2012-12-01";
@@ -943,10 +943,38 @@ pub fn cancel_sql(pid: u32) -> String {
     format!("SELECT PG_CANCEL_BACKEND({pid})")
 }
 
-/// Cancels the query running in session `pid` (the identity must own it or be a superuser).
-pub fn cancel_query(aws: &Aws, cluster: &str, identity: &Identity, pid: i64) -> Result<()> {
-    let pid = valid_pid(pid).ok_or_else(|| AwsError::Config(format!("not a process id: {pid}")))?;
-    redshift_data::run(aws, &Target::Cluster(cluster.to_string()), identity, &cancel_sql(pid)).map(|_| ())
+/// SQL that returns a row while session `pid` still runs the query `q` it was seen running:
+/// by query id (`SYS_*` views), else by start time (`STV_RECENTS`). Built from numbers only.
+fn still_running_sql(pid: u32, q: &Query) -> Result<String> {
+    let query_id = q.query_id.and_then(|id| u64::try_from(id).ok()).filter(|id| *id > 0);
+    let started = q.started.filter(|s| s.is_finite() && *s > 0.0);
+    match (query_id, started) {
+        (Some(id), _) => Ok(format!(
+            "SELECT 1 FROM sys_query_history WHERE session_id = {pid} AND query_id = {id} \
+             AND status IN ('planning', 'queued', 'running', 'returning')"
+        )),
+        (None, Some(at)) => Ok(format!(
+            "SELECT 1 FROM stv_recents WHERE pid = {pid} AND status = 'Running' AND ABS(DATE_PART(epoch, starttime) - {at:.3}) < 1"
+        )),
+        _ => Err(AwsError::Config("which query this session runs is not known: read the queries again first".into())),
+    }
+}
+
+/// Cancels `q`, the query session `pid` was seen running (the identity must own it or be a
+/// superuser). A session runs one query after another: what it runs is checked first, so a
+/// list read minutes ago cannot cancel the query that came after.
+pub fn cancel_query(aws: &Aws, cluster: &str, identity: &Identity, q: &Query) -> Result<()> {
+    let pid = q.pid.and_then(valid_pid).ok_or_else(|| AwsError::Config("the query has no process id to cancel".into()))?;
+    let target = Target::Cluster(cluster.to_string());
+    if redshift_data::run(aws, &target, identity, &still_running_sql(pid, q)?)?.rows.is_empty() {
+        return Err(AwsError::Config(format!("session {pid} no longer runs that query: nothing was cancelled")));
+    }
+    redshift_data::run(aws, &target, identity, &cancel_sql(pid)).map(|_| ())
+}
+
+/// The queries running or queued now.
+pub fn running(aws: &Aws, cluster: &str, identity: &Identity) -> Result<Vec<Query>> {
+    with_fallback(aws, &Target::Cluster(cluster.to_string()), identity, running_sql()).map(|r| queries_from(&r))
 }
 
 /// The result of a request made on another thread.
@@ -1100,7 +1128,7 @@ pub fn report(p: &ReportParts) -> String {
                 let _ = writeln!(
                     md,
                     "| {} | {} | {} | {} | {} |",
-                    md_code(&n.label()),
+                    md_cell(&n.label()),
                     avg_max(m, &key, "cpu"),
                     if n.leader() { "—".into() } else { avg_max(m, &key, "disk") },
                     avg_max(m, &key, "read_latency"),
@@ -1246,13 +1274,13 @@ pub fn report(p: &ReportParts) -> String {
                         let _ = writeln!(
                             md,
                             "| {} | {} | {} | {} | {} | {} | {} | {} |",
-                            md_code(&t.name()),
+                            md_cell(&t.name()),
                             t.size(),
                             fmt_rows(t.rows),
                             pct(t.unsorted),
                             pct(t.stats_off),
                             t.skew_rows.map(|s| format!("{s:.1}")).unwrap_or_else(|| "—".into()),
-                            md_code(&t.diststyle),
+                            md_cell(&t.diststyle),
                             t.flags().join(", ")
                         );
                     }

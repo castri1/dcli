@@ -168,7 +168,40 @@ fn micros(us: f64) -> String {
 /// The queries of the Queries tab, in the order the cursor walks them: running and queued
 /// now, the slowest of the last day, the longest waits.
 pub fn listed(a: &Activity) -> Vec<&Query> {
-    [&a.running, &a.slowest, &a.waited].into_iter().flat_map(|r| r.as_ref().map(|v| v.iter().collect::<Vec<_>>()).unwrap_or_default()).collect()
+    sections(a).into_iter().flatten().collect()
+}
+
+/// The running, slowest and longest-waiting queries, each list empty when it failed.
+fn sections(a: &Activity) -> [&[Query]; 3] {
+    [&a.running, &a.slowest, &a.waited].map(|r| r.as_ref().map_or(&[][..], Vec::as_slice))
+}
+
+/// A query of [`listed`] as (list, session, query id, start second): what a refresh looks
+/// for to keep the cursor on the same query.
+pub type QueryKey = (usize, Option<i64>, Option<i64>, Option<i64>);
+
+/// Row `n` of [`listed`] as a [`QueryKey`].
+pub fn query_key(a: &Activity, n: usize) -> Option<QueryKey> {
+    let mut n = n;
+    for (list, rows) in sections(a).into_iter().enumerate() {
+        if let Some(q) = rows.get(n) {
+            return Some((list, q.pid, q.query_id, q.started.map(|s| s as i64)));
+        }
+        n -= rows.len();
+    }
+    None
+}
+
+/// Where the query `key` (from [`query_key`]) is in [`listed`] now.
+pub fn find_query(a: &Activity, key: &QueryKey) -> Option<usize> {
+    let mut offset = 0;
+    for (list, rows) in sections(a).into_iter().enumerate() {
+        if list == key.0 {
+            return rows.iter().position(|q| (q.pid, q.query_id, q.started.map(|s| s as i64)) == (key.1, key.2, key.3)).map(|p| offset + p);
+        }
+        offset += rows.len();
+    }
+    None
 }
 
 /// What a tab that runs SQL shows without a database identity.

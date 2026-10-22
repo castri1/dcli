@@ -15,7 +15,7 @@ use super::metrics::{self, Query};
 use super::xml::{self, El};
 use super::{Aws, AwsError, Result, Service, pi};
 use crate::tui::chart::{fmt_count, fmt_ms};
-use crate::util::{fmt_utc, md_block, md_code};
+use crate::util::{fmt_utc, md_block, md_cell, md_code};
 
 pub const SERVICE: Service = Service { endpoint: "rds", signing_name: "rds", target_prefix: "" };
 pub const VERSION: &str = "2014-10-31";
@@ -1409,11 +1409,11 @@ pub fn report(p: &ReportParts) -> String {
         let _ = writeln!(
             md,
             "| {} | {} | {} | {} | {} | {} |",
-            md_code(&i.id),
+            md_cell(&i.id),
             i.role(),
-            md_code(&class),
-            md_code(i.az.as_deref().unwrap_or("?")),
-            md_code(&i.status),
+            md_cell(&class),
+            md_cell(i.az.as_deref().unwrap_or("?")),
+            md_cell(&i.status),
             on_off(i.pi_enabled)
         );
     }
@@ -1442,7 +1442,7 @@ pub fn report(p: &ReportParts) -> String {
                 let _ = writeln!(
                     md,
                     "| {} | {} | {load} | {} | {memory} | {} | {} | {lag} | {cache} |",
-                    md_code(id),
+                    md_cell(id),
                     avg_max(m, id, "cpu"),
                     avg_max(m, id, "connections"),
                     avg_max(m, id, "read_latency"),

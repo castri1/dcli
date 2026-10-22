@@ -4426,6 +4426,12 @@ def rs_result(st):
         known = any(s[1] == pid for s in sessions)
         RS_SESSIONS[name] = [s for s in sessions if s[1] != pid]
         return rs_rows(["pg_cancel_backend"], [[1 if known else 0]])
+    if sql.startswith("select 1 from "):
+        # dcli checks the session still runs the query it showed before cancelling it.
+        pid = int(re.search(r"(?:session_id|pid) = (\d+)", sql).group(1))
+        qid = re.search(r"query_id = (\d+)", sql)
+        alive = any(s[1] == pid and (qid is None or s[0] == int(qid.group(1))) for s in sessions)
+        return rs_rows(["?column?"], [[1]] if alive else [])
     if "status in ('planning'" in sql or "from stv_recents" in sql:
         rows = [[q, pid, user, st["db"], status, now - ago, int(ago * 1e6), queued, text] for q, pid, user, status, ago, queued, text in sessions
                 if "stv_recents" not in sql or status == "running"]

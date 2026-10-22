@@ -104,7 +104,7 @@ enum Action {
     Pause(String),
     Resume(String),
     Resize { cluster: String, option: NodeOption },
-    Cancel { cluster: String, pid: i64 },
+    Cancel { cluster: String, query: Box<redshift::Query> },
 }
 
 enum Dialog {
@@ -312,12 +312,25 @@ impl Redshift {
         }
     }
 
+    /// The rows again after the filter changed: the selected cluster stays selected while it
+    /// shows, else the first row is.
     fn refilter(&mut self) {
         let keep = self.list_cluster().map(|c| c.id.clone());
+        self.rebuild(keep, false);
+    }
+
+    /// The rows after `keep` (the id of the cluster selected before new data replaced the
+    /// list) was looked for: wherever it moved it stays selected; when it is gone after a
+    /// refresh (`new_data`), nothing is, so that a key cannot act on whatever took its row.
+    fn rebuild(&mut self, keep: Option<String>, new_data: bool) {
         let query = self.filter.value.trim().to_lowercase();
         self.rows = (0..self.clusters.len()).filter(|i| matches_filter(&self.clusters[*i].id, &query)).collect();
-        let index = keep.and_then(|k| self.rows.iter().position(|i| self.clusters[*i].id == k)).unwrap_or(0);
-        self.list_state.select(if self.rows.is_empty() { None } else { Some(index) });
+        let index = match keep.map(|k| self.rows.iter().position(|i| self.clusters[*i].id == k)) {
+            Some(found) if new_data => found,
+            Some(Some(found)) => Some(found),
+            _ => Some(0),
+        };
+        self.list_state.select(if self.rows.is_empty() { None } else { index });
     }
 
     /// Opens the cluster asked for by another module, once the list has it.
@@ -614,7 +627,7 @@ impl Redshift {
         let Some((q, live)) = self.selected_query() else {
             return ctx.toast(Level::Info, "Select a running query first (Enter, then ↑↓)");
         };
-        let Some(pid) = q.pid.filter(|p| redshift::valid_pid(*p).is_some()).filter(|_| live) else {
+        let Some(pid) = q.pid.and_then(redshift::valid_pid).filter(|_| live) else {
             return ctx.toast(Level::Info, "Only a query running or queued now can be cancelled");
         };
         let running = q.started.map(|s| format!(", {} so far", crate::tui::chart::fmt_ms((now_secs() - s).max(0.0) * 1000.0))).unwrap_or_default();
@@ -625,7 +638,7 @@ impl Redshift {
                 ellipsize(&views::one_line(&q.text), 300),
                 "It stops and its transaction rolls back. You need to own the session or be a superuser.".into(),
             ],
-            Action::Cancel { cluster: c.id, pid },
+            Action::Cancel { cluster: c.id, query: Box::new(q) },
         );
     }
 
@@ -639,10 +652,11 @@ impl Redshift {
                 what: format!("{cluster} is resizing to {}", option.shape()),
                 cluster,
             }),
-            Action::Cancel { cluster, pid } => {
+            Action::Cancel { cluster, query } => {
                 let Some(identity) = self.identity(&cluster).cloned() else { return };
+                let pid = query.pid.unwrap_or_default();
                 ctx.spawn(move || Msg::Done {
-                    result: redshift::cancel_query(&aws, &cluster, &identity, pid),
+                    result: redshift::cancel_query(&aws, &cluster, &identity, &query),
                     what: format!("Cancelled the query of session {pid}"),
                     cluster,
                 });
@@ -1234,9 +1248,10 @@ impl Module for Redshift {
                 self.in_flight.remove("clusters");
                 match result {
                     Ok(clusters) => {
+                        let keep = self.list_cluster().map(|c| c.id.clone());
                         self.clusters = clusters;
                         self.load = LoadState::Loaded;
-                        self.refilter();
+                        self.rebuild(keep, true);
                         if self.open.is_some() && self.cluster().is_none() {
                             self.open = None;
                         }
@@ -1268,8 +1283,11 @@ impl Module for Redshift {
             }
             Msg::Activity { cluster, activity } => {
                 self.in_flight.remove(&format!("activity {cluster}"));
-                let count = views::listed(&activity).len();
-                self.query_cursor = self.query_cursor.filter(|n| *n < count);
+                // The selected query stays selected wherever the new list puts it, or nothing is.
+                if self.open.as_deref() == Some(cluster.as_str()) {
+                    let keep = self.query_cursor.zip(self.activity.get(&cluster)).and_then(|(n, (_, old))| views::query_key(old, n));
+                    self.query_cursor = keep.and_then(|k| views::find_query(&activity, &k));
+                }
                 self.activity.insert(cluster, (Instant::now(), *activity));
             }
             Msg::Tables { cluster, result } => {

@@ -94,7 +94,7 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
         return scale(&aws, &env, instance, args.class.as_deref().unwrap_or_default(), args.now, args.yes);
     }
     if let Some(endpoint) = &args.test_endpoint {
-        return test_endpoint(&aws, endpoint, args.instance.as_deref(), args.json);
+        return test_endpoint(&aws, &env, endpoint, args.instance.as_deref(), args.json, args.yes);
     }
     let Some(task) = task else {
         if args.tables || args.metrics || args.resume || args.reload.is_some() || args.stop || args.report {
@@ -388,7 +388,14 @@ fn resume(aws: &Aws, env: &str, r: &Replication, yes: bool) -> Result<ExitCode> 
     if let Some(warning) = resume_warning(r, now_secs()) {
         eprintln!("{}", paint(&warning, "33"));
     }
-    confirm(env, &format!("{} {} ({})?", how.verb(), r.id, r.migration.label()), yes)?;
+    let prep = PrepMode::of(r.settings.as_deref());
+    if how == StartType::Start && prep.rewrites_target() {
+        // A first start loads the tables like a full reload: the same name to type.
+        eprintln!("Starting {} loads every table from the source. It {}.", r.id, prep.effect());
+        type_task_name(r, env, "start it", yes)?;
+    } else {
+        confirm(env, &format!("{} {} ({})?", how.verb(), r.id, r.migration.label()), yes)?;
+    }
     let fresh = dms::start(aws, r, how)?;
     println!("{} {} is {}", paint("✓", "32"), fresh.id, fresh.status);
     Ok(ExitCode::SUCCESS)
@@ -412,18 +419,24 @@ pub fn resume_warning(r: &Replication, now: f64) -> Option<String> {
     ))
 }
 
+/// Asks for the task's name (whatever the environment) before what rewrites its target.
+fn type_task_name(r: &Replication, env: &str, what: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !interactive() {
+        bail!("refusing to {what} without confirmation; pass --yes");
+    }
+    if ask(&format!("Type the task name '{}' to {what} ({env}):", r.id)) != r.id {
+        bail!("cancelled");
+    }
+    Ok(())
+}
+
 fn reload_task(aws: &Aws, env: &str, r: &Replication, yes: bool) -> Result<ExitCode> {
     let prep = PrepMode::of(r.settings.as_deref());
     eprintln!("Reloading {} loads every table again from the source. It {}.", r.id, prep.effect());
-    if !yes {
-        if !interactive() {
-            bail!("refusing to reload without confirmation; pass --yes");
-        }
-        let typed = ask(&format!("Type the task name '{}' to reload it ({env}):", r.id));
-        if typed != r.id {
-            bail!("cancelled");
-        }
-    }
+    type_task_name(r, env, "reload it", yes)?;
     let fresh = dms::start(aws, r, StartType::Reload)?;
     println!("{} {} is reloading ({})", paint("✓", "32"), fresh.id, fresh.status);
     Ok(ExitCode::SUCCESS)
@@ -592,7 +605,7 @@ fn scale(aws: &Aws, env: &str, id: &str, class: &str, now: bool, yes: bool) -> R
 /// How long a connection test is followed.
 const TEST_WAIT: Duration = Duration::from_secs(120);
 
-fn test_endpoint(aws: &Aws, id: &str, instance: Option<&str>, json: bool) -> Result<ExitCode> {
+fn test_endpoint(aws: &Aws, env: &str, id: &str, instance: Option<&str>, json: bool, yes: bool) -> Result<ExitCode> {
     let endpoints = dms::list_endpoints(aws)?;
     let endpoint: &Endpoint = endpoints.iter().find(|e| e.id == id || e.arn == id).ok_or_else(|| anyhow!("no DMS endpoint named '{id}'"))?;
     let all = dms::list_instances(aws)?;
@@ -607,6 +620,9 @@ fn test_endpoint(aws: &Aws, id: &str, instance: Option<&str>, json: bool) -> Res
             }
         }
     };
+    // It changes nothing, but it signs in to the database with the endpoint's credentials,
+    // which can count toward lockouts or raise alerts there.
+    confirm(env, &format!("Test the connection from {} to {} (it signs in to {})?", instance.id, endpoint.id, endpoint.address()), yes)?;
     if !json {
         eprintln!("Testing {} from {}…", endpoint.id, instance.id);
     }
