@@ -100,15 +100,31 @@ jobs:
       - name: Publish (platform packages first, the launcher last)
         run: |
           published() { [ -n "$(npm view "$1@$2" version 2>/dev/null)" ]; }
-          for dir in out/dcli-*/ out/dcli/; do
-            name=$(node -p "require('./${dir}package.json').name")
-            version=$(node -p "require('./${dir}package.json').version")
+          # What `npm install` resolves against: the registry's install metadata, which can
+          # lag a publish by minutes.
+          served() {
+            curl -fsS -H 'Accept: application/vnd.npm.install-v1+json' "https://registry.npmjs.org/${1/\//%2f}" |
+              node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.exit(JSON.parse(s).versions['$2']?0:1))"
+          }
+          publish() {
+            name=$(node -p "require('./${1}package.json').name")
+            version=$(node -p "require('./${1}package.json').version")
             if published "$name" "$version"; then
               echo "$name@$version is already published"
-              continue
+              return
             fi
-            npm publish --access public "$dir" || {
+            npm publish --access public "$1" || {
               sleep 30
-              published "$name" "$version" || npm publish --access public "$dir"
+              published "$name" "$version" || npm publish --access public "$1"
             }
+          }
+          for dir in out/dcli-*/; do publish "$dir"; done
+          # The launcher installs these as optional dependencies: published before the registry
+          # serves them, npm would install it without a binary. Wait for every one.
+          for dir in out/dcli-*/; do
+            name=$(node -p "require('./${dir}package.json').name")
+            version=$(node -p "require('./${dir}package.json').version")
+            for _ in $(seq 1 60); do served "$name" "$version" && break; echo "waiting for the registry to serve $name@$version"; sleep 15; done
+            served "$name" "$version" || { echo "$name@$version is still not served"; exit 1; }
           done
+          publish out/dcli/
