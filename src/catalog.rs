@@ -134,8 +134,10 @@ fn redshift_clusters(_aws: &Aws) -> aws::Result<Vec<Resource>> {
 }
 
 /// DMS replication tasks; the target is the task identifier.
-fn dms_tasks(_aws: &Aws) -> aws::Result<Vec<Resource>> {
-    Ok(Vec::new())
+fn dms_tasks(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    use crate::aws::dms;
+    let tasks = dms::list_replications(aws, &[], false)?;
+    Ok(tasks.iter().map(|t| Resource::new("DMS", &t.id, t.id.clone(), &format!("{} · {}", t.migration.label(), t.status))).collect())
 }
 
 fn buses(aws: &Aws) -> aws::Result<Vec<Resource>> {

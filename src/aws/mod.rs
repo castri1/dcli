@@ -99,6 +99,18 @@ impl Aws {
         self.json_call(svc, operation, input, "application/x-amz-json-1.1")
     }
 
+    /// Like [`call`](Self::call) for an operation that must not run twice (starting or
+    /// reloading a DMS task): sent again only when AWS throttled it.
+    pub fn call_once<T: DeserializeOwned>(&self, svc: &Service, operation: &str, input: &Value) -> Result<T> {
+        let headers = vec![
+            ("content-type".to_string(), "application/x-amz-json-1.1".to_string()),
+            ("x-amz-target".to_string(), format!("{}.{operation}", svc.target_prefix)),
+        ];
+        let body = serde_json::to_vec(input).unwrap_or_default();
+        let resp = self.send_with(svc, "POST", &[], &[], headers, body, false)?;
+        parse(&resp.body)
+    }
+
     /// `awsJson1_0` call (DynamoDB, Step Functions): same as [`call`](Self::call), another
     /// content type.
     pub fn call_json10<T: DeserializeOwned>(&self, svc: &Service, operation: &str, input: &Value) -> Result<T> {
