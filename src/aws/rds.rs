@@ -7,135 +7,22 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::str::FromStr;
 
 use serde::Serialize;
 
 use super::lambda::Range;
 use super::metrics::{self, Query};
+use super::xml::{self, El};
 use super::{Aws, AwsError, Result, Service, pi};
 use crate::tui::chart::{fmt_count, fmt_ms};
-use crate::util::{fmt_utc, md_block, md_code, parse_rfc3339, xml_blocks, xml_decode};
+use crate::util::{fmt_utc, md_block, md_code};
 
 pub const SERVICE: Service = Service { endpoint: "rds", signing_name: "rds", target_prefix: "" };
 pub const VERSION: &str = "2014-10-31";
 
-/// Pages read at most by the list calls (100 items each).
-const MAX_PAGES: usize = 20;
-
-// ---- reading the XML -------------------------------------------------------------------
-
-/// The direct children of an element's content, as (tag, raw content). Responses nest
-/// elements of the same name (a cluster's `Status` and its security groups' `Status`), so
-/// fields are read from an element's own children only.
-fn children(xml: &str) -> Vec<(&str, &str)> {
-    let bytes = xml.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while let Some(lt) = xml[i..].find('<').map(|p| p + i) {
-        let Some(gt) = xml[lt..].find('>').map(|p| p + lt) else { break };
-        let tag = &xml[lt + 1..gt];
-        i = gt + 1;
-        if tag.starts_with(['/', '?', '!']) {
-            continue;
-        }
-        if let Some(empty) = tag.strip_suffix('/') {
-            out.push((empty.split_whitespace().next().unwrap_or(""), ""));
-            continue;
-        }
-        let name = tag.split_whitespace().next().unwrap_or("");
-        let (open, close) = (format!("<{name}>"), format!("</{name}>"));
-        let (mut depth, mut j) = (1usize, i);
-        while j < bytes.len() {
-            if bytes[j..].starts_with(close.as_bytes()) {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-                j += close.len();
-            } else if bytes[j..].starts_with(open.as_bytes()) {
-                depth += 1;
-                j += open.len();
-            } else {
-                j += 1;
-            }
-        }
-        if j >= bytes.len() {
-            break;
-        }
-        out.push((name, &xml[i..j]));
-        i = j + close.len();
-    }
-    out
-}
-
-/// An element, read through its direct children.
-struct El<'a> {
-    kids: Vec<(&'a str, &'a str)>,
-}
-
-impl<'a> El<'a> {
-    fn new(xml: &'a str) -> El<'a> {
-        El { kids: children(xml) }
-    }
-
-    fn raw(&self, tag: &str) -> Option<&'a str> {
-        self.kids.iter().find(|(t, _)| *t == tag).map(|(_, v)| *v)
-    }
-
-    fn text(&self, tag: &str) -> Option<String> {
-        self.raw(tag).map(xml_decode).filter(|s| !s.is_empty())
-    }
-
-    fn string(&self, tag: &str) -> String {
-        self.text(tag).unwrap_or_default()
-    }
-
-    fn flag(&self, tag: &str) -> bool {
-        self.raw(tag).is_some_and(|v| v.trim() == "true")
-    }
-
-    fn num<T: FromStr>(&self, tag: &str) -> Option<T> {
-        self.raw(tag)?.trim().parse().ok()
-    }
-
-    fn time(&self, tag: &str) -> Option<f64> {
-        parse_rfc3339(self.raw(tag)?.trim())
-    }
-
-    fn child(&self, tag: &str) -> Option<El<'a>> {
-        self.raw(tag).map(El::new)
-    }
-
-    /// The elements of the list `tag`, whatever their member name.
-    fn list(&self, tag: &str) -> Vec<El<'a>> {
-        self.raw(tag).map(|x| children(x).into_iter().map(|(_, v)| El::new(v)).collect()).unwrap_or_default()
-    }
-
-    /// The texts of the list `tag`.
-    fn strings(&self, tag: &str) -> Vec<String> {
-        self.raw(tag).map(|x| children(x).into_iter().map(|(_, v)| xml_decode(v)).collect()).unwrap_or_default()
-    }
-}
-
 /// Reads every page of `action`, each item of the list `list` through `parse`.
 fn pages<T>(aws: &Aws, action: &str, params: &[(&str, &str)], list: &str, parse: impl Fn(&El) -> Option<T>) -> Result<Vec<T>> {
-    let mut out = Vec::new();
-    let mut marker: Option<String> = None;
-    for _ in 0..MAX_PAGES {
-        let mut page: Vec<(&str, &str)> = params.to_vec();
-        if let Some(m) = &marker {
-            page.push(("Marker", m));
-        }
-        let xml = aws.query(&SERVICE, action, VERSION, &page)?;
-        let result = El::new(xml_blocks(&xml, &format!("{action}Result")).into_iter().next().unwrap_or(""));
-        out.extend(result.list(list).iter().filter_map(&parse));
-        marker = result.text("Marker");
-        if marker.is_none() {
-            break;
-        }
-    }
-    Ok(out)
+    xml::pages(aws, &SERVICE, VERSION, action, params, list, parse)
 }
 
 // ---- clusters, instances, endpoints ----------------------------------------------------
@@ -1709,8 +1596,7 @@ mod tests {
         </DBClusters></DescribeDBClustersResult><ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></DescribeDBClustersResponse>";
 
     fn parse_clusters(xml: &str) -> Vec<Cluster> {
-        let result = El::new(xml_blocks(xml, "DescribeDBClustersResult")[0]);
-        result.list("DBClusters").iter().filter_map(parse_cluster).collect()
+        xml::result_of(xml, "DescribeDBClusters").list("DBClusters").iter().filter_map(parse_cluster).collect()
     }
 
     #[test]
@@ -1726,14 +1612,6 @@ mod tests {
         let s = &clusters[1];
         assert_eq!(s.status, "modifying");
         assert_eq!(s.capacity_label(), "Serverless v2 · 4–16 ACU");
-    }
-
-    #[test]
-    fn children_skip_nested_namesakes_and_empty_elements() {
-        let kids = children("<A><A>in</A></A><B/><C>x &amp; y</C>");
-        assert_eq!(kids, [("A", "<A>in</A>"), ("B", ""), ("C", "x &amp; y")]);
-        assert_eq!(El::new("<C>a&#x1b;[31mb</C>").string("C"), "ab", "entities are decoded, then sanitized");
-        assert!(children("<A>never closed").is_empty());
     }
 
     fn instance(id: &str, writer: bool, az: &str) -> Instance {

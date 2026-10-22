@@ -32,6 +32,7 @@ pub mod sigv4;
 pub mod sqs;
 pub mod ssm;
 pub mod sso;
+pub mod xml;
 
 use std::sync::Arc;
 use std::time::Duration;
