@@ -2596,15 +2596,510 @@ def appconfig_rest(method, path, query, headers, body):
 
 
 # ---- API Gateway (restJson1: REST APIs under /restapis, HTTP and WebSocket APIs under /v2) ---
+# REST APIs answer with epoch seconds and `item` lists, HTTP/WebSocket APIs with ISO dates and
+# `items`. /__execute/{apiId}/… plays an HTTP API's invoke endpoint, for test calls.
 def is_apigateway(path):
     return path.split("?")[0].split("/")[1:3] == ["v2", "apis"] or any(
-        path.startswith(p) for p in ("/restapis", "/domainnames", "/v2/domainnames", "/apikeys", "/usageplans"))
+        path.startswith(p) for p in ("/restapis", "/domainnames", "/v2/domainnames", "/apikeys", "/usageplans", "/__execute/"))
+
+
+ACCOUNT = "123456789012"
+APIGW_PORT = sys.argv[1] if len(sys.argv) > 1 else "47123"
+
+
+def _lambda_uri(fn):
+    return f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:{ACCOUNT}:function:{fn}/invocations"
+
+
+def _method(auth="NONE", authorizer=None, integration=None, key=False, validator=None, params=None, models=None):
+    m = {"authorizationType": auth, "apiKeyRequired": key, "methodIntegration": integration}
+    if authorizer:
+        m["authorizerId"] = authorizer
+    if validator:
+        m["requestValidatorId"] = validator
+    if params:
+        m["requestParameters"] = params
+    if models:
+        m["requestModels"] = models
+    return m
+
+
+def _proxy(fn, timeout=29000):
+    return {"type": "AWS_PROXY", "httpMethod": "POST", "uri": _lambda_uri(fn), "timeoutInMillis": timeout,
+            "passthroughBehavior": "WHEN_NO_MATCH", "connectionType": "INTERNET"}
+
+
+def _days(n):
+    return T0 - 86400 * n
+
+
+# The escape sequence in a mapping template proves dcli shows AWS text without letting it
+# drive the terminal.
+APIGW_REST = {
+    "a1b2c3": {
+        "api": {"id": "a1b2c3", "name": "public-api", "description": "Public orders API", "createdDate": _days(400),
+                "apiKeySource": "HEADER", "endpointConfiguration": {"types": ["REGIONAL"]}, "disableExecuteApiEndpoint": False},
+        "resources": {
+            "root0": ("/", {}),
+            "res01": ("/orders", {
+                "GET": _method("COGNITO_USER_POOLS", "c0gn1t", _proxy("orders-sync")),
+                "POST": _method("COGNITO_USER_POOLS", "c0gn1t", _proxy("payments-webhook", 10000), validator="v-body",
+                                models={"application/json": "Order"}),
+            }),
+            "res02": ("/orders/{id}", {
+                "GET": _method("NONE", integration=_proxy("orders-sync"), params={"method.request.path.id": True}),
+            }),
+            "res03": ("/orders/{id}/ship", {
+                "POST": _method("AWS_IAM", integration={
+                    "type": "AWS", "httpMethod": "POST", "uri": f"arn:aws:apigateway:us-east-1:sqs:path/{ACCOUNT}/orders",
+                    "credentials": f"arn:aws:iam::{ACCOUNT}:role/apigw-sqs", "passthroughBehavior": "NEVER", "timeoutInMillis": 29000,
+                    "requestParameters": {"integration.request.header.Content-Type": "'application/x-www-form-urlencoded'"},
+                    "requestTemplates": {"application/json": "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"
+                                                             "&MessageAttribute.1.Name=orderId\u001b]0;pwned\u0007"
+                                                             "&MessageAttribute.1.Value.StringValue=$input.params('id')"}},
+                    params={"method.request.path.id": True}),
+            }),
+            "res05": ("/checkout", {
+                "POST": _method("COGNITO_USER_POOLS", "c0gn1t", {
+                    "type": "AWS", "httpMethod": "POST", "uri": "arn:aws:apigateway:us-east-1:states:action/StartExecution",
+                    "credentials": f"arn:aws:iam::{ACCOUNT}:role/apigw-sfn", "passthroughBehavior": "NEVER", "timeoutInMillis": 29000,
+                    "requestTemplates": {"application/json": "{\n  \"input\": \"$util.escapeJavaScript($input.json('$'))\",\n"
+                                                             f"  \"stateMachineArn\": \"arn:aws:states:us-east-1:{ACCOUNT}:stateMachine:order-fulfillment\"\n}}"}}),
+            }),
+            "res04": ("/health", {
+                "GET": _method("NONE", integration={"type": "MOCK", "requestTemplates": {"application/json": "{\"statusCode\": 200}"},
+                                                     "passthroughBehavior": "WHEN_NO_MATCH", "timeoutInMillis": 29000}),
+            }),
+            "res06": ("/users/{proxy+}", {
+                "ANY": _method("CUSTOM", "t0k3n", {"type": "HTTP_PROXY", "httpMethod": "ANY", "uri": "https://legacy-users.internal.example.com/{proxy}",
+                                                    "connectionType": "INTERNET", "timeoutInMillis": 8000}),
+            }),
+        },
+        "authorizers": [
+            {"id": "c0gn1t", "name": "orders-users", "type": "COGNITO_USER_POOLS", "identitySource": "method.request.header.Authorization",
+             "providerARNs": [f"arn:aws:cognito-idp:us-east-1:{ACCOUNT}:userpool/us-east-1_AbC123"]},
+            {"id": "t0k3n", "name": "legacy-token", "type": "TOKEN", "identitySource": "method.request.header.Authorization",
+             "authorizerUri": _lambda_uri("users-auth"), "authorizerResultTtlInSeconds": 300},
+        ],
+        "validators": [{"id": "v-body", "name": "Validate body", "validateRequestBody": True, "validateRequestParameters": False}],
+        "deployments": [
+            {"id": "e7f8a9", "description": "add /checkout", "createdDate": T0 - 7200},
+            {"id": "d5e6f7", "description": "orders/{id}/ship", "createdDate": _days(1)},
+            {"id": "c4d5e6", "description": "release 41", "createdDate": _days(6)},
+            {"id": "b3c4d5", "description": "release 40", "createdDate": _days(20)},
+            {"id": "a2b3c4", "description": "initial", "createdDate": _days(45)},
+        ],
+        "stages": [
+            {"stageName": "dev", "deploymentId": "e7f8a9", "createdDate": _days(45), "lastUpdatedDate": T0 - 7200,
+             "variables": {"fn": "orders-sync", "LOG_LEVEL": "debug"},
+             "methodSettings": {"*/*": {"metricsEnabled": False, "loggingLevel": "INFO", "dataTraceEnabled": True,
+                                        "throttlingBurstLimit": 20, "throttlingRateLimit": 10.0}}},
+            {"stageName": "qa", "deploymentId": "d5e6f7", "createdDate": _days(45), "lastUpdatedDate": _days(1),
+             "variables": {"fn": "orders-sync"}},
+            {"stageName": "prod", "deploymentId": "c4d5e6", "createdDate": _days(45), "lastUpdatedDate": _days(6),
+             "description": "Production", "variables": {"fn": "orders-sync", "API_TOKEN": "sk_live_should_stay_masked"},
+             "cacheClusterEnabled": True, "cacheClusterSize": "6.1", "cacheClusterStatus": "AVAILABLE", "tracingEnabled": True,
+             "methodSettings": {"*/*": {"metricsEnabled": True, "loggingLevel": "ERROR", "dataTraceEnabled": False,
+                                        "throttlingBurstLimit": 200, "throttlingRateLimit": 100.0,
+                                        "cachingEnabled": True, "cacheTtlInSeconds": 300}},
+             "accessLogSettings": {"destinationArn": f"arn:aws:logs:us-east-1:{ACCOUNT}:log-group:/aws/apigateway/public-api-prod",
+                                   "format": "{\"requestId\":\"$context.requestId\",\"status\":\"$context.status\"}"}},
+        ],
+    },
+    "r9s8t7": {
+        "api": {"id": "r9s8t7", "name": "legacy-reports", "description": "Reports for the back office", "createdDate": _days(900),
+                "apiKeySource": "HEADER", "endpointConfiguration": {"types": ["REGIONAL"]}},
+        "resources": {
+            "root1": ("/", {}),
+            "rr01": ("/reports", {"GET": _method("AWS_IAM", integration=_proxy("report-builder"))}),
+            "rr02": ("/reports/{id}", {"GET": _method("AWS_IAM", integration=_proxy("report-builder"),
+                                                      params={"method.request.path.id": True})}),
+        },
+        "authorizers": [], "validators": [],
+        "deployments": [{"id": "rd0002", "description": "nightly exports", "createdDate": _days(200)},
+                        {"id": "rd0001", "description": "", "createdDate": _days(900)}],
+        "stages": [{"stageName": "prod", "deploymentId": "rd0002", "createdDate": _days(900), "lastUpdatedDate": _days(200)}],
+    },
+    "p4q5r6": {
+        "api": {"id": "p4q5r6", "name": "partner-api", "createdDate": _days(300), "apiKeySource": "HEADER",
+                "endpointConfiguration": {"types": ["EDGE"]}, "policy": "{\"Version\":\"2012-10-17\"}"},
+        "resources": {
+            "root2": ("/", {}),
+            "pp01": ("/catalog", {"GET": _method("NONE", integration=_proxy("orders-sync"), key=True)}),
+        },
+        "authorizers": [], "validators": [],
+        "deployments": [{"id": "pd0001", "description": "v1", "createdDate": _days(300)}],
+        "stages": [{"stageName": "v1", "deploymentId": "pd0001", "createdDate": _days(300)}],
+    },
+}
+
+APIGW_V2 = {
+    "h7x9k2": {
+        "api": {"apiId": "h7x9k2", "name": "orders-http", "protocolType": "HTTP", "description": "Orders for the mobile app",
+                "createdDate": s3_iso(_days(120)), "apiEndpoint": f"http://127.0.0.1:{APIGW_PORT}/__execute/h7x9k2",
+                "disableExecuteApiEndpoint": False},
+        "routes": [
+            {"routeId": "rt1", "routeKey": "GET /orders", "target": "integrations/i1", "authorizationType": "JWT", "authorizerId": "jw1"},
+            {"routeId": "rt2", "routeKey": "POST /orders", "target": "integrations/i2", "authorizationType": "JWT", "authorizerId": "jw1"},
+            {"routeId": "rt3", "routeKey": "GET /orders/{id}", "target": "integrations/i1", "authorizationType": "NONE"},
+            {"routeId": "rt4", "routeKey": "POST /notify", "target": "integrations/i3", "authorizationType": "NONE"},
+            {"routeId": "rt5", "routeKey": "$default", "target": "integrations/i4", "authorizationType": "NONE"},
+        ],
+        "integrations": [
+            {"integrationId": "i1", "integrationType": "AWS_PROXY", "integrationUri": f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:orders-sync",
+             "payloadFormatVersion": "2.0", "timeoutInMillis": 30000, "connectionType": "INTERNET"},
+            {"integrationId": "i2", "integrationType": "AWS_PROXY", "integrationUri": f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:payments-webhook",
+             "payloadFormatVersion": "2.0", "timeoutInMillis": 10000},
+            {"integrationId": "i3", "integrationType": "AWS_PROXY", "integrationSubtype": "SQS-SendMessage",
+             "credentialsArn": f"arn:aws:iam::{ACCOUNT}:role/apigw-sqs", "payloadFormatVersion": "1.0",
+             "requestParameters": {"QueueUrl": f"https://sqs.us-east-1.amazonaws.com/{ACCOUNT}/notifications", "MessageBody": "$request.body"}},
+            {"integrationId": "i4", "integrationType": "HTTP_PROXY", "integrationUri": "https://legacy.example.com", "integrationMethod": "ANY",
+             "payloadFormatVersion": "1.0", "timeoutInMillis": 15000},
+        ],
+        "authorizers": [{"authorizerId": "jw1", "name": "auth0", "authorizerType": "JWT", "identitySource": ["$request.header.Authorization"],
+                         "jwtConfiguration": {"issuer": "https://acme.auth0.com/", "audience": ["orders"]}}],
+        "deployments": [
+            {"deploymentId": "dep3", "createdDate": s3_iso(T0 - 3600), "deploymentStatus": "DEPLOYED", "autoDeployed": True},
+            {"deploymentId": "dep2", "createdDate": s3_iso(_days(3)), "deploymentStatus": "DEPLOYED", "description": "release 12"},
+            {"deploymentId": "dep1", "createdDate": s3_iso(_days(10)), "deploymentStatus": "DEPLOYED", "description": "release 11"},
+        ],
+        "stages": [
+            {"stageName": "$default", "deploymentId": "dep3", "autoDeploy": True, "createdDate": s3_iso(_days(120)),
+             "lastUpdatedDate": s3_iso(T0 - 3600), "defaultRouteSettings": {"detailedMetricsEnabled": False},
+             "lastDeploymentStatusMessage": "Successfully deployed stage with deployment ID 'dep3'"},
+            {"stageName": "prod", "deploymentId": "dep2", "autoDeploy": False, "createdDate": s3_iso(_days(120)),
+             "lastUpdatedDate": s3_iso(_days(3)), "stageVariables": {"tier": "gold"},
+             "defaultRouteSettings": {"detailedMetricsEnabled": True, "throttlingBurstLimit": 500, "throttlingRateLimit": 250.0},
+             "accessLogSettings": {"destinationArn": f"arn:aws:logs:us-east-1:{ACCOUNT}:log-group:/aws/apigateway/orders-http-prod",
+                                   "format": "$context.requestId $context.routeKey $context.status"}},
+        ],
+    },
+    "w5s4k3": {
+        "api": {"apiId": "w5s4k3", "name": "chat-ws", "protocolType": "WEBSOCKET", "routeSelectionExpression": "$request.body.action",
+                "createdDate": s3_iso(_days(60)), "apiEndpoint": "wss://w5s4k3.execute-api.us-east-1.amazonaws.com"},
+        "routes": [
+            {"routeId": "wr1", "routeKey": "$connect", "target": "integrations/wi1", "authorizationType": "CUSTOM", "authorizerId": "wa1"},
+            {"routeId": "wr2", "routeKey": "$disconnect", "target": "integrations/wi1", "authorizationType": "NONE"},
+            {"routeId": "wr3", "routeKey": "$default", "target": "integrations/wi1", "authorizationType": "NONE"},
+            {"routeId": "wr4", "routeKey": "sendMessage", "target": "integrations/wi2", "authorizationType": "NONE"},
+        ],
+        "integrations": [
+            {"integrationId": "wi1", "integrationType": "AWS_PROXY", "integrationUri": _lambda_uri("users-auth")},
+            {"integrationId": "wi2", "integrationType": "AWS_PROXY", "integrationUri": _lambda_uri("image-resizer")},
+        ],
+        "authorizers": [{"authorizerId": "wa1", "name": "ws-auth", "authorizerType": "REQUEST",
+                         "identitySource": ["route.request.querystring.token"], "authorizerUri": _lambda_uri("users-auth")}],
+        "deployments": [{"deploymentId": "wd1", "createdDate": s3_iso(_days(15)), "deploymentStatus": "DEPLOYED"}],
+        "stages": [{"stageName": "production", "deploymentId": "wd1", "createdDate": s3_iso(_days(60)),
+                    "defaultRouteSettings": {"detailedMetricsEnabled": False}}],
+    },
+}
+
+APIGW_DOMAINS = [
+    {"domainName": "api.acme.dev", "domainNameConfigurations": [{"endpointType": "REGIONAL", "securityPolicy": "TLS_1_2",
+                                                                 "domainNameStatus": "AVAILABLE",
+                                                                 "apiGatewayDomainName": "d-abc123.execute-api.us-east-1.amazonaws.com"}],
+     "mappings": [{"apiMappingId": "m1", "apiId": "h7x9k2", "stage": "prod", "apiMappingKey": ""},
+                  {"apiMappingId": "m2", "apiId": "a1b2c3", "stage": "prod", "apiMappingKey": "v1"},
+                  {"apiMappingId": "m3", "apiId": "r9s8t7", "stage": "prod", "apiMappingKey": "reports"}]},
+    {"domainName": "partners.acme.dev", "domainNameConfigurations": [{"endpointType": "EDGE", "securityPolicy": "TLS_1_2",
+                                                                      "domainNameStatus": "AVAILABLE",
+                                                                      "apiGatewayDomainName": "d111111abcdef8.cloudfront.net"}],
+     "mappings": [{"apiMappingId": "m4", "apiId": "p4q5r6", "stage": "v1", "apiMappingKey": ""}]},
+]
+
+APIGW_USAGE_PLANS = [{"id": "up1", "name": "partners-gold", "apiStages": [{"apiId": "p4q5r6", "stage": "v1"}],
+                      "throttle": {"burstLimit": 50, "rateLimit": 20.0}}]
+
+# Requests a minute per stage (the metric hook), and the route that fails now and then.
+APIGW_TRAFFIC = {("public-api", "prod"): 120, ("public-api", "qa"): 5, ("public-api", "dev"): 2,
+                 ("legacy-reports", "prod"): 400, ("partner-api", "v1"): 10,
+                 ("h7x9k2", "prod"): 60, ("h7x9k2", "$default"): 3, ("w5s4k3", "production"): 30}
+APIGW_FAILING = {"POST /orders"}
+
+# API Gateway's own log groups join the Logs mock's: access logs (JSON) and REST execution logs.
+APIGW_ACCESS_LINES = [
+    '{{"requestId":"{rid}","ip":"10.0.{n}","httpMethod":"GET","resourcePath":"/orders","status":"200","responseLatency":"84"}}',
+    '{{"requestId":"{rid}","ip":"10.0.{n}","httpMethod":"GET","resourcePath":"/orders/{{id}}","status":"200","responseLatency":"41"}}',
+    '{{"requestId":"{rid}","ip":"10.0.{n}","httpMethod":"POST","resourcePath":"/orders","status":"502","responseLatency":"10012",'
+    '"integrationError":"Lambda function timed out after 10000 ms"}}',
+    '{{"requestId":"{rid}","ip":"10.0.{n}","httpMethod":"GET","resourcePath":"/health","status":"200","responseLatency":"3"}}',
+    '{{"requestId":"{rid}","ip":"10.0.{n}","httpMethod":"POST","resourcePath":"/orders","status":"201","responseLatency":"230"}}',
+    '{{"requestId":"{rid}","ip":"10.0.{n}","httpMethod":"GET","resourcePath":"/orders/{{id}}","status":"404","responseLatency":"39"}}',
+]
+APIGW_HTTP_ACCESS_LINES = ["{rid} GET /orders 200", "{rid} POST /orders 200", "{rid} GET /orders/{{id}} 200", "{rid} $default 502"]
+APIGW_EXECUTION_LINES = [
+    "({rid}) Extended Request Id: Xyz{n}=",
+    "({rid}) HTTP Method: POST, Resource Path: /orders",
+    "({rid}) Lambda execution failed with status 200 due to customer function error: payment provider did not answer in 3000 ms."
+    " Lambda request id: {uuid}",
+    "({rid}) Method completed with status: 502",
+    "({rid}) Execution failed due to a timeout error",
+    "({rid}) Method completed with status: 504",
+    "({rid}) Successfully completed execution",
+]
+LINES_BY_GROUP.update({"/aws/apigateway/public-api-prod": APIGW_ACCESS_LINES, "/aws/apigateway/orders-http-prod": APIGW_HTTP_ACCESS_LINES,
+                       "API-Gateway-Execution-Logs_a1b2c3/prod": APIGW_EXECUTION_LINES})
+_log_groups_before_apigw = log_groups
+
+
+def log_groups():  # noqa: F811
+    return _log_groups_before_apigw() + ["/aws/apigateway/public-api-prod", "/aws/apigateway/orders-http-prod"]
+
+
+def _apigw_json(status, obj, error=None):
+    headers = {"content-type": "application/json"}
+    if error:
+        headers["x-amzn-errortype"] = error
+    return status, headers, json.dumps(obj).encode()
+
+
+def _apigw_not_found(what):
+    return _apigw_json(404, {"message": f"Invalid {what} identifier specified"}, "NotFoundException")
+
+
+def _rest_resources(api):
+    out = []
+    for rid, (path, methods) in api["resources"].items():
+        parent = path.rsplit("/", 1)[0] or "/"
+        item = {"id": rid, "path": path, "pathPart": path.rsplit("/", 1)[-1]}
+        if path != "/":
+            item["parentId"] = next((k for k, (p, _) in api["resources"].items() if p == parent), None)
+        if methods:
+            item["resourceMethods"] = {verb: {"httpMethod": verb, **m} for verb, m in methods.items()}
+        out.append(item)
+    return out
+
+
+def _openapi(name, paths, yaml):
+    doc = {"openapi": "3.0.1", "info": {"title": name, "version": "2026-10-21"}, "paths": {}}
+    for method, path in paths:
+        doc["paths"].setdefault(path, {})[method.lower() if method != "ANY" else "x-amazon-apigateway-any-method"] = {
+            "responses": {"200": {"description": "200 response"}}}
+    if not yaml:
+        return json.dumps(doc, indent=2)
+    lines = [f"openapi: \"{doc['openapi']}\"", "info:", f"  title: \"{name}\"", f"  version: \"{doc['info']['version']}\"", "paths:"]
+    for path, methods in doc["paths"].items():
+        lines.append(f"  {path}:")
+        for m in methods:
+            lines += [f"    {m}:", "      responses:", "        \"200\":", "          description: \"200 response\""]
+    return "\n".join(lines) + "\n"
+
+
+def _execution_log(rid, method, path, uri, status, latency, body):
+    stamp = time.strftime("%a %b %d %H:%M:%S UTC %Y", time.gmtime())
+    lines = [f"Execution log for request {rid}", f"{stamp} : Starting execution for request: {rid}",
+             f"{stamp} : HTTP Method: {method}, Resource Path: {path}", f"{stamp} : Method request path: {{}}",
+             f"{stamp} : Endpoint request URI: {uri}", f"{stamp} : Received response. Status: {status}, Integration latency: {latency} ms",
+             f"{stamp} : Endpoint response body before transformations: {body[:200]}"]
+    if status >= 500:
+        lines.append(f"{stamp} : Execution failed due to configuration error: the integration returned an error")
+    lines.append(f"{stamp} : Method completed with status: {status}")
+    return "\n".join(lines) + "\n"
+
+
+def _test_invoke(api, rid, verb, body):
+    path, methods = api["resources"].get(rid, (None, {}))
+    m = methods.get(verb) or methods.get("ANY")
+    if m is None:
+        return _apigw_not_found("Method")
+    req = json.loads(body or b"{}")
+    integration = m["methodIntegration"]
+    request_id = str(uuid.uuid4())
+    if integration["type"] == "MOCK":
+        status, out = 200, '{"status": "ok"}'
+    elif integration["type"] == "AWS_PROXY":
+        fn = integration["uri"].split(":function:")[1].split("/")[0]
+        payload = {"resource": path, "path": req.get("pathWithQueryString", path).split("?")[0], "httpMethod": verb,
+                   "body": req.get("body"), "stageVariables": req.get("stageVariables")}
+        if verb == "POST" and fn == "payments-webhook" and "fail" in (req.get("body") or ""):
+            payload = {"fail": True}
+        _, _, raw = lambda_invoke(f"/2015-03-31/functions/{fn}/invocations", {}, json.dumps(payload).encode())
+        result = json.loads(raw)
+        if "errorType" in result:
+            status, out = 502, '{"message": "Internal server error"}'
+        else:
+            status, out = result.get("statusCode", 200), result.get("body", "")
+    elif integration["type"] == "AWS":
+        status, out = 200, json.dumps({"SendMessageResponse": {"SendMessageResult": {"MessageId": request_id}}})
+    else:
+        status, out = 502, '{"message": "Internal server error"}'
+    latency = 182 if status < 500 else 3010
+    log = _execution_log(request_id, verb, path, integration.get("uri", "MOCK"), status, latency, out)
+    return _apigw_json(200, {"status": status, "body": out, "latency": latency + 14, "log": log,
+                             "headers": {"Content-Type": "application/json", "X-Amzn-Trace-Id": f"Root=1-{request_id[:8]}"}})
+
+
+def _execute(method, path, headers, body):
+    """An HTTP API's invoke endpoint: /__execute/{apiId}[/{stage}]/path."""
+    parts = path.split("/")[2:]
+    api = APIGW_V2.get(parts[0]) if parts else None
+    if api is None:
+        return _apigw_json(404, {"message": "Not Found"})
+    rest = parts[1:]
+    stage = "$default"
+    if rest and any(s["stageName"] == rest[0] for s in api["stages"]):
+        stage, rest = rest[0], rest[1:]
+    req_path = "/" + "/".join(rest)
+    for r in api["routes"]:
+        verb, _, template = r["routeKey"].partition(" ")
+        pattern = "^" + re.sub(r"\{[^/]+\}", "[^/]+", template) + "$"
+        if r["routeKey"] == "$default" or verb != method or not re.match(pattern, req_path):
+            continue
+        if r["authorizationType"] == "JWT" and not headers.get("authorization"):
+            return _apigw_json(401, {"message": "Unauthorized"})
+        if r["routeKey"] == "POST /notify":
+            return _apigw_json(200, {"SendMessageResponse": {"MessageId": str(uuid.uuid4())}})
+        return _apigw_json(200, {"route": r["routeKey"], "stage": stage, "path": req_path, "received": body.decode() or None})
+    return _apigw_json(502, {"message": "Internal Server Error"})
 
 
 def apigateway_rest(method, path, query, headers, body):
     """API Gateway requests. Returns (status, headers, body bytes)."""
-    data = json.dumps({"message": f"mock: no route for {method} {path}"}).encode()
-    return 404, {"content-type": "application/json", "x-amzn-errortype": "NotFoundException"}, data
+    if path.startswith("/__execute/"):
+        return _execute(method, path, headers, body)
+    p = [unquote(x) for x in path.strip("/").split("/")]
+    if p == ["restapis"]:
+        return _apigw_json(200, {"item": [a["api"] for a in APIGW_REST.values()]})
+    if p == ["usageplans"]:
+        return _apigw_json(200, {"item": APIGW_USAGE_PLANS})
+    if p[0] == "restapis":
+        api = APIGW_REST.get(p[1])
+        if api is None:
+            return _apigw_not_found("API")
+        what = p[2] if len(p) > 2 else ""
+        if what == "resources" and len(p) == 3:
+            return _apigw_json(200, {"item": _rest_resources(api)})
+        if what == "resources" and len(p) == 6 and method == "POST":
+            return _test_invoke(api, p[3], p[5], body)
+        if what == "authorizers":
+            return _apigw_json(200, {"item": api["authorizers"]})
+        if what == "requestvalidators":
+            return _apigw_json(200, {"item": api["validators"]})
+        if what == "deployments" and method == "POST":
+            req = json.loads(body or b"{}")
+            dep = {"id": uuid.uuid4().hex[:6], "description": req.get("description", ""), "createdDate": time.time()}
+            api["deployments"].insert(0, dep)
+            for s in api["stages"]:
+                if s["stageName"] == req.get("stageName"):
+                    s.update({"deploymentId": dep["id"], "lastUpdatedDate": time.time()})
+            return _apigw_json(201, dep)
+        if what == "deployments":
+            return _apigw_json(200, {"item": api["deployments"]})
+        if what == "stages" and len(p) == 3:
+            return _apigw_json(200, {"item": api["stages"]})
+        stage = next((s for s in api["stages"] if len(p) > 3 and s["stageName"] == p[3]), None)
+        if what == "stages" and stage is None:
+            return _apigw_not_found("stage")
+        if what == "stages" and method == "PATCH":
+            for op in json.loads(body or b"{}").get("patchOperations", []):
+                if op.get("path") == "/deploymentId":
+                    if not any(d["id"] == op["value"] for d in api["deployments"]):
+                        return _apigw_json(400, {"message": "Invalid deployment identifier specified"}, "BadRequestException")
+                    stage.update({"deploymentId": op["value"], "lastUpdatedDate": time.time()})
+            return _apigw_json(200, stage)
+        if what == "stages" and len(p) == 6 and p[4] == "exports":
+            paths = [(verb, rpath) for rpath, methods in api["resources"].values() for verb in methods]
+            yaml = "yaml" in headers.get("accept", "")
+            return 200, {"content-type": "application/yaml" if yaml else "application/json"}, _openapi(api["api"]["name"], paths, yaml).encode()
+        return _apigw_json(404, {"message": f"mock: no route for {method} {path}"}, "NotFoundException")
+    if p[:2] == ["v2", "domainnames"]:
+        if len(p) == 2:
+            return _apigw_json(200, {"items": [{k: v for k, v in d.items() if k != "mappings"} for d in APIGW_DOMAINS]})
+        d = next((d for d in APIGW_DOMAINS if d["domainName"] == p[2]), None)
+        if d is None:
+            return _apigw_not_found("domain name")
+        return _apigw_json(200, {"items": d["mappings"]})
+    if p[:2] == ["v2", "apis"]:
+        if len(p) == 2:
+            return _apigw_json(200, {"items": [a["api"] for a in APIGW_V2.values()]})
+        api = APIGW_V2.get(p[2])
+        if api is None:
+            return _apigw_not_found("API")
+        what = p[3] if len(p) > 3 else ""
+        if what in ("routes", "integrations", "authorizers") and len(p) == 4:
+            return _apigw_json(200, {"items": api[what]})
+        if what == "deployments" and method == "POST":
+            req = json.loads(body or b"{}")
+            stage = next((s for s in api["stages"] if s["stageName"] == req.get("stageName")), None)
+            if stage and stage.get("autoDeploy"):
+                return _apigw_json(400, {"message": "Stage with autoDeploy enabled cannot be deployed manually"}, "BadRequestException")
+            dep = {"deploymentId": uuid.uuid4().hex[:6], "createdDate": s3_iso(time.time()), "deploymentStatus": "DEPLOYED",
+                   "description": req.get("description", "")}
+            api["deployments"].insert(0, dep)
+            if stage:
+                stage.update({"deploymentId": dep["deploymentId"], "lastUpdatedDate": s3_iso(time.time())})
+            return _apigw_json(201, dep)
+        if what == "deployments":
+            return _apigw_json(200, {"items": api["deployments"]})
+        if what == "stages" and len(p) == 4:
+            return _apigw_json(200, {"items": api["stages"]})
+        if what == "stages" and method == "PATCH":
+            stage = next((s for s in api["stages"] if s["stageName"] == p[4]), None)
+            if stage is None:
+                return _apigw_not_found("stage")
+            req = json.loads(body or b"{}")
+            if "deploymentId" in req:
+                if stage.get("autoDeploy"):
+                    return _apigw_json(400, {"message": "DeploymentId cannot be set on a stage with autoDeploy enabled"}, "BadRequestException")
+                stage.update({"deploymentId": req["deploymentId"], "lastUpdatedDate": s3_iso(time.time())})
+            return _apigw_json(200, stage)
+        if what == "exports":
+            if api["api"]["protocolType"] != "HTTP":
+                return _apigw_json(400, {"message": "Exporting WebSocket APIs is not supported"}, "BadRequestException")
+            paths = [tuple(r["routeKey"].split(" ", 1)) for r in api["routes"] if " " in r["routeKey"]]
+            yaml = query.get("outputType", "YAML") == "YAML"
+            return 200, {"content-type": "application/octet-stream"}, _openapi(api["api"]["name"], paths, yaml).encode()
+    return _apigw_json(404, {"message": f"mock: no route for {method} {path}"}, "NotFoundException")
+
+
+def _apigw_metric(namespace, name, dims, stat, period, ts):
+    """AWS/ApiGateway: steady traffic per stage, 0.3% server errors, and POST /orders (a slow
+    payment provider) failing more, worst in the last 3 hours. Routes have numbers only on
+    stages with detailed metrics."""
+    if namespace != "AWS/ApiGateway":
+        return None
+    api_key = dims.get("ApiName") or dims.get("ApiId", "")
+    stage = dims.get("Stage", "")
+    route = dims.get("Route") or (f"{dims['Method']} {dims['Resource']}" if "Method" in dims else None)
+    rate = APIGW_TRAFFIC.get((api_key, stage))
+    if rate is None:
+        return CW_NO_DATA
+    if route:
+        detailed = False
+        for api in list(APIGW_REST.values()) + list(APIGW_V2.values()):
+            if api["api"].get("name") == api_key or api["api"].get("apiId") == api_key:
+                s = next((s for s in api["stages"] if s["stageName"] == stage), {})
+                detailed = s.get("methodSettings", {}).get("*/*", {}).get("metricsEnabled") or \
+                    s.get("defaultRouteSettings", {}).get("detailedMetricsEnabled")
+        if not detailed:
+            return CW_NO_DATA
+        rate = rate / 4
+    seed = int(hashlib.sha256(f"{name}{stat}{sorted(dims.items())}{int(ts)}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    wave = 1 + 0.5 * math.sin(ts / 86400 * 2 * math.pi)
+    count = rate * period / 60 * wave * (0.9 + 0.2 * seed)
+    failing = route in APIGW_FAILING or (route is None and api_key == "public-api" and stage == "prod")
+    # The share of this period within the last 3 hours, when the failures started.
+    now = time.time()
+    spike = max(0.0, min(ts + period, now) - max(ts, now - 3 * 3600)) / period if failing else 0.0
+    error_share = 0.003 + (0.08 if route else 0.02) * spike
+    slow = 900 if (route in APIGW_FAILING) else 0
+    values = {
+        "Count": count, "MessageCount": count, "ConnectCount": count / 15,
+        "5XXError": count * error_share, "5xx": count * error_share, "IntegrationError": count * 0.002, "ExecutionError": count * 0.001,
+        "4XXError": count * 0.015, "4xx": count * 0.015, "ClientError": count * 0.01,
+        "CacheHitCount": count * 0.05, "CacheMissCount": count * 0.95,
+    }
+    if name in values:
+        return round(values[name], 2) if stat in ("Sum", "SampleCount") else 1.0
+    if name in ("Latency", "IntegrationLatency"):
+        base = {"p50": 60, "p90": 180, "p99": 420, "Maximum": 900}.get(stat, 85) + slow * (1 if stat in ("p99", "Maximum") else 0.3)
+        own = 0 if name == "IntegrationLatency" else 18
+        return round((base + own) * (0.85 + 0.3 * seed), 1)
+    return None
+
+
+CW_METRIC_HOOKS.append(_apigw_metric)
 
 
 # ---- RDS (awsQuery, Version 2014-10-31) -------------------------------------------------------
