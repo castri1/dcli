@@ -3467,14 +3467,403 @@ def dms(op, body):
 
 
 # ---- Redshift (awsQuery, Version 2012-12-01) ---------------------------------------------------
+RS_NS = "http://redshift.amazonaws.com/doc/2012-12-01/"
+RS_CLUSTERS = {
+    # Busy: compute-0 skewed, a WLM queue at peaks, concurrency scaling, a blocking lock.
+    "analytics-prod": {"type": "ra3.4xlarge", "nodes": 4, "status": "available", "db": "analytics", "user": "admin",
+                       "public": False, "encrypted": True, "routing": True, "pg": "analytics-wlm", "created": T0 - 86400 * 700, "net": 10},
+    # Used in office hours only: a candidate to pause on a schedule; publicly accessible.
+    "analytics-dev": {"type": "ra3.xlplus", "nodes": 2, "status": "available", "db": "dev", "user": "admin",
+                      "public": True, "encrypted": True, "routing": False, "pg": "default.redshift-1.0", "created": T0 - 86400 * 300, "net": 20},
+    # Lightly used all the time: nodes to spare.
+    "reporting-dw": {"type": "ra3.4xlarge", "nodes": 6, "status": "available", "db": "reporting", "user": "report_admin",
+                     "public": False, "encrypted": True, "routing": True, "pg": "default.redshift-1.0", "created": T0 - 86400 * 500, "net": 30},
+    # Old generation, paused, unencrypted.
+    "legacy-dw": {"type": "dc2.large", "nodes": 2, "status": "paused", "db": "legacy", "user": "dw_admin",
+                  "public": False, "encrypted": False, "routing": False, "pg": "default.redshift-1.0", "created": T0 - 86400 * 1400, "net": 40},
+}
+# A change under way: cluster → (when it ends, what then).
+RS_CHANGES = {}
+RS_SNAPSHOTS = [
+    # (id, cluster, kind, created, MB, status)
+    *[(f"rs:analytics-prod-2026-10-{22 - d:02d}-06-00", "analytics-prod", "automated", T0 - d * 86400, 2_400_000, "available") for d in range(1, 4)],
+    ("analytics-prod-before-migration", "analytics-prod", "manual", T0 - 200 * 86400, 870_400, "available"),
+    ("analytics-dev-schema-test", "analytics-dev", "manual", T0 - 10 * 86400, 51_200, "available"),
+    ("legacy-dw-final-2025", "legacy-dw", "manual", T0 - 400 * 86400, 286_720, "available"),
+    ("legacy-dw-before-pause", "legacy-dw", "manual", T0 - 120 * 86400, 290_000, "available"),
+]
+RS_EVENTS = [
+    ("analytics-prod", "INFO", "management", "Cluster analytics-prod completed a resize from 2 to 4 nodes.", 5),
+    ("analytics-prod", "ERROR", "monitoring", "A node in cluster analytics-prod failed and was replaced (Compute-2).", 2),
+    ("analytics-prod", "INFO", "configuration", "Cluster analytics-prod parameter group analytics-wlm was updated: \x1b[31mwlm_json_configuration\x1b[0m.", 1),
+    ("analytics-dev", "INFO", "pending", "Cluster analytics-dev has a maintenance window scheduled.", 3),
+    ("legacy-dw", "INFO", "management", "Cluster legacy-dw has been paused.", 6),
+]
+RS_EVENT_LOG = []  # (cluster, severity, category, message, time) of changes made here
+RS_WLM = {
+    "analytics-wlm": json.dumps([
+        {"query_group": [], "user_group": ["etl"], "query_concurrency": 5, "memory_percent_to_use": 40},
+        {"query_group": [], "user_group": ["bi"], "query_concurrency": 10, "memory_percent_to_use": 40},
+        {"query_concurrency": 5},
+        {"short_query_queue": True},
+    ]),
+    "default.redshift-1.0": json.dumps([{"auto_wlm": True}]),
+}
+
+
+def rs_x(tag, value):
+    """An element; None leaves it out. ESC characters travel as &#x1b;, as AWS would send them."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    return f"<{tag}>{xml_escape(str(value)).replace(chr(27), '&#x1b;').replace(chr(7), '&#x7;')}</{tag}>"
+
+
+def rs_iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+
+def rs_xml(action, inner):
+    return (f'<{action}Response xmlns="{RS_NS}"><{action}Result>{inner}</{action}Result>'
+            f"<ResponseMetadata><RequestId>{eid()}</RequestId></ResponseMetadata></{action}Response>")
+
+
+def rs_settle():
+    """Finishes the changes whose time has come (pausing → paused, resizing → available…)."""
+    for name, (until, then) in list(RS_CHANGES.items()):
+        if time.time() >= until:
+            RS_CLUSTERS[name].update(then)
+            del RS_CHANGES[name]
+    for i, snap in enumerate(RS_SNAPSHOTS):
+        if snap[5] == "creating" and time.time() - snap[3] > 5:
+            RS_SNAPSHOTS[i] = (*snap[:5], "available")
+
+
+def rs_cluster_xml(name, c):
+    nodes = ""
+    if c["status"] != "paused":
+        roles = ["LEADER"] + [f"COMPUTE-{k}" for k in range(c["nodes"])] if c["nodes"] > 1 else ["SHARED"]
+        for k, role in enumerate(roles):
+            net = c["net"]
+            public = rs_x("PublicIPAddress", f"54.20.{net}.{k + 10}") if c["public"] else ""
+            private = rs_x("PrivateIPAddress", f"10.{net}.0.{k + 10}")
+            nodes += f"<member>{rs_x('NodeRole', role)}{private}{public}</member>"
+    pending, resize = "", ""
+    change = RS_CHANGES.get(name)
+    if change and c["status"] == "resizing":
+        then = change[1]
+        pending = f"{rs_x('NodeType', then['type'])}{rs_x('NumberOfNodes', then['nodes'])}"
+        resize = f"<ResizeInfo>{rs_x('ResizeType', 'ElasticResize')}{rs_x('AllowCancelResize', 'true')}</ResizeInfo>"
+    counts = sorted({max(1, c["nodes"] // 2), c["nodes"] * 2, c["nodes"] + 2} - {c["nodes"]})
+    address = rs_x("Address", f"{name}.c9mock1x2y3z.us-east-1.redshift.amazonaws.com")
+    endpoint = "" if c["status"] == "paused" else f"<Endpoint>{address}{rs_x('Port', 5439)}</Endpoint>"
+    return (f"<Cluster>{rs_x('ClusterIdentifier', name)}{rs_x('NodeType', c['type'])}{rs_x('ClusterStatus', c['status'])}"
+            f"{rs_x('ClusterAvailabilityStatus', {'available': 'Available', 'paused': 'Unavailable'}.get(c['status'], 'Modifying'))}"
+            f"{rs_x('NumberOfNodes', c['nodes'])}{rs_x('DBName', c['db'])}{rs_x('MasterUsername', c['user'])}{endpoint}"
+            f"{rs_x('ClusterCreateTime', rs_iso(c['created']))}{rs_x('AutomatedSnapshotRetentionPeriod', 7)}"
+            f"{rs_x('ManualSnapshotRetentionPeriod', -1)}"
+            f"<ClusterSecurityGroups/><VpcSecurityGroups><VpcSecurityGroup>{rs_x('VpcSecurityGroupId', 'sg-0rs')}"
+            f"{rs_x('Status', 'active')}</VpcSecurityGroup></VpcSecurityGroups>"
+            f"<ClusterParameterGroups><ClusterParameterGroup>{rs_x('ParameterGroupName', c['pg'])}"
+            f"{rs_x('ParameterApplyStatus', 'in-sync')}</ClusterParameterGroup></ClusterParameterGroups>"
+            f"{rs_x('VpcId', 'vpc-0abc')}{rs_x('AvailabilityZone', 'us-east-1a')}"
+            f"{rs_x('PreferredMaintenanceWindow', 'sun:06:00-sun:06:30')}<PendingModifiedValues>{pending}</PendingModifiedValues>"
+            f"{rs_x('ClusterVersion', '1.0')}{rs_x('AllowVersionUpgrade', True)}{rs_x('PubliclyAccessible', c['public'])}"
+            f"{rs_x('Encrypted', c['encrypted'])}{rs_x('EnhancedVpcRouting', c['routing'])}"
+            f"{f'<ClusterNodes>{nodes}</ClusterNodes>' if nodes else ''}{rs_x('MaintenanceTrackName', 'current')}"
+            f"{rs_x('ElasticResizeNumberOfNodeOptions', '[' + ','.join(map(str, counts)) + ']')}"
+            f"{rs_x('NextMaintenanceWindowStartTime', rs_iso(T0 + 86400 * 3))}{rs_x('MultiAZ', 'Disabled')}{resize}"
+            f"{rs_x('ClusterNamespaceArn', 'arn:aws:redshift:us-east-1:123456789012:namespace:' + name + '-ns')}</Cluster>")
+
+
+def rs_change(name, status, then, secs, message):
+    RS_CLUSTERS[name]["status"] = status
+    RS_CHANGES[name] = (time.time() + secs, then)
+    RS_EVENT_LOG.append((name, "INFO", "management", message, time.time()))
+
+
 def redshift(params):
-    action = params.get("Action", [""])[0]
+    """awsQuery: form-encoded request, XML response (status, body)."""
+    get = lambda k, d="": params.get(k, [d])[0]
+    action = get("Action")
+    rs_settle()
+    name = get("ClusterIdentifier")
+    c = RS_CLUSTERS.get(name)
+    if action == "DescribeClusters":
+        if name and c is None:
+            return 404, query_error("ClusterNotFound", f"Cluster {xml_escape(name)} not found.")
+        body = "".join(rs_cluster_xml(n, x) for n, x in RS_CLUSTERS.items() if not name or n == name)
+        return 200, rs_xml(action, f"<Clusters>{body}</Clusters>")
+    if action == "DescribeClusterSnapshots":
+        rows = [s for s in RS_SNAPSHOTS if not name or s[1] == name]
+        body = "".join(
+            f"<Snapshot>{rs_x('SnapshotIdentifier', s)}{rs_x('ClusterIdentifier', cl)}{rs_x('SnapshotType', kind)}{rs_x('Status', st)}"
+            f"{rs_x('SnapshotCreateTime', rs_iso(created))}{rs_x('TotalBackupSizeInMegaBytes', mb)}"
+            f"{rs_x('NodeType', RS_CLUSTERS[cl]['type'])}{rs_x('NumberOfNodes', RS_CLUSTERS[cl]['nodes'])}"
+            f"{rs_x('ManualSnapshotRetentionPeriod', -1 if kind == 'manual' else None)}</Snapshot>"
+            for s, cl, kind, created, mb, st in rows)
+        return 200, rs_xml(action, f"<Snapshots>{body}</Snapshots>")
+    if action == "DescribeEvents":
+        events = [(cl, sev, cat, msg, time.time() - 86400 * days) for cl, sev, cat, msg, days in RS_EVENTS] + RS_EVENT_LOG
+        body = "".join(
+            f"<Event>{rs_x('SourceIdentifier', cl)}{rs_x('SourceType', 'cluster')}{rs_x('Severity', sev)}{rs_x('Message', msg)}"
+            f"<EventCategories>{rs_x('EventCategory', cat)}</EventCategories>{rs_x('Date', rs_iso(t))}{rs_x('EventId', 'REDSHIFT-EVENT-' + str(int(t) % 9000 + 1000))}</Event>"
+            for cl, sev, cat, msg, t in events)
+        return 200, rs_xml(action, f"<Events>{body}</Events>")
+    if action == "DescribeClusterParameters":
+        group = get("ParameterGroupName")
+        value = RS_WLM.get(group, RS_WLM["default.redshift-1.0"])
+        body = (f"<Parameter>{rs_x('ParameterName', 'enable_user_activity_logging')}{rs_x('ParameterValue', 'false')}</Parameter>"
+                f"<Parameter>{rs_x('ParameterName', 'wlm_json_configuration')}{rs_x('ParameterValue', value)}"
+                f"{rs_x('Source', 'user' if group != 'default.redshift-1.0' else 'engine-default')}</Parameter>")
+        return 200, rs_xml(action, f"<Parameters>{body}</Parameters>")
+    if action == "DescribeNodeConfigurationOptions":
+        if c is None:
+            return 404, query_error("ClusterNotFound", f"Cluster {xml_escape(name)} not found.")
+        if c["status"] != "available":
+            return 400, query_error("InvalidClusterState", f"The cluster {name} is {c['status']}.")
+        used = {"analytics-prod": 52.0, "analytics-dev": 18.0, "reporting-dw": 20.0}.get(name, 40.0) * c["nodes"]
+        shapes = [(c["type"], n) for n in sorted({max(2, c["nodes"] // 2), c["nodes"] - 1, c["nodes"], c["nodes"] + 2, c["nodes"] * 2}) if n >= 1]
+        if c["type"] == "ra3.4xlarge":
+            shapes.append(("ra3.16xlarge", max(2, c["nodes"] // 4)))
+        if c["type"] == "ra3.xlplus":
+            shapes = [(c["type"], n) for n in (1, 2, 3, 4)] + [("ra3.4xlarge", 2)]
+        disk = {(t, n): round(used / n / (4 if t == "ra3.16xlarge" else 1), 1) for t, n in shapes}
+        body = "".join(
+            f"<NodeConfigurationOption>{rs_x('NodeType', t)}{rs_x('NumberOfNodes', n)}"
+            f"{rs_x('EstimatedDiskUtilizationPercent', disk[(t, n)])}{rs_x('Mode', 'standard')}</NodeConfigurationOption>"
+            for t, n in shapes if disk[(t, n)] <= 95)
+        return 200, rs_xml(action, f"<NodeConfigurationOptionList>{body}</NodeConfigurationOptionList>")
+    if c is None and action in ("PauseCluster", "ResumeCluster", "ResizeCluster", "CreateClusterSnapshot"):
+        return 404, query_error("ClusterNotFound", f"Cluster {xml_escape(name)} not found.")
+    if action == "PauseCluster":
+        if c["status"] != "available":
+            return 400, query_error("InvalidClusterState", f"You can only pause an available cluster: {name} is {c['status']}.")
+        rs_change(name, "pausing", {"status": "paused"}, 8, f"Cluster {name} is being paused.")
+        return 200, rs_xml(action, rs_cluster_xml(name, c))
+    if action == "ResumeCluster":
+        if c["status"] != "paused":
+            return 400, query_error("InvalidClusterState", f"You can only resume a paused cluster: {name} is {c['status']}.")
+        rs_change(name, "resuming", {"status": "available"}, 8, f"Cluster {name} is being resumed.")
+        return 200, rs_xml(action, rs_cluster_xml(name, c))
+    if action == "ResizeCluster":
+        if c["status"] != "available":
+            return 400, query_error("InvalidClusterState", f"The cluster {name} is {c['status']}.")
+        then = {"status": "available", "type": get("NodeType") or c["type"], "nodes": int(get("NumberOfNodes") or c["nodes"])}
+        kind = "classic" if get("Classic") == "true" else "elastic"
+        rs_change(name, "resizing", then, 10, f"Cluster {name} started an {kind} resize to {then['type']} x {then['nodes']}.")
+        return 200, rs_xml(action, rs_cluster_xml(name, c))
+    if action == "CreateClusterSnapshot":
+        snap = get("SnapshotIdentifier")
+        if any(s[0] == snap for s in RS_SNAPSHOTS):
+            return 400, query_error("ClusterSnapshotAlreadyExists", f"Cluster snapshot {xml_escape(snap)} already exists.")
+        if c["status"] != "available":
+            return 400, query_error("InvalidClusterState", f"The cluster {name} is {c['status']}.")
+        RS_SNAPSHOTS.append((snap, name, "manual", time.time(), 2_400_000 if name == "analytics-prod" else 60_000, "creating"))
+        RS_EVENT_LOG.append((name, "INFO", "backup", f"Snapshot {snap} of cluster {name} started.", time.time()))
+        return 200, rs_xml(action, f"<Snapshot>{rs_x('SnapshotIdentifier', snap)}{rs_x('Status', 'creating')}</Snapshot>")
     return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
 
 
+def rs_metric(namespace, name, dims, stat, period, ts):
+    """AWS/Redshift: per-node CPU with compute-0 skewed on analytics-prod, office hours on
+    analytics-dev, light use on reporting-dw; nothing from a paused cluster."""
+    if namespace != "AWS/Redshift":
+        return None
+    cluster = RS_CLUSTERS.get(dims.get("ClusterIdentifier", ""))
+    if cluster is None or cluster["status"] in ("paused", "pausing"):
+        return CW_NO_DATA
+    cname = dims["ClusterIdentifier"]
+    node = dims.get("NodeID", "")
+    seed = int(hashlib.sha256(f"{cname}{name}{node}{dims.get('latency', '')}{int(ts)}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    hod = (ts / 3600) % 24
+    weekday = (int(ts // 86400) + 4) % 7 not in (0, 6)
+    wave = 1 + 0.5 * math.sin((hod - 9) / 24 * 2 * math.pi)
+    if cname == "analytics-dev":
+        office = weekday and 13 <= hod < 23
+        cpu, disk, conn = (18 + 8 * seed, 18.0, 4 + int(5 * seed)) if office else (0.5 + seed * 0.5, 18.0, 0)
+        queued, running = 0, (2 if office else 0)
+    elif cname == "reporting-dw":
+        cpu, disk, conn, queued, running = 9 + 6 * seed, 20.0, 2 + int(2 * seed), 0, 1
+    else:
+        busy = 70 + 12 * wave + 5 * seed
+        cpu = {"Leader": 10 + 6 * wave, "Compute-0": busy}.get(node, 24 + 8 * wave + 4 * seed) if node else 38 + 12 * wave
+        disk = {"Compute-0": 78.0}.get(node, 44 + seed) if node else 52.0
+        conn = int(28 + 16 * wave + 4 * seed)
+        queued = max(0, int((wave - 1.15) * 30 + 4 * seed))
+        running = int(7 + 3 * wave)
+    if name == "CPUUtilization":
+        return round(min(cpu * (1.15 if stat == "Maximum" else 1.0), 100.0), 2)
+    if name == "PercentageDiskSpaceUsed":
+        return disk
+    if name == "DatabaseConnections":
+        return float(conn)
+    if name == "WLMQueueLength":
+        return float(queued)
+    if name == "WLMQueueWaitTime":
+        return float(queued * 9000 + (seed * 400 if queued else 0))
+    if name == "WLMRunningQueries":
+        return float(running)
+    if name == "QueriesCompletedPerSecond":
+        base = {"short": 2.5, "medium": 0.4, "long": 0.05}.get(dims.get("latency"), 0.1)
+        return round(base * (wave if cname == "analytics-prod" else 0.2), 4)
+    if name == "QueryDuration":
+        return {"short": 2e5, "medium": 5e6, "long": 1.2e8}.get(dims.get("latency"), 1e6) * (0.8 + 0.4 * seed)
+    if name in ("ReadLatency", "WriteLatency"):
+        return (0.004 if name == "ReadLatency" else 0.009) * (0.8 + 0.4 * seed)
+    if name == "ConcurrencyScalingActiveClusters":
+        return 1.0 if cname == "analytics-prod" and wave > 1.3 else 0.0
+    if name == "ConcurrencyScalingSeconds":
+        # Peaks of about two and a half hours a day.
+        if cname != "analytics-prod":
+            return 0.0
+        return float(period) * 0.105 if period >= 86400 else (float(period) if wave > 1.3 else 0.0)
+    if name == "HealthStatus":
+        return 1.0
+    if name == "MaintenanceMode":
+        return 0.0
+    return None
+
+
+CW_METRIC_HOOKS.append(rs_metric)
+
+
 # ---- Redshift Data API (awsJson1_1, X-Amz-Target RedshiftData.*) -------------------------------
+# A secret the identity form can pick (its name says what it is for).
+SECRETS.append({"Name": "prod/analytics/redshift", "Description": "Redshift analytics-prod admin", "Value": json.dumps({"username": "admin", "password": "rs-s3cr3t"}),
+                "Created": time.time() - 86400 * 90, "Changed": time.time() - 86400 * 30, "Accessed": time.time() - 3600,
+                "Tags": [{"Key": "service", "Value": "redshift"}], "Versions": 1})
+RS_STATEMENTS = {}
+RS_SESSIONS = {
+    "analytics-prod": [
+        # (query id, pid, user, status, started seconds ago, queued µs, SQL)
+        (88001, 1073, "etl", "running", 250, 0, "INSERT INTO analytics.events_daily\nSELECT event_date, user_id, count(*)\nFROM analytics.events\nGROUP BY 1, 2"),
+        (88002, 1081, "bi_user", "running", 95, 2_000_000, "SELECT user_id, count(*) FROM analytics.events WHERE event_date > current_date - 30 GROUP BY 1"),
+        (88003, 1090, "looker", "queued", 45, 45_000_000, "SELECT region, sum(amount) FROM sales.orders GROUP BY region ORDER BY 2 DESC"),
+        (88004, 1102, "dashboard", "running", 12, 0, "SELECT 1 /* \x1b[31mred\x1b[0m */ FROM analytics.kpis"),
+    ],
+    "analytics-dev": [(None, 2001, "dev_user", "running", 30, 0, "SELECT * FROM staging.raw_clicks LIMIT 1000")],
+    "reporting-dw": [],
+}
+RS_SLOW = [
+    (77001, 980, "etl", "success", 7200, 2_700_000_000, 0, "VACUUM analytics.events"),
+    (77002, 1010, "looker", "success", 5400, 1_380_000_000, 210_000_000, "SELECT * FROM sales.orders o JOIN sales.lines l ON l.order_id = o.id"),
+    (77003, 1011, "bi_user", "aborted", 4000, 900_000_000, 0, "SELECT user_id, count(DISTINCT session_id) FROM analytics.sessions GROUP BY 1"),
+    (77004, 1012, "etl", "success", 3600, 610_000_000, 95_000_000, "COPY analytics.events FROM 's3://acme-events/2026/10/21/' IAM_ROLE default FORMAT JSON 'auto'"),
+    (77005, 1013, "looker", "success", 1800, 300_000_000, 140_000_000, "SELECT region, sum(amount) FROM sales.orders GROUP BY region"),
+]
+RS_TABLES = [
+    # schema, table, size MB, rows, skew_rows, unsorted, stats_off, encoded, diststyle, sortkey, pct_used
+    ("analytics", "events", 1_840_000, 9_800_000_000, 7.8, 35.0, 4.0, "Y", "KEY(user_id)", "event_date", 31.2),
+    ("analytics", "sessions", 420_000, 1_200_000_000, 1.1, 3.0, 22.0, "Y", "KEY(session_id)", "started_at", 7.1),
+    ("sales", "orders", 96_000, 310_000_000, 1.0, 0.0, 0.0, "Y", "AUTO(KEY(customer_id))", "order_date", 1.6),
+    ("sales", "lines", 210_000, 1_100_000_000, 1.2, 12.0, 0.0, "Y", "KEY(order_id)", "order_id", 3.6),
+    ("staging", "raw_clicks", 150_000, 800_000_000, 1.0, 100.0, 100.0, "N", "EVEN", "", 2.5),
+    ("public", "events\x1b[2J", 900, 4_000_000, 1.0, 0.0, 0.0, "Y", "ALL", "", 0.02),
+    ("analytics", "kpis", 120, 50_000, 1.0, 0.0, 2.0, "Y", "ALL", "day", 0.0),
+]
+
+
+def rs_secret_ok(arn):
+    return any(secret_meta(x)["ARN"] == arn for x in SECRETS)
+
+
 def redshift_data(op, body):
-    raise KeyError(f"ValidationException: {op} is not in the mock yet")
+    rs_settle()
+    if op == "ExecuteStatement":
+        name = body.get("ClusterIdentifier", "")
+        c = RS_CLUSTERS.get(name)
+        if c is None:
+            raise KeyError(f"ValidationException: Cluster {name} not found")
+        if c["status"] != "available":
+            raise KeyError(f"ValidationException: Cluster {name} is {c['status']}: it cannot run statements")
+        if not body.get("Database"):
+            raise KeyError("ValidationException: Database is required")
+        if not body.get("DbUser") and not body.get("SecretArn"):
+            raise KeyError("ValidationException: either DbUser or SecretArn is required")
+        sid = eid()
+        error = None
+        if body.get("SecretArn") and not rs_secret_ok(body["SecretArn"]):
+            error = "FATAL: secret not found or not authorized (check the secret's resource policy)"
+        elif body.get("DbUser") == "nobody":
+            error = 'FATAL: permission denied for user "IAM:nobody": redshift:GetClusterCredentials is not allowed'
+        sql = body.get("Sql", "")
+        if name == "analytics-dev" and "sys_query_history" in sql.lower():
+            error = 'ERROR: relation "sys_query_history" does not exist'
+        RS_STATEMENTS[sid] = {"sql": sql, "cluster": name, "db": body["Database"], "user": body.get("DbUser"), "t": time.time(), "error": error}
+        return {"Id": sid, "ClusterIdentifier": name, "Database": body["Database"], "CreatedAt": time.time()}
+    st = RS_STATEMENTS.get(body.get("Id", ""))
+    if st is None:
+        raise KeyError("ResourceNotFoundException: statement not found")
+    if op == "DescribeStatement":
+        age = time.time() - st["t"]
+        status = "SUBMITTED" if age < 0.2 else "STARTED" if age < 0.6 else ("FAILED" if st["error"] else "FINISHED")
+        if st.get("cancelled"):
+            status = "ABORTED"
+        out = {"Id": body["Id"], "Status": status, "HasResultSet": status == "FINISHED", "QueryString": st["sql"], "Duration": int(age * 1e9)}
+        if status == "FAILED":
+            out["Error"] = st["error"]
+        return out
+    if op == "CancelStatement":
+        st["cancelled"] = True
+        return {"Status": True}
+    if op == "GetStatementResult":
+        if st["error"] or time.time() - st["t"] < 0.6:
+            raise KeyError("ValidationException: the statement has no result to read")
+        return rs_result(st)
+    raise KeyError(f"ValidationException: {op} is not in the mock")
+
+
+def rs_field(v):
+    if v is None:
+        return {"isNull": True}
+    if isinstance(v, bool):
+        return {"booleanValue": v}
+    if isinstance(v, int):
+        return {"longValue": v}
+    if isinstance(v, float):
+        return {"doubleValue": v}
+    return {"stringValue": v}
+
+
+def rs_rows(columns, rows):
+    return {"ColumnMetadata": [{"name": c, "typeName": "varchar"} for c in columns], "Records": [[rs_field(v) for v in r] for r in rows],
+            "TotalNumRows": len(rows)}
+
+
+RS_QUERY_COLUMNS = ["query_id", "session_id", "user_name", "database_name", "status", "started", "elapsed_time", "queue_time", "query_text"]
+
+
+def rs_result(st):
+    sql = st["sql"].lower()
+    name, now = st["cluster"], time.time()
+    sessions = RS_SESSIONS.setdefault(name, [])
+    if "pg_cancel_backend(" in sql:
+        pid = int(re.search(r"pg_cancel_backend\((\d+)\)", sql).group(1))
+        known = any(s[1] == pid for s in sessions)
+        RS_SESSIONS[name] = [s for s in sessions if s[1] != pid]
+        return rs_rows(["pg_cancel_backend"], [[1 if known else 0]])
+    if "status in ('planning'" in sql or "from stv_recents" in sql:
+        rows = [[q, pid, user, st["db"], status, now - ago, int(ago * 1e6), queued, text] for q, pid, user, status, ago, queued, text in sessions
+                if "stv_recents" not in sql or status == "running"]
+        return rs_rows(RS_QUERY_COLUMNS, rows)
+    if "sys_query_history" in sql or "from stl_query" in sql:
+        by_queue = "queue_time desc" in sql
+        rows = sorted(RS_SLOW if name == "analytics-prod" else RS_SLOW[3:], key=lambda r: -(r[6] if by_queue else r[5]))
+        rows = [r for r in rows if not by_queue or r[6] > 0]
+        return rs_rows(RS_QUERY_COLUMNS, [[q, pid, user, st["db"], status, now - ago, elapsed, queued, text]
+                                          for q, pid, user, status, ago, elapsed, queued, text in rows])
+    if "svv_transactions" in sql:
+        rows = []
+        if name == "analytics-prod" and any(s[1] == 1081 for s in sessions) and any(s[1] == 1073 for s in sessions):
+            rows.append([1081, "bi_user", 1073, "etl", "analytics.events", "AccessShareLock", "AccessExclusiveLock", 95, 250])
+        return rs_rows(["waiting_pid", "waiting_user", "blocking_pid", "blocking_user", "table_name", "wanted", "held", "waiting_s", "held_s"], rows)
+    if "svv_table_info" in sql:
+        tables = RS_TABLES if name == "analytics-prod" else RS_TABLES[3:]
+        return rs_rows(["schema_name", "table_name", "size", "tbl_rows", "skew_rows", "unsorted", "stats_off", "encoded", "diststyle", "sortkey", "pct_used"],
+                       [list(t) for t in tables])
+    return rs_rows(["?column?"], [[1]])
 
 
 def is_appconfig(path):
