@@ -5,6 +5,7 @@
 //! (`Aws::rest`), so no per-service SDK crate is needed.
 
 pub mod alarms;
+pub mod apigateway;
 pub mod appconfig;
 pub mod cloudformation;
 pub mod cloudwatch;
@@ -18,7 +19,9 @@ pub mod http;
 pub mod lambda;
 pub mod logs;
 pub mod metrics;
+pub mod pi;
 pub mod profile;
+pub mod rds;
 pub mod s3;
 pub mod secrets;
 pub mod sfn;

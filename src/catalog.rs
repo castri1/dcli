@@ -1,7 +1,7 @@
 //! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, log
 //! groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues,
-//! tables, event buses, AppConfig applications and alarms, each with the module that opens
-//! it. Services are listed in parallel and capped; a service the user cannot read is left out.
+//! tables, API Gateway APIs, Aurora clusters, event buses, AppConfig applications and
+//! alarms, each with the module that opens it. Services are listed in parallel and capped; a service the user cannot read is left out.
 
 use crate::aws::{self, Aws, alarms, appconfig, cloudformation, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
 use crate::util::show_invisible;
@@ -28,8 +28,22 @@ impl Resource {
 
 type Lister = fn(&Aws) -> aws::Result<Vec<Resource>>;
 
-const LISTERS: &[Lister] =
-    &[functions, log_groups, parameters, secret_list, stacks, buckets, state_machines, queues, tables, buses, applications, alarm_list];
+const LISTERS: &[Lister] = &[
+    functions,
+    apis,
+    log_groups,
+    parameters,
+    secret_list,
+    stacks,
+    buckets,
+    state_machines,
+    queues,
+    tables,
+    db_clusters,
+    buses,
+    applications,
+    alarm_list,
+];
 
 /// The resources of the environment `aws` points at, `pipelines` being those in its config,
 /// and how many services could be listed (none: the session has probably expired).
@@ -60,6 +74,11 @@ fn pages<T>(mut page: impl FnMut(Option<&str>) -> aws::Result<(Vec<T>, Option<St
 fn functions(aws: &Aws) -> aws::Result<Vec<Resource>> {
     let list = pages(|t| lambda::list_functions(aws, t))?;
     Ok(list.iter().map(|f| Resource::new("Lambda", &f.function_name, f.function_name.clone(), f.runtime.as_deref().unwrap_or("function"))).collect())
+}
+
+/// API Gateway APIs (REST, HTTP and WebSocket); the target is the API id.
+fn apis(_aws: &Aws) -> aws::Result<Vec<Resource>> {
+    Ok(Vec::new())
 }
 
 fn log_groups(aws: &Aws) -> aws::Result<Vec<Resource>> {
@@ -98,6 +117,11 @@ fn queues(aws: &Aws) -> aws::Result<Vec<Resource>> {
 
 fn tables(aws: &Aws) -> aws::Result<Vec<Resource>> {
     Ok(pages(|t| dynamodb::list_tables(aws, t))?.iter().map(|t| Resource::new("DynamoDB", t, t.clone(), "table")).collect())
+}
+
+/// Aurora clusters; the target is the cluster identifier.
+fn db_clusters(_aws: &Aws) -> aws::Result<Vec<Resource>> {
+    Ok(Vec::new())
 }
 
 fn buses(aws: &Aws) -> aws::Result<Vec<Resource>> {

@@ -4,8 +4,10 @@
 //!   3. register it below. The header and the `:` palette list modules in this order.
 
 mod alarms;
+mod apigateway;
 mod appconfig;
 mod approvals;
+mod aurora;
 mod cfn;
 mod common;
 mod cwlogs;
@@ -16,6 +18,7 @@ mod matrix;
 mod parameters;
 mod pipelines;
 mod s3;
+mod savings;
 mod secrets;
 mod sfn;
 mod sfn_flow;
@@ -29,15 +32,18 @@ pub fn all() -> Vec<Box<dyn Module>> {
         Box::new(matrix::Matrix::new()),
         Box::new(approvals::Approvals::new()),
         Box::new(alarms::Alarms::new()),
+        Box::new(savings::Savings::new()),
         Box::new(parameters::Parameters::new()),
         Box::new(secrets::Secrets::new()),
         Box::new(lambda::Lambda::new()),
+        Box::new(apigateway::ApiGateway::new()),
         Box::new(cwlogs::CwLogs::new()),
         Box::new(cfn::CloudFormation::new()),
         Box::new(s3::S3::new()),
         Box::new(sfn::StepFunctions::new()),
         Box::new(sqs::Sqs::new()),
         Box::new(dynamodb::DynamoDb::new()),
+        Box::new(aurora::Aurora::new()),
         Box::new(events::EventBridge::new()),
         Box::new(appconfig::AppConfig::new()),
     ]

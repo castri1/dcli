@@ -10,6 +10,7 @@ mod modules;
 mod pipeline;
 mod platform;
 mod report;
+mod savings;
 mod tui;
 mod update;
 mod util;

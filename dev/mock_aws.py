@@ -2417,6 +2417,29 @@ def appconfig_rest(method, path, query, headers, body):
     return err(404, "ResourceNotFoundException", f"mock: no route for {method} {path}")
 
 
+# ---- API Gateway (restJson1: REST APIs under /restapis, HTTP and WebSocket APIs under /v2) ---
+def is_apigateway(path):
+    return path.split("?")[0].split("/")[1:3] == ["v2", "apis"] or any(
+        path.startswith(p) for p in ("/restapis", "/domainnames", "/v2/domainnames", "/apikeys", "/usageplans"))
+
+
+def apigateway_rest(method, path, query, headers, body):
+    """API Gateway requests. Returns (status, headers, body bytes)."""
+    data = json.dumps({"message": f"mock: no route for {method} {path}"}).encode()
+    return 404, {"content-type": "application/json", "x-amzn-errortype": "NotFoundException"}, data
+
+
+# ---- RDS (awsQuery, Version 2014-10-31) -------------------------------------------------------
+def rds(params):
+    action = params.get("Action", [""])[0]
+    return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
+
+
+# ---- Performance Insights (awsJson1_1, X-Amz-Target PerformanceInsightsv20180227.*) -----------
+def performance_insights(op, body):
+    raise KeyError(f"InvalidArgumentException: {op} is not in the mock yet")
+
+
 def is_appconfig(path):
     return path.startswith("/applications") or path.startswith("/deploymentstrategies")
 
@@ -2456,6 +2479,8 @@ class H(BaseHTTPRequestHandler):
         query = {k: v[0] for k, v in parse_qs(qs, keep_blank_values=True).items()}
         if is_appconfig(path):
             return self.reply_raw(*appconfig_rest(method, path, query, self.headers, body))
+        if is_apigateway(path):
+            return self.reply_raw(*apigateway_rest(method, path, query, self.headers, body))
         return self.reply_raw(*s3_rest(method, path, query, self.headers))
 
     def do_GET(self):
@@ -2496,12 +2521,12 @@ class H(BaseHTTPRequestHandler):
         raw = self.raw_body()
         if self.path.startswith("/2015-03-31/functions/") and "/invocations" in self.path:
             return self.reply_raw(*lambda_invoke(self.path, self.headers, raw))
-        if is_appconfig(self.path):
+        if is_appconfig(self.path) or is_apigateway(self.path):
             return self.route_rest("POST", raw)
         if self.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
             # awsQuery services, told apart by their API version.
             params = parse_qs(raw.decode())
-            service = {"2010-08-01": cloudwatch}.get(params.get("Version", [""])[0], cloudformation)
+            service = {"2010-08-01": cloudwatch, "2014-10-31": rds}.get(params.get("Version", [""])[0], cloudformation)
             return self.reply_xml(*service(params))
         body = json.loads(raw or b"{}")
         target = self.headers.get("x-amz-target", "")
@@ -2509,7 +2534,7 @@ class H(BaseHTTPRequestHandler):
         handler = {"CodePipeline_20150709": codepipeline, "CodeBuild_20161006": codebuild,
                    "Logs_20140328": cwlogs, "AmazonSSM": ssm, "secretsmanager": secretsmanager,
                    "AWSStepFunctions": stepfunctions, "DynamoDB_20120810": dynamodb, "AWSEvents": eventbridge,
-                   "AmazonSQS": sqs}.get(prefix)
+                   "AmazonSQS": sqs, "PerformanceInsightsv20180227": performance_insights}.get(prefix)
         try:
             self.reply(200, handler(op, body))
         except Exception as e:

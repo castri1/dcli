@@ -207,6 +207,12 @@ pub enum Command {
     Insights(crate::clicmd::insights::Args),
     /// CloudFormation stacks: events, resources, outputs, drift, failure reports
     Cfn(crate::clicmd::cfn::Args),
+    /// API Gateway: APIs, routes, stages and their metrics; test a route, export OpenAPI
+    Apigw(crate::clicmd::apigw::Args),
+    /// Aurora clusters: topology, performance, top SQL
+    Aurora(crate::clicmd::aurora::Args),
+    /// What could cost less: unused or oversized resources, in the units AWS bills
+    Optimize(crate::clicmd::optimize::Args),
     /// Update dcli to the latest release (through npm when installed with npm)
     Update {
         /// Only tell whether a newer version exists
@@ -543,6 +549,9 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Sqs(args) => crate::clicmd::sqs::run(config, args),
         Command::Insights(args) => crate::clicmd::insights::run(config, args),
         Command::Cfn(args) => crate::clicmd::cfn::run(config, args),
+        Command::Apigw(args) => crate::clicmd::apigw::run(config, args),
+        Command::Aurora(args) => crate::clicmd::aurora::run(config, args),
+        Command::Optimize(args) => crate::clicmd::optimize::run(config, args),
         Command::Lambda(args) => crate::clicmd::lambda::run(config, args),
     }
 }
