@@ -3136,6 +3136,45 @@ RDS_CLUSTERS = {
 RDS_SNAPSHOTS = [("analytics-old-final-2025", "analytics-old", 400, 120), ("orders-prod-before-migration", "orders-prod", 200, 350),
                  ("orders-prod-yesterday", "orders-prod", 1, 410)]
 
+# Changes made through the API: statuses other than "available" (clusters and instances by
+# name), what happens later (time, function), events they log (time, source, type,
+# categories, message), class changes waiting for the maintenance window, snapshot statuses.
+RDS_STATUS = {}
+RDS_LATER = []
+RDS_LOG = []
+RDS_PENDING_CLASS = {"orders-3": "db.r6g.xlarge"}
+RDS_SNAPSHOT_STATUS = {}
+RDS_CLASSES = ["db.r5.large", "db.r5.xlarge", "db.r5.2xlarge", "db.r6g.large", "db.r6g.xlarge", "db.r6g.2xlarge", "db.r6g.4xlarge",
+               "db.r6i.large", "db.r6i.xlarge", "db.r7g.large", "db.r7g.xlarge", "db.r7g.2xlarge", "db.t3.medium", "db.t4g.medium",
+               "db.t4g.large", "db.x2g.large", "db.x2g.xlarge", "db.serverless"]
+
+
+def rds_later(seconds, fn):
+    RDS_LATER.append((time.time() + seconds, fn))
+
+
+def rds_advance():
+    """Applies the changes whose time has come."""
+    now = time.time()
+    for item in [x for x in RDS_LATER if x[0] <= now]:
+        RDS_LATER.remove(item)
+        item[1]()
+
+
+def rds_log(source, kind, category, message):
+    RDS_LOG.append((time.time(), source, kind, [category], message))
+
+
+def rds_set_instance(name, **changes):
+    """Replaces fields of an instance tuple (id, class, zone, writer, tier, pi)."""
+    fields = ["id", "cls", "zone", "writer", "tier", "pi"]
+    for c in RDS_CLUSTERS.values():
+        for n, inst in enumerate(c["instances"]):
+            if inst[0] == name:
+                row = dict(zip(fields, inst))
+                row.update(changes)
+                c["instances"][n] = tuple(row[f] for f in fields)
+
 
 def rds_x(tag, value):
     """An element; None leaves it out. ESC characters travel as &#x1b; as AWS would send them."""
@@ -3177,7 +3216,7 @@ def rds_cluster_xml(name, c):
     return (f"<DBCluster>{rds_x('AllocatedStorage', 1)}<AvailabilityZones><AvailabilityZone>us-east-1a</AvailabilityZone>"
             f"<AvailabilityZone>us-east-1b</AvailabilityZone><AvailabilityZone>us-east-1c</AvailabilityZone></AvailabilityZones>"
             f"{rds_x('BackupRetentionPeriod', c['backups'])}{rds_x('DatabaseName', c['db'])}{rds_x('DBClusterIdentifier', name)}"
-            f"{rds_x('DBClusterParameterGroup', 'default.' + rds_family(c))}{rds_x('DBSubnetGroup', 'default')}{rds_x('Status', 'available')}"
+            f"{rds_x('DBClusterParameterGroup', 'default.' + rds_family(c))}{rds_x('DBSubnetGroup', 'default')}{rds_x('Status', RDS_STATUS.get(name, 'available'))}"
             f"{rds_x('Endpoint', rds_host(name))}{rds_x('ReaderEndpoint', rds_host(name, 'cluster-ro'))}<CustomEndpoints>{customs}</CustomEndpoints>"
             f"{rds_x('MultiAZ', len(c['instances']) > 1)}{rds_x('Engine', c['engine'])}{rds_x('EngineVersion', c['version'])}"
             f"{rds_x('Port', c['port'])}{rds_x('MasterUsername', c['user'])}"
@@ -3198,10 +3237,10 @@ def rds_instances():
     out = []
     for name, c in RDS_CLUSTERS.items():
         for i, cls, zone, _, tier, pi in c["instances"]:
-            pending = ("<PendingModifiedValues><DBInstanceClass>db.r6g.xlarge</DBInstanceClass></PendingModifiedValues>"
-                       if i == "orders-3" else "<PendingModifiedValues/>")
+            pending = (f"<PendingModifiedValues><DBInstanceClass>{RDS_PENDING_CLASS[i]}</DBInstanceClass></PendingModifiedValues>"
+                       if i in RDS_PENDING_CLASS else "<PendingModifiedValues/>")
             out.append((name, f"<DBInstance>{rds_x('DBInstanceIdentifier', i)}{rds_x('DBInstanceClass', cls)}{rds_x('Engine', c['engine'])}"
-                        f"{rds_x('DBInstanceStatus', 'available')}{rds_x('MasterUsername', c['user'])}"
+                        f"{rds_x('DBInstanceStatus', RDS_STATUS.get(i, 'available'))}{rds_x('MasterUsername', c['user'])}"
                         f"<Endpoint>{rds_x('Address', rds_host(i, 'instance'))}{rds_x('Port', c['port'])}<HostedZoneId>Z2R2ITUGPM61AM</HostedZoneId></Endpoint>"
                         f"{rds_x('InstanceCreateTime', rds_iso(T0 - 86400 * c['age']))}"
                         f"<DBParameterGroups><DBParameterGroup>{rds_x('DBParameterGroupName', 'default.' + rds_family(c))}"
@@ -3248,12 +3287,13 @@ RDS_EVENTS = [
 
 def rds_events(params):
     minutes = int(params.get("Duration", ["60"])[0])
-    rows = [e for e in RDS_EVENTS if e[0] <= minutes * 60]
+    rows = [(T0 - ago, src, kind, cats, msg) for ago, src, kind, cats, msg in RDS_EVENTS if ago <= minutes * 60]
+    rows += [e for e in RDS_LOG if time.time() - e[0] <= minutes * 60]
     return "".join(
         f"<Event>{rds_x('SourceIdentifier', src)}{rds_x('SourceType', kind)}{rds_x('Message', msg)}"
         f"<EventCategories>{''.join(rds_x('EventCategory', c) for c in cats)}</EventCategories>"
-        f"{rds_x('Date', rds_iso(T0 - ago))}{rds_x('SourceArn', f'arn:aws:rds:{RDS_REGION}:{RDS_ACCOUNT}:{src}')}</Event>"
-        for ago, src, kind, cats, msg in rows)
+        f"{rds_x('Date', rds_iso(at))}{rds_x('SourceArn', f'arn:aws:rds:{RDS_REGION}:{RDS_ACCOUNT}:{src}')}</Event>"
+        for at, src, kind, cats, msg in rows)
 
 
 def rds_pending():
@@ -3274,10 +3314,157 @@ def rds_xml(action, inner):
             f"<ResponseMetadata><RequestId>{eid()}</RequestId></ResponseMetadata></{action}Response>")
 
 
+def rds_change(action, get):
+    """The changes: (status, body), or None when `action` is not one."""
+    def cluster_xml(name):
+        return rds_xml(action, rds_cluster_xml(name, RDS_CLUSTERS[name]))
+
+    def instance_xml(name):
+        return rds_xml(action, next(x for c, x in rds_instances() if f"<DBInstanceIdentifier>{name}<" in x))
+
+    def bad_state(kind, message):
+        return 400, query_error(f"Invalid{kind}StateFault", xml_escape(message))
+
+    if action in ("FailoverDBCluster", "StopDBCluster", "StartDBCluster", "ModifyDBCluster", "CreateDBClusterSnapshot"):
+        name = get("DBClusterIdentifier")
+        if name not in RDS_CLUSTERS:
+            return 404, query_error("DBClusterNotFoundFault", f"DBCluster {xml_escape(name)} not found.")
+        c = RDS_CLUSTERS[name]
+        status = RDS_STATUS.get(name, "available")
+        members = [i[0] for i in c["instances"]]
+        if action == "FailoverDBCluster":
+            if status != "available":
+                return bad_state("DBCluster", f"DB cluster {name} is {status}.")
+            readers = sorted((i for i in c["instances"] if not i[3]), key=lambda i: i[4])
+            target = get("TargetDBInstanceIdentifier") or (readers[0][0] if readers else "")
+            if target not in [r[0] for r in readers]:
+                return 400, query_error("InvalidParameterValue", f"{xml_escape(target)} is not a reader of {name}.")
+            old = next(i[0] for i in c["instances"] if i[3])
+            RDS_STATUS[name] = "failing-over"
+            rds_log(name, "db-cluster", "failover", f"Started cross AZ failover to DB instance: {target}")
+
+            def done():
+                rds_set_instance(old, writer=False)
+                rds_set_instance(target, writer=True)
+                RDS_STATUS.pop(name, None)
+                rds_log(name, "db-cluster", "failover", f"Completed failover to DB instance: {target}")
+            rds_later(6, done)
+            return 200, cluster_xml(name)
+        if action == "StopDBCluster":
+            if name == "orders-prod":
+                return bad_state("DBCluster", "DB cluster orders-prod is part of a global database and can't be stopped.")
+            if status != "available":
+                return bad_state("DBCluster", f"DB cluster {name} is {status}.")
+            for n in [name] + members:
+                RDS_STATUS[n] = "stopping"
+            rds_log(name, "db-cluster", "notification", "DB cluster is being stopped")
+
+            def stopped():
+                for n in [name] + members:
+                    RDS_STATUS[n] = "stopped"
+                rds_log(name, "db-cluster", "notification", "DB cluster stopped")
+            rds_later(8, stopped)
+            return 200, cluster_xml(name)
+        if action == "StartDBCluster":
+            if status != "stopped":
+                return bad_state("DBCluster", f"DB cluster {name} is {status}, not stopped.")
+            for n in [name] + members:
+                RDS_STATUS[n] = "starting"
+            rds_log(name, "db-cluster", "notification", "DB cluster is being started")
+
+            def started():
+                for n in [name] + members:
+                    RDS_STATUS.pop(n, None)
+                rds_log(name, "db-cluster", "notification", "DB cluster started")
+            rds_later(8, started)
+            return 200, cluster_xml(name)
+        if action == "ModifyDBCluster":
+            lo, hi = get("ServerlessV2ScalingConfiguration.MinCapacity"), get("ServerlessV2ScalingConfiguration.MaxCapacity")
+            if status != "available":
+                return bad_state("DBCluster", f"DB cluster {name} is {status}.")
+            if not lo or not hi or float(lo) > float(hi):
+                return 400, query_error("InvalidParameterCombination", "MinCapacity must not be greater than MaxCapacity.")
+            c["serverless"] = (float(lo), float(hi))
+            RDS_STATUS[name] = "modifying"
+            rds_log(name, "db-cluster", "configuration change", f"Updated the Serverless v2 capacity range to {lo}-{hi} ACUs")
+            rds_later(4, lambda: RDS_STATUS.pop(name, None))
+            return 200, cluster_xml(name)
+        snap = get("DBClusterSnapshotIdentifier")
+        if any(x[0] == snap for x in RDS_SNAPSHOTS):
+            return 400, query_error("DBClusterSnapshotAlreadyExistsFault", f"Cannot create the snapshot because a snapshot with the identifier {xml_escape(snap)} already exists.")
+        if not re.fullmatch(r"[A-Za-z](?!.*--)[A-Za-z0-9-]{0,254}", snap) or snap.endswith("-"):
+            return 400, query_error("InvalidParameterValue", f"Invalid snapshot identifier: {xml_escape(snap)}")
+        if status != "available":
+            return bad_state("DBCluster", f"DB cluster {name} is {status}.")
+        RDS_SNAPSHOTS.append((snap, name, (T0 - time.time()) / 86400, 412 if name == "orders-prod" else 20))
+        RDS_SNAPSHOT_STATUS[snap] = "creating"
+        RDS_STATUS[name] = "backing-up"
+        rds_log(name, "db-cluster", "backup", f"Creating manual cluster snapshot {snap}")
+
+        def snapped():
+            RDS_SNAPSHOT_STATUS.pop(snap, None)
+            RDS_STATUS.pop(name, None)
+            rds_log(name, "db-cluster", "backup", f"Manual cluster snapshot created: {snap}")
+        rds_later(10, snapped)
+        return 200, rds_xml(action, f"<DBClusterSnapshot>{rds_x('DBClusterSnapshotIdentifier', snap)}"
+                                    f"{rds_x('DBClusterIdentifier', name)}{rds_x('Status', 'creating')}</DBClusterSnapshot>")
+    if action in ("RebootDBInstance", "ModifyDBInstance"):
+        name = get("DBInstanceIdentifier")
+        info = rds_instance_info(name)
+        if not info:
+            return 404, query_error("DBInstanceNotFound", f"DBInstance {xml_escape(name)} not found.")
+        status = RDS_STATUS.get(name, "available")
+        if status != "available":
+            return bad_state("DBInstance", f"DB instance {name} is {status}.")
+        if action == "RebootDBInstance":
+            RDS_STATUS[name] = "rebooting"
+
+            def rebooted():
+                RDS_STATUS.pop(name, None)
+                rds_log(name, "db-instance", "availability", "DB instance restarted")
+            rds_later(8, rebooted)
+            return 200, instance_xml(name)
+        cls = get("DBInstanceClass")
+        if cls not in RDS_CLASSES:
+            return 400, query_error("InvalidParameterCombination", f"RDS does not support creating a DB instance with the following combination: DBInstanceClass={xml_escape(cls)}.")
+        if get("ApplyImmediately") != "true":
+            RDS_PENDING_CLASS[name] = cls
+            return 200, instance_xml(name)
+        RDS_STATUS[name] = "modifying"
+        RDS_PENDING_CLASS[name] = cls
+
+        def resized():
+            rds_set_instance(name, cls=cls)
+            RDS_PENDING_CLASS.pop(name, None)
+            RDS_STATUS.pop(name, None)
+            rds_log(name, "db-instance", "configuration change", f"Finished applying modification to DB instance class: {cls}")
+        rds_later(10, resized)
+        return 200, instance_xml(name)
+    if action == "DescribeOrderableDBInstanceOptions":
+        engine = get("Engine")
+        if not engine.startswith("aurora"):
+            return 200, rds_xml(action, "<OrderableDBInstanceOptions/>")
+        # Each class twice (two storage types), ten per page, to exercise the de-duplication and Marker.
+        rows = [(cls, storage) for cls in RDS_CLASSES for storage in ("aurora", "aurora-iopt1")]
+        start = int(get("Marker") or 0)
+        marker = rds_x("Marker", start + 10) if start + 10 < len(rows) else ""
+        body = "".join(
+            f"<OrderableDBInstanceOption>{rds_x('Engine', engine)}{rds_x('EngineVersion', get('EngineVersion'))}"
+            f"{rds_x('DBInstanceClass', cls)}{rds_x('StorageType', storage)}{rds_x('SupportsPerformanceInsights', True)}"
+            f"<AvailabilityZones><AvailabilityZone><Name>us-east-1a</Name></AvailabilityZone></AvailabilityZones></OrderableDBInstanceOption>"
+            for cls, storage in rows[start:start + 10])
+        return 200, rds_xml(action, f"<OrderableDBInstanceOptions>{body}</OrderableDBInstanceOptions>{marker}")
+    return None
+
+
 def rds(params):
     """awsQuery: form-encoded request, XML response (status, body)."""
     get = lambda k, d="": params.get(k, [d])[0]
     action = get("Action")
+    rds_advance()
+    changed = rds_change(action, get)
+    if changed:
+        return changed
     if action == "DescribeDBClusters":
         only = get("DBClusterIdentifier")
         if only and only not in RDS_CLUSTERS:
@@ -3311,7 +3498,7 @@ def rds(params):
         body = "".join(
             f"<DBClusterSnapshot>{rds_x('DBClusterSnapshotIdentifier', s)}{rds_x('DBClusterIdentifier', c)}"
             f"{rds_x('SnapshotCreateTime', rds_iso(T0 - 86400 * days))}{rds_x('Engine', RDS_CLUSTERS[c]['engine'])}"
-            f"{rds_x('AllocatedStorage', gb)}{rds_x('Status', 'available')}{rds_x('SnapshotType', 'manual')}</DBClusterSnapshot>"
+            f"{rds_x('AllocatedStorage', gb)}{rds_x('Status', RDS_SNAPSHOT_STATUS.get(s, 'available'))}{rds_x('SnapshotType', 'manual')}</DBClusterSnapshot>"
             for s, c, days, gb in RDS_SNAPSHOTS)
         return 200, rds_xml(action, f"<DBClusterSnapshots>{body}</DBClusterSnapshots>")
     return 400, query_error("InvalidAction", f"{action} is not in the mock yet")

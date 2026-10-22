@@ -1,8 +1,9 @@
 //! RDS (awsQuery protocol, API version 2014-10-31): Aurora clusters, their instances,
 //! endpoints, events, pending maintenance and manual snapshots, and the logic shared by the
 //! Aurora module, `dcli aurora` and the savings check: which nodes each endpoint serves, how
-//! healthy a node looks, the instances' CloudWatch metrics, instance class sizes, and a
-//! Markdown performance diagnosis for an AI agent.
+//! healthy a node looks, the instances' CloudWatch metrics, instance class sizes, a Markdown
+//! performance diagnosis for an AI agent, and the changes dcli makes (failover, reboot,
+//! stop and start, instance class, Serverless v2 range, manual snapshot).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -600,6 +601,8 @@ pub fn status_health(status: &str) -> Health {
     match status {
         "available" => Health::Ok,
         "stopped" | "stopping" => Health::Stopped,
+        // A failover under way, not a failure.
+        "failing-over" => Health::Changing,
         s if s.contains("fail") || s.starts_with("inaccessible") || s.starts_with("incompatible") || s == "storage-full" || s == "insufficient-capacity" => {
             Health::Failing
         }
@@ -1055,6 +1058,354 @@ pub fn connect_command(cluster: &Cluster, host: &str, region: &str, profile: &st
     }
 }
 
+// ---- changes -----------------------------------------------------------------------------
+
+/// A change to a cluster or one of its instances, as the Aurora module and `dcli aurora`
+/// ask for it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// A reader becomes the writer: the one named, or the one AWS picks by promotion tier.
+    Failover { cluster: String, to: Option<String> },
+    Reboot { instance: String },
+    Stop { cluster: String },
+    Start { cluster: String },
+    /// Another instance class, right away (the instance restarts) or in the next
+    /// maintenance window.
+    SetClass { instance: String, class: String, now: bool },
+    /// The range the cluster's Serverless v2 instances scale in, in ACUs.
+    SetCapacity { cluster: String, min: f64, max: f64 },
+    Snapshot { cluster: String, id: String },
+}
+
+impl Action {
+    /// The RDS action and its parameters.
+    pub fn request(&self) -> (&'static str, Vec<(&'static str, String)>) {
+        match self {
+            Action::Failover { cluster, to } => {
+                let mut params = vec![("DBClusterIdentifier", cluster.clone())];
+                if let Some(to) = to {
+                    params.push(("TargetDBInstanceIdentifier", to.clone()));
+                }
+                ("FailoverDBCluster", params)
+            }
+            Action::Reboot { instance } => ("RebootDBInstance", vec![("DBInstanceIdentifier", instance.clone())]),
+            Action::Stop { cluster } => ("StopDBCluster", vec![("DBClusterIdentifier", cluster.clone())]),
+            Action::Start { cluster } => ("StartDBCluster", vec![("DBClusterIdentifier", cluster.clone())]),
+            Action::SetClass { instance, class, now } => (
+                "ModifyDBInstance",
+                vec![("DBInstanceIdentifier", instance.clone()), ("DBInstanceClass", class.clone()), ("ApplyImmediately", now.to_string())],
+            ),
+            Action::SetCapacity { cluster, min, max } => (
+                "ModifyDBCluster",
+                vec![
+                    ("DBClusterIdentifier", cluster.clone()),
+                    ("ServerlessV2ScalingConfiguration.MinCapacity", fmt_acu(*min)),
+                    ("ServerlessV2ScalingConfiguration.MaxCapacity", fmt_acu(*max)),
+                    ("ApplyImmediately", "true".into()),
+                ],
+            ),
+            Action::Snapshot { cluster, id } => {
+                ("CreateDBClusterSnapshot", vec![("DBClusterIdentifier", cluster.clone()), ("DBClusterSnapshotIdentifier", id.clone())])
+            }
+        }
+    }
+
+    /// The cluster it changes (an instance's for instance changes, found in `instances`).
+    pub fn cluster<'a>(&'a self, instances: &'a [Instance]) -> Option<&'a str> {
+        match self {
+            Action::Failover { cluster, .. }
+            | Action::Stop { cluster }
+            | Action::Start { cluster }
+            | Action::SetCapacity { cluster, .. }
+            | Action::Snapshot { cluster, .. } => Some(cluster),
+            Action::Reboot { instance } | Action::SetClass { instance, .. } => {
+                instances.iter().find(|i| i.id == *instance).map(|i| i.cluster.as_str())
+            }
+        }
+    }
+
+    /// `Fail over orders-prod to orders-2`: a dialog's title, a confirmation's question.
+    pub fn title(&self) -> String {
+        match self {
+            Action::Failover { cluster, to: Some(to) } => format!("Fail over {cluster} to {to}"),
+            Action::Failover { cluster, to: None } => format!("Fail over {cluster}"),
+            Action::Reboot { instance } => format!("Reboot {instance}"),
+            Action::Stop { cluster } => format!("Stop {cluster}"),
+            Action::Start { cluster } => format!("Start {cluster}"),
+            Action::SetClass { instance, class, now: true } => format!("Change {instance} to {class} now"),
+            Action::SetClass { instance, class, now: false } => format!("Change {instance} to {class} in the maintenance window"),
+            Action::SetCapacity { cluster, min, max } => format!("Scale {cluster} between {} and {} ACU", fmt_acu(*min), fmt_acu(*max)),
+            Action::Snapshot { cluster, id } => format!("Snapshot {cluster} as {id}"),
+        }
+    }
+
+    /// What AWS accepted, said once it did: `orders-prod is failing over to orders-2`.
+    pub fn accepted(&self) -> String {
+        match self {
+            Action::Failover { cluster, to: Some(to) } => format!("{cluster} is failing over to {to}"),
+            Action::Failover { cluster, to: None } => format!("{cluster} is failing over"),
+            Action::Reboot { instance } => format!("{instance} is rebooting"),
+            Action::Stop { cluster } => format!("{cluster} is stopping"),
+            Action::Start { cluster } => format!("{cluster} is starting"),
+            Action::SetClass { instance, class, now: true } => format!("{instance} is changing to {class}"),
+            Action::SetClass { instance, class, now: false } => format!("{instance} changes to {class} in the next maintenance window"),
+            Action::SetCapacity { cluster, min, max } => format!("{cluster} now scales between {} and {} ACU", fmt_acu(*min), fmt_acu(*max)),
+            Action::Snapshot { cluster, id } => format!("Creating the snapshot {id} of {cluster}"),
+        }
+    }
+}
+
+/// Asks AWS for `action`. Never sent twice: a failover or a reboot repeated after a lost
+/// answer would happen twice.
+pub fn apply(aws: &Aws, action: &Action) -> Result<()> {
+    let (op, params) = action.request();
+    let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    aws.query_once(&SERVICE, op, VERSION, &params).map(|_| ())
+}
+
+/// Why `action` cannot run on the cluster as it is now; `None` when it can. AWS would
+/// refuse most of these too: saying so first spares a confirmation for nothing.
+pub fn refusal(action: &Action, c: &Cluster, instances: &[&Instance]) -> Option<String> {
+    let instance = |id: &str| instances.iter().find(|i| i.id == id);
+    let busy = |what: &str| format!("{} is {}: it can be {what} only when available", c.id, c.status);
+    match action {
+        Action::Failover { to, .. } => {
+            if let Some((global, false)) = &c.global {
+                return Some(format!(
+                    "{} is a secondary cluster of the global database {global}: it has no writer here (fail over the global database instead)",
+                    c.id
+                ));
+            }
+            if c.status != "available" {
+                return Some(busy("failed over"));
+            }
+            let readers: Vec<&&Instance> = instances.iter().filter(|i| !i.writer).collect();
+            if readers.is_empty() {
+                return Some(format!("{} has no reader that could become the writer", c.id));
+            }
+            match to {
+                Some(id) => match instance(id) {
+                    None => Some(format!("{id} is not an instance of {}", c.id)),
+                    Some(i) if i.writer => Some(format!("{id} already is the writer")),
+                    Some(i) if i.status != "available" => Some(format!("{id} is {}: only an available reader can become the writer", i.status)),
+                    Some(_) => None,
+                },
+                None if !readers.iter().any(|i| i.status == "available") => Some("no reader is available to become the writer".into()),
+                None => None,
+            }
+        }
+        Action::Reboot { instance: id } => match instance(id) {
+            None => Some(format!("{id} is not an instance of {}", c.id)),
+            Some(i) if i.status != "available" => Some(format!("{id} is {}: it can be rebooted only when available", i.status)),
+            Some(_) => None,
+        },
+        Action::Stop { .. } => {
+            if let Some((global, _)) = &c.global {
+                return Some(format!("{} belongs to the global database {global}: AWS does not stop the clusters of a global database", c.id));
+            }
+            if let Some(mode) = c.engine_mode.as_deref().filter(|m| matches!(*m, "serverless" | "multimaster")) {
+                return Some(format!("{} is an Aurora {mode} cluster: those cannot be stopped", c.id));
+            }
+            (c.status != "available").then(|| busy("stopped"))
+        }
+        Action::Start { .. } => (c.status != "stopped").then(|| format!("{} is {}: only a stopped cluster starts", c.id, c.status)),
+        Action::SetClass { instance: id, class, .. } => match instance(id) {
+            None => Some(format!("{id} is not an instance of {}", c.id)),
+            Some(i) if i.class == *class => Some(format!("{id} already is {class}")),
+            Some(_) if class == "db.serverless" && c.serverless.is_none() => {
+                Some(format!("{} has no Serverless v2 range yet: set it first (MIN:MAX ACU)", c.id))
+            }
+            Some(i) if i.status != "available" => Some(format!("{id} is {}: its class can change only when it is available", i.status)),
+            Some(_) => None,
+        },
+        Action::SetCapacity { min, max, .. } => {
+            if c.serverless.is_none() && !instances.iter().any(|i| i.serverless()) {
+                return Some(format!("{} has no Serverless v2 instances: change its instances' class instead", c.id));
+            }
+            if c.status != "available" {
+                return Some(busy("changed"));
+            }
+            check_acu(*min, *max).err()
+        }
+        Action::Snapshot { id, .. } => {
+            if c.status != "available" {
+                return Some(busy("snapshotted"));
+            }
+            check_snapshot_name(id).err()
+        }
+    }
+}
+
+/// `db.r6g.xlarge (4 vCPU, 32 GiB)`; the class alone when its size is not known here.
+fn class_with_specs(class: &str) -> String {
+    match class_specs(class) {
+        Some((vcpus, gib)) => format!("{class} ({vcpus} vCPU, {gib:.0} GiB)"),
+        None => class.to_string(),
+    }
+}
+
+/// What `action` does, for its confirmation: what changes, what stops working and for how
+/// long, what is billed.
+pub fn explain(action: &Action, c: &Cluster, instances: &[&Instance]) -> String {
+    let instance = |id: &str| instances.iter().find(|i| i.id == id).copied();
+    let writer = c.writer().unwrap_or("the writer");
+    match action {
+        Action::Failover { to, .. } => {
+            let next = match to {
+                Some(to) => to.clone(),
+                None => {
+                    let pick = instances.iter().filter(|i| !i.writer && i.status == "available").min_by_key(|i| i.promotion_tier.unwrap_or(15));
+                    pick.map(|i| format!("the reader AWS picks (lowest tier: {})", i.id)).unwrap_or_else(|| "a reader".into())
+                }
+            };
+            format!(
+                "{next} becomes the writer and {writer} a reader. Connections to the writer drop for a few seconds to a minute; \
+                 the writer endpoint follows the new writer, so applications reconnect to it. Use it to test failover or to move \
+                 the writer to another zone."
+            )
+        }
+        Action::Reboot { instance: id } => {
+            let mut text = format!("{id} restarts: its connections drop and it takes about a minute to come back.");
+            if instance(id).is_some_and(|i| i.writer) {
+                text.push_str(
+                    " It is the writer: writes stop while it restarts (a reboot does not fail over), and with some engine \
+                     versions the readers restart too.",
+                );
+            }
+            text
+        }
+        Action::Stop { .. } => format!(
+            "Every instance of {} stops: nothing can connect until it is started again. Instance hours stop being billed; \
+             storage and backups still are. AWS starts the cluster again by itself after 7 days.",
+            c.id
+        ),
+        Action::Start { .. } => format!("Every instance of {} starts again; it takes a few minutes before it accepts connections.", c.id),
+        Action::SetClass { instance: id, class, now } => {
+            let from = instance(id).map(|i| class_with_specs(&i.class)).unwrap_or_default();
+            let mut text = format!("{id}: {from} → {}. ", class_with_specs(class));
+            if *now {
+                text.push_str("It restarts with the new class right away: a few minutes without that instance.");
+                if instance(id).is_some_and(|i| i.writer) {
+                    text.push_str(" It is the writer: writes stop while it restarts. To keep them going, change a reader first and fail over to it.");
+                }
+            } else {
+                let window = c.maintenance_window.as_deref().map(|w| format!(" ({w} UTC)")).unwrap_or_default();
+                text.push_str(&format!("Applied in the next maintenance window{window}; nothing changes until then."));
+            }
+            text
+        }
+        Action::SetCapacity { .. } => {
+            let now = c.serverless.as_ref().map(|r| format!(" (now {}–{} ACU)", fmt_acu(r.min), fmt_acu(r.max))).unwrap_or_default();
+            format!(
+                "The cluster's Serverless v2 instances scale within the new range{now}, without restarting. ACUs are billed per \
+                 second: the minimum is what an idle cluster costs."
+            )
+        }
+        Action::Snapshot { .. } => format!(
+            "A manual snapshot of the whole volume of {}, without downtime. It is kept until someone deletes it, billed as \
+             backup storage.",
+            c.id
+        ),
+    }
+}
+
+/// `0.5:16` → (0.5, 16), checked with [`check_acu`].
+pub fn parse_acu(text: &str) -> std::result::Result<(f64, f64), String> {
+    let (min, max) = text.split_once([':', '-']).ok_or_else(|| format!("'{text}': write MIN:MAX, like 0.5:16"))?;
+    let number = |s: &str| s.trim().parse::<f64>().map_err(|_| format!("'{}' is not a number of ACUs", s.trim()));
+    let (min, max) = (number(min)?, number(max)?);
+    check_acu(min, max)?;
+    Ok((min, max))
+}
+
+/// What AWS takes for a Serverless v2 range: steps of 0.5 ACU, 0 ≤ minimum ≤ maximum, a
+/// maximum from 1 to 256 (a minimum of 0, pausing when idle, needs a recent engine version).
+pub fn check_acu(min: f64, max: f64) -> std::result::Result<(), String> {
+    let step = |v: f64| (v * 2.0).fract() == 0.0;
+    if !min.is_finite() || !max.is_finite() || !step(min) || !step(max) {
+        return Err("ACUs go in steps of 0.5".into());
+    }
+    if min < 0.0 || min > max {
+        return Err(format!("the minimum ({}) must be between 0 and the maximum ({})", fmt_acu(min), fmt_acu(max)));
+    }
+    if !(1.0..=256.0).contains(&max) {
+        return Err(format!("the maximum ({}) must be between 1 and 256 ACU", fmt_acu(max)));
+    }
+    Ok(())
+}
+
+/// A name for a manual snapshot of `cluster` taken at `now`: `orders-prod-2026-10-22-1730`.
+pub fn snapshot_name(cluster: &str, now: f64) -> String {
+    let (y, mo, d, h, mi, _) = crate::util::utc_parts(now as i64);
+    let mut name = String::new();
+    for c in format!("{cluster}-{y:04}-{mo:02}-{d:02}-{h:02}{mi:02}").chars() {
+        let c = if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' };
+        if !(c == '-' && (name.is_empty() || name.ends_with('-'))) {
+            name.push(c);
+        }
+    }
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        name.insert_str(0, "snapshot-");
+    }
+    name.truncate(255);
+    name.trim_end_matches('-').to_string()
+}
+
+/// AWS's rules for a cluster snapshot identifier: 1 to 255 letters, digits and hyphens,
+/// starting with a letter, without two hyphens in a row or one at the end.
+pub fn check_snapshot_name(id: &str) -> std::result::Result<(), String> {
+    let ok = !id.is_empty()
+        && id.len() <= 255
+        && id.starts_with(|c: char| c.is_ascii_alphabetic())
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !id.contains("--")
+        && !id.ends_with('-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{id}' is not a valid snapshot name: letters, digits and single hyphens, starting with a letter, up to 255 characters"
+        ))
+    }
+}
+
+/// Whether a class runs on Graviton (ARM) processors: `db.r6g.large`, `db.t4g.medium`.
+pub fn is_graviton(class: &str) -> bool {
+    class_parts(class).is_some_and(|(family, _)| family.contains('g'))
+}
+
+/// `2 vCPU · 16 GiB · Graviton` for a class picker.
+pub fn class_detail(class: &str) -> String {
+    if class == "db.serverless" {
+        return "Serverless v2: scales within the cluster's ACU range".into();
+    }
+    let mut parts = Vec::new();
+    if let Some((vcpus, gib)) = class_specs(class) {
+        parts.push(format!("{vcpus} vCPU · {gib:.0} GiB"));
+    }
+    parts.push(if is_graviton(class) { "Graviton".into() } else { "Intel".into() });
+    parts.join(" · ")
+}
+
+/// Classes by family, then size, `db.serverless` last; each once.
+fn sort_classes(classes: &mut Vec<String>) {
+    let key = |c: &String| match class_parts(c) {
+        Some((family, size)) => (0, family.to_string(), SIZES.iter().position(|s| *s == size).unwrap_or(SIZES.len()), c.clone()),
+        None => (1, String::new(), 0, c.clone()),
+    };
+    classes.sort_by_key(key);
+    classes.dedup();
+}
+
+/// The instance classes Aurora offers for an engine and version (the options repeat per
+/// storage type and zone; each class is listed once).
+pub fn orderable_classes(aws: &Aws, engine: &str, version: &str) -> Result<Vec<String>> {
+    let params = [("Engine", engine), ("EngineVersion", version), ("MaxRecords", "1000")];
+    let mut classes = pages(aws, "DescribeOrderableDBInstanceOptions", &params, "OrderableDBInstanceOptions", |o| o.text("DBInstanceClass"))?;
+    sort_classes(&mut classes);
+    Ok(classes)
+}
+
 // ---- report for an AI agent --------------------------------------------------------------
 
 /// Instances whose Performance Insights the report reads at most.
@@ -1436,8 +1787,128 @@ mod tests {
         assert_eq!(node_health("available", Some(10.0), Some(12_000.0)), Health::Failing);
         assert_eq!(node_health("rebooting", Some(99.0), None), Health::Changing);
         assert_eq!(node_health("failed", None, None), Health::Failing);
+        assert_eq!(status_health("failing-over"), Health::Changing);
         assert_eq!(fmt_size(16.0 * 1024.0 * 1024.0 * 1024.0), "16.0 GB");
         assert_eq!(fmt_size(1536.0 * 1024.0 * 1024.0 * 1024.0), "1.5 TB");
+    }
+
+    fn cluster(id: &str, status: &str) -> Cluster {
+        Cluster {
+            id: id.into(),
+            status: status.into(),
+            engine: "aurora-postgresql".into(),
+            members: vec![Member { instance: "w".into(), writer: true, ..Default::default() }],
+            maintenance_window: Some("sun:08:00-sun:08:30".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn changes_ask_aws_with_the_right_parameters() {
+        let (op, params) = Action::Failover { cluster: "c".into(), to: Some("r".into()) }.request();
+        assert_eq!((op, params), ("FailoverDBCluster", vec![("DBClusterIdentifier", "c".into()), ("TargetDBInstanceIdentifier", "r".into())]));
+        assert_eq!(Action::Failover { cluster: "c".into(), to: None }.request().1.len(), 1);
+        let (op, params) = Action::SetClass { instance: "r".into(), class: "db.r7g.large".into(), now: false }.request();
+        assert_eq!(op, "ModifyDBInstance");
+        assert!(params.contains(&("ApplyImmediately", "false".into())) && params.contains(&("DBInstanceClass", "db.r7g.large".into())));
+        let (op, params) = Action::SetCapacity { cluster: "c".into(), min: 0.5, max: 16.0 }.request();
+        assert_eq!(op, "ModifyDBCluster");
+        assert!(params.contains(&("ServerlessV2ScalingConfiguration.MinCapacity", "0.5".into())));
+        assert!(params.contains(&("ServerlessV2ScalingConfiguration.MaxCapacity", "16".into())));
+        assert_eq!(Action::Snapshot { cluster: "c".into(), id: "s".into() }.request().0, "CreateDBClusterSnapshot");
+        assert_eq!(Action::Stop { cluster: "c".into() }.request().0, "StopDBCluster");
+        assert_eq!(Action::Start { cluster: "c".into() }.request().0, "StartDBCluster");
+        assert_eq!(Action::Reboot { instance: "r".into() }.request().0, "RebootDBInstance");
+        let instances = [instance("r", false, "a")];
+        assert_eq!(Action::Reboot { instance: "r".into() }.cluster(&instances), Some("c"));
+        assert_eq!(Action::Reboot { instance: "gone".into() }.cluster(&instances), None);
+    }
+
+    #[test]
+    fn changes_the_cluster_cannot_take_are_refused() {
+        let c = cluster("c", "available");
+        let (w, r) = (instance("w", true, "a"), instance("r", false, "b"));
+        let both = [&w, &r];
+        let failover = |to: Option<&str>| Action::Failover { cluster: "c".into(), to: to.map(str::to_string) };
+        assert_eq!(refusal(&failover(Some("r")), &c, &both), None);
+        assert_eq!(refusal(&failover(None), &c, &both), None);
+        assert!(refusal(&failover(Some("w")), &c, &both).unwrap().contains("already is the writer"));
+        assert!(refusal(&failover(None), &c, &[&w]).unwrap().contains("no reader"));
+        let rebooting = Instance { status: "rebooting".into(), ..r.clone() };
+        assert!(refusal(&failover(Some("r")), &c, &[&w, &rebooting]).unwrap().contains("only an available reader"));
+        assert!(refusal(&failover(None), &cluster("c", "modifying"), &both).unwrap().contains("only when available"));
+        let secondary = Cluster { global: Some(("g".into(), false)), ..c.clone() };
+        assert!(refusal(&failover(None), &secondary, &both).unwrap().contains("secondary cluster"));
+
+        let stop = Action::Stop { cluster: "c".into() };
+        assert_eq!(refusal(&stop, &c, &both), None);
+        let global = Cluster { global: Some(("g".into(), true)), ..c.clone() };
+        assert!(refusal(&stop, &global, &both).unwrap().contains("global database"));
+        let v1 = Cluster { engine_mode: Some("serverless".into()), ..c.clone() };
+        assert!(refusal(&stop, &v1, &both).unwrap().contains("cannot be stopped"));
+        let start = Action::Start { cluster: "c".into() };
+        assert!(refusal(&start, &c, &both).unwrap().contains("only a stopped cluster"));
+        assert_eq!(refusal(&start, &cluster("c", "stopped"), &both), None);
+
+        let class = |class: &str| Action::SetClass { instance: "r".into(), class: class.into(), now: true };
+        assert!(refusal(&class("db.r6g.large"), &c, &both).unwrap().contains("already is"));
+        assert_eq!(refusal(&class("db.r7g.large"), &c, &both), None);
+        assert!(refusal(&class("db.serverless"), &c, &both).unwrap().contains("no Serverless v2 range"));
+
+        let acu = |min, max| Action::SetCapacity { cluster: "c".into(), min, max };
+        assert!(refusal(&acu(1.0, 8.0), &c, &both).unwrap().contains("no Serverless v2 instances"));
+        let serverless = Cluster { serverless: Some(Capacity { min: 4.0, max: 16.0 }), ..c.clone() };
+        assert_eq!(refusal(&acu(1.0, 8.0), &serverless, &both), None);
+        assert!(refusal(&acu(9.0, 8.0), &serverless, &both).is_some());
+
+        let snapshot = |id: &str| Action::Snapshot { cluster: "c".into(), id: id.into() };
+        assert_eq!(refusal(&snapshot("c-2026-10-22-1730"), &c, &both), None);
+        assert!(refusal(&snapshot("c--x"), &c, &both).is_some());
+        assert!(refusal(&snapshot("c-x"), &cluster("c", "backing-up"), &both).unwrap().contains("only when available"));
+    }
+
+    #[test]
+    fn explanations_warn_about_the_writer() {
+        let c = cluster("c", "available");
+        let (w, r) = (instance("w", true, "a"), Instance { promotion_tier: Some(1), ..instance("r", false, "b") });
+        let both = [&w, &r];
+        assert!(explain(&Action::Reboot { instance: "w".into() }, &c, &both).contains("It is the writer"));
+        assert!(!explain(&Action::Reboot { instance: "r".into() }, &c, &both).contains("It is the writer"));
+        assert!(explain(&Action::Failover { cluster: "c".into(), to: None }, &c, &both).starts_with("the reader AWS picks (lowest tier: r) becomes the writer and w a reader"));
+        let later = explain(&Action::SetClass { instance: "w".into(), class: "db.r6g.xlarge".into(), now: false }, &c, &both);
+        assert!(later.starts_with("w: db.r6g.large (2 vCPU, 16 GiB) → db.r6g.xlarge (4 vCPU, 32 GiB)."), "{later}");
+        assert!(later.contains("next maintenance window (sun:08:00-sun:08:30 UTC)"), "{later}");
+        assert!(explain(&Action::SetClass { instance: "w".into(), class: "db.r6g.xlarge".into(), now: true }, &c, &both).contains("writes stop"));
+    }
+
+    #[test]
+    fn acu_ranges_and_snapshot_names() {
+        assert_eq!(parse_acu("0.5:16"), Ok((0.5, 16.0)));
+        assert_eq!(parse_acu(" 2 - 8 "), Ok((2.0, 8.0)));
+        assert_eq!(parse_acu("0:1"), Ok((0.0, 1.0)));
+        for bad in ["16", "a:2", "0.3:4", "8:4", "0.5:0.5", "1:300", "-1:4"] {
+            assert!(parse_acu(bad).is_err(), "{bad}");
+        }
+        // 2026-10-22 17:30 UTC
+        assert_eq!(snapshot_name("orders-prod", 1_792_690_200.0), "orders-prod-2026-10-22-1730");
+        assert_eq!(snapshot_name("Orders_Prod", 1_792_690_200.0), "orders-prod-2026-10-22-1730");
+        assert_eq!(snapshot_name("9lives", 1_792_690_200.0), "snapshot-9lives-2026-10-22-1730");
+        assert!(check_snapshot_name(&snapshot_name(&"x".repeat(300), 0.0)).is_ok());
+        for bad in ["", "1a", "a--b", "a-", "a_b", "a b"] {
+            assert!(check_snapshot_name(bad).is_err(), "{bad}");
+        }
+        assert!(check_snapshot_name("a-b-2").is_ok());
+    }
+
+    #[test]
+    fn offered_classes_are_sorted_once_each() {
+        let mut classes: Vec<String> =
+            ["db.serverless", "db.r6g.2xlarge", "db.r6g.large", "db.r5.large", "db.r6g.large", "db.t4g.medium", "db.r6g.xlarge"].map(String::from).to_vec();
+        sort_classes(&mut classes);
+        assert_eq!(classes, ["db.r5.large", "db.r6g.large", "db.r6g.xlarge", "db.r6g.2xlarge", "db.t4g.medium", "db.serverless"]);
+        assert!(is_graviton("db.r6g.large") && is_graviton("db.t4g.medium") && !is_graviton("db.r6i.large") && !is_graviton("db.serverless"));
+        assert_eq!(class_detail("db.r6g.large"), "2 vCPU · 16 GiB · Graviton");
+        assert_eq!(class_detail("db.r5.xlarge"), "4 vCPU · 32 GiB · Intel");
     }
 
     #[test]

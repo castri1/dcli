@@ -1,6 +1,8 @@
 //! `dcli aurora`: Aurora clusters, a cluster's topology (endpoints → nodes, each node's
 //! CPU, connections and replica lag), its metrics, top SQL and wait events (Performance
-//! Insights), events and pending maintenance, and a performance diagnosis for an AI agent.
+//! Insights), events and pending maintenance, and a performance diagnosis for an AI agent;
+//! and the changes: failover, reboot, stop and start, instance class, Serverless v2 range,
+//! manual snapshot (each asks first).
 
 use std::process::ExitCode;
 
@@ -11,7 +13,7 @@ use crate::aws::Aws;
 use crate::aws::lambda::Range;
 use crate::aws::pi;
 use crate::aws::rds::{self, Cluster, Health, Instance, Inventory, Metrics};
-use crate::cli::{aws_for, env_and, paint, print_json};
+use crate::cli::{aws_for, confirm_write, env_and, paint, print_json};
 use crate::config::Config;
 use crate::tui::chart::{Agg, columns, fmt_ms, sparkline, sparkline_to};
 use crate::util::{ellipsize, fmt_ago, fmt_utc, now_secs, program};
@@ -43,14 +45,60 @@ pub struct Args {
     range: String,
     #[arg(long)]
     json: bool,
+    /// Fail over: a reader becomes the writer (--to names it; otherwise AWS picks one by
+    /// promotion tier)
+    #[arg(long, group = "action")]
+    failover: bool,
+    /// The reader --failover makes the writer
+    #[arg(long, value_name = "INSTANCE", requires = "failover")]
+    to: Option<String>,
+    /// Reboot an instance of the cluster
+    #[arg(long, value_name = "INSTANCE", group = "action")]
+    reboot: Option<String>,
+    /// Stop the cluster (storage is still billed; AWS starts it again after 7 days)
+    #[arg(long, group = "action")]
+    stop: bool,
+    /// Start a stopped cluster
+    #[arg(long, group = "action")]
+    start: bool,
+    /// Change an instance's class: INSTANCE=CLASS (orders-2=db.r6g.large), in the next
+    /// maintenance window unless --now
+    #[arg(long, value_name = "INSTANCE=CLASS", group = "action")]
+    class: Option<String>,
+    /// With --class: right away (the instance restarts) instead of in the maintenance window
+    #[arg(long, requires = "class")]
+    now: bool,
+    /// The range the cluster's Serverless v2 instances scale in: MIN:MAX ACU (0.5:16)
+    #[arg(long, value_name = "MIN:MAX", group = "action")]
+    acu: Option<String>,
+    /// Create a manual snapshot of the cluster (named after the cluster and the time unless
+    /// NAME is given)
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "", group = "action")]
+    snapshot: Option<String>,
+    /// Do not ask for confirmation
+    #[arg(short, long)]
+    yes: bool,
+}
+
+impl Args {
+    fn wants_action(&self) -> bool {
+        self.failover || self.reboot.is_some() || self.stop || self.start || self.class.is_some() || self.acu.is_some() || self.snapshot.is_some()
+    }
+
+    fn wants_view(&self) -> bool {
+        self.metrics || self.top_sql || self.events || self.report
+    }
 }
 
 pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
     let (env, cluster) = env_and(config, args.env.clone(), args.cluster.clone())?;
     let aws = aws_for(config, &env)?;
     let range = Range::parse(&args.range).ok_or_else(|| anyhow!("--range: use 1h, 24h or 7d"))?;
+    if args.wants_action() && args.wants_view() {
+        bail!("a change (--failover, --reboot, --stop, --start, --class, --acu, --snapshot) goes alone, without a view");
+    }
     let Some(id) = cluster else {
-        if args.metrics || args.top_sql || args.events || args.report {
+        if args.wants_view() || args.wants_action() {
             bail!("which cluster? {} aurora [ENV] CLUSTER …", program());
         }
         return list(&aws, args.json);
@@ -62,6 +110,9 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
     let inventory = rds::inventory(&aws, Some(&id))?;
     let Some(cluster) = inventory.cluster(&id) else { bail!("Aurora cluster not found: {id}") };
     let instances = inventory.instances_of(&id);
+    if let Some(action) = action(&aws, &args, cluster, &instances)? {
+        return change(&aws, &env, cluster, &instances, &action, args.yes);
+    }
     if args.metrics {
         return metrics(&aws, cluster, &instances, range, args.json);
     }
@@ -72,6 +123,58 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
         return events(&aws, cluster, &instances, args.json);
     }
     topology(&aws, &env, &inventory, cluster, args.json)
+}
+
+/// The change the flags ask for, if any.
+fn action(aws: &Aws, args: &Args, c: &Cluster, instances: &[&Instance]) -> Result<Option<rds::Action>> {
+    let cluster = c.id.clone();
+    if args.failover {
+        return Ok(Some(rds::Action::Failover { cluster, to: args.to.clone() }));
+    }
+    if let Some(instance) = &args.reboot {
+        return Ok(Some(rds::Action::Reboot { instance: instance.clone() }));
+    }
+    if args.stop {
+        return Ok(Some(rds::Action::Stop { cluster }));
+    }
+    if args.start {
+        return Ok(Some(rds::Action::Start { cluster }));
+    }
+    if let Some(spec) = &args.class {
+        let (instance, class) = spec.split_once('=').ok_or_else(|| anyhow!("--class takes INSTANCE=CLASS, like orders-2=db.r6g.large"))?;
+        let (instance, class) = (instance.trim(), class.trim());
+        let i = instances.iter().find(|i| i.id == instance).ok_or_else(|| anyhow!("no instance {instance} in {}", c.id))?;
+        // A class AWS does not offer for this engine version would only fail later.
+        let offered = rds::orderable_classes(aws, &i.engine, &i.engine_version)?;
+        if !offered.iter().any(|o| o == class) {
+            bail!("{class} is not offered for {} {}; classes: {}", i.engine, i.engine_version, offered.join(", "));
+        }
+        return Ok(Some(rds::Action::SetClass { instance: instance.to_string(), class: class.to_string(), now: args.now }));
+    }
+    if let Some(range) = &args.acu {
+        let (min, max) = rds::parse_acu(range).map_err(|e| anyhow!("--acu: {e}"))?;
+        return Ok(Some(rds::Action::SetCapacity { cluster, min, max }));
+    }
+    if let Some(name) = &args.snapshot {
+        let id = if name.trim().is_empty() { rds::snapshot_name(&c.id, now_secs()) } else { name.trim().to_string() };
+        return Ok(Some(rds::Action::Snapshot { cluster, id }));
+    }
+    Ok(None)
+}
+
+/// Says what the change does, asks (the environment's name in production), and asks AWS.
+fn change(aws: &Aws, env: &str, c: &Cluster, instances: &[&Instance], action: &rds::Action, yes: bool) -> Result<ExitCode> {
+    if let Some(why) = rds::refusal(action, c, instances) {
+        bail!("{why}");
+    }
+    println!("{}", rds::explain(action, c, instances));
+    if !confirm_write(env, &format!("{} ({env})?", action.title()), yes)? {
+        bail!("nothing changed");
+    }
+    rds::apply(aws, action)?;
+    println!("{} {}", paint("✓", "32"), action.accepted());
+    println!("{}", paint(&format!("Follow it with: {} aurora {env} {}", program(), c.id), "90"));
+    Ok(ExitCode::SUCCESS)
 }
 
 fn health_code(h: Health) -> &'static str {

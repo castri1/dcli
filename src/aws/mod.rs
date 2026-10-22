@@ -118,12 +118,23 @@ impl Aws {
     /// `awsQuery` call (CloudFormation and other older APIs): a form-encoded `POST /`;
     /// returns the XML response body.
     pub fn query(&self, svc: &Service, action: &str, version: &str, params: &[(&str, &str)]) -> Result<String> {
+        self.query_with(svc, action, version, params, true)
+    }
+
+    /// Like [`Aws::query`] for a call that must not run twice (failing over a cluster,
+    /// rebooting an instance): sent again only when AWS throttled it, not after a server
+    /// error or a lost connection, when it may already have run.
+    pub fn query_once(&self, svc: &Service, action: &str, version: &str, params: &[(&str, &str)]) -> Result<String> {
+        self.query_with(svc, action, version, params, false)
+    }
+
+    fn query_with(&self, svc: &Service, action: &str, version: &str, params: &[(&str, &str)], idempotent: bool) -> Result<String> {
         let mut body = format!("Action={}&Version={}", uri_encode(action), uri_encode(version));
         for (k, v) in params {
             body.push_str(&format!("&{}={}", uri_encode(k), uri_encode(v)));
         }
         let headers = vec![("content-type".to_string(), "application/x-www-form-urlencoded; charset=utf-8".to_string())];
-        let resp = self.send(svc, "POST", &[], &[], headers, body.into_bytes())?;
+        let resp = self.send_with(svc, "POST", &[], &[], headers, body.into_bytes(), idempotent)?;
         Ok(crate::util::sanitize(&String::from_utf8_lossy(&resp.body)))
     }
 
