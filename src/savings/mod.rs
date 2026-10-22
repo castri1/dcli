@@ -165,6 +165,8 @@ impl Finding {
 /// What every check is given.
 pub struct Scan<'a> {
     pub aws: &'a Aws,
+    /// The dcli environment's name (`dev`, `prod`…).
+    pub env: &'a str,
     /// Days of usage looked at.
     pub days: u32,
 }
@@ -235,8 +237,8 @@ pub struct Outcome {
 
 /// Runs the checks of `services` (all of them when empty) in parallel. `done` hears of each
 /// service as it finishes, with its findings (tagged with the service) or its error.
-pub fn run(aws: &Aws, days: u32, services: &[&str], done: &(dyn Fn(&'static str, &aws::Result<Vec<Finding>>) + Sync)) -> Outcome {
-    let scan = Scan { aws, days };
+pub fn run(aws: &Aws, env: &str, days: u32, services: &[&str], done: &(dyn Fn(&'static str, &aws::Result<Vec<Finding>>) + Sync)) -> Outcome {
+    let scan = Scan { aws, env, days };
     let checks: Vec<&(&'static str, Check)> = CHECKS.iter().filter(|(s, _)| services.is_empty() || services.contains(s)).collect();
     let results: Vec<(&'static str, aws::Result<Vec<Finding>>)> = std::thread::scope(|s| {
         let jobs: Vec<_> = checks

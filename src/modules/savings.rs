@@ -188,9 +188,9 @@ impl Savings {
         self.found.clear();
         self.checks = CHECKS.iter().map(|(service, _)| (*service, Check::Running)).collect();
         self.rebuild();
-        let (aws, days) = (ctx.env().aws.clone(), self.days);
+        let (aws, env, days) = (ctx.env().aws.clone(), ctx.env().name.clone(), self.days);
         ctx.spawn_stream(move |em: Emitter<Msg>| {
-            savings::run(&aws, days, &[], &|service, result| {
+            savings::run(&aws, &env, days, &[], &|service, result| {
                 em.emit(Msg::Checked { service, result: result.clone() });
             });
             em.emit(Msg::Scanned);

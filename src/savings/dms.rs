@@ -18,7 +18,7 @@ const SMALLER_CPU_MAX: f64 = 60.0;
 /// …and the memory in use would take at most this share of the smaller class's memory
 /// (the rest holds changes waiting to be applied).
 const SMALLER_MEMORY_SHARE: f64 = 0.6;
-/// Words in a profile or instance name that say "not production".
+/// Words in an environment, profile or instance name that say "not production".
 const NON_PRODUCTION: [&str; 8] = ["dev", "test", "qa", "stag", "sandbox", "sbx", "uat", "demo"];
 
 /// Impact by vCPU-hours a month removed: a 4-vCPU instance running all month (2,920) is
@@ -77,14 +77,15 @@ pub fn check(scan: &Scan) -> aws::Result<Vec<Finding>> {
             usage.insert(i.id.clone(), Usage { cpu_max: cpu.into_iter().reduce(f64::max), free_min: mem.into_iter().reduce(f64::min) });
         }
     }
-    Ok(findings(&instances, &tasks, &usage, &scan.aws.profile, scan.days, now_secs()))
+    Ok(findings(&instances, &tasks, &usage, (scan.env, &scan.aws.profile), scan.days, now_secs()))
 }
 
 fn on(t: &Replication, i: &Instance) -> bool {
     t.instance_arn.as_ref() == Some(&i.arn)
 }
 
-fn findings(instances: &[Instance], tasks: &[Replication], usage: &HashMap<String, Usage>, profile: &str, days: u32, now: f64) -> Vec<Finding> {
+/// `names`: the dcli environment and the AWS profile, which say whether this is production.
+fn findings(instances: &[Instance], tasks: &[Replication], usage: &HashMap<String, Usage>, names: (&str, &str), days: u32, now: f64) -> Vec<Finding> {
     let mut out = Vec::new();
     for i in instances {
         let mine: Vec<&Replication> = tasks.iter().filter(|t| on(t, i)).collect();
@@ -97,7 +98,7 @@ fn findings(instances: &[Instance], tasks: &[Replication], usage: &HashMap<Strin
         {
             out.push(f);
         }
-        if let Some(f) = multi_az(i, profile) {
+        if let Some(f) = multi_az(i, names) {
             out.push(f);
         }
     }
@@ -193,13 +194,14 @@ fn oversized(i: &Instance, u: &Usage, days: u32) -> Option<Finding> {
     Some(f)
 }
 
-/// Multi-AZ where the profile or the instance's name says development, test or staging.
-fn multi_az(i: &Instance, profile: &str) -> Option<Finding> {
-    if !i.multi_az || is_production(profile) || is_production(&i.id) {
+/// Multi-AZ where the environment, the profile or the instance's name says development, test
+/// or staging, and none of them says production.
+fn multi_az(i: &Instance, (env, profile): (&str, &str)) -> Option<Finding> {
+    if !i.multi_az || is_production(env) || is_production(profile) || is_production(&i.id) {
         return None;
     }
     let hint = |name: &str| NON_PRODUCTION.iter().find(|w| name.to_lowercase().contains(**w)).map(|w| (name.to_string(), *w));
-    let (name, word) = hint(&i.id).or_else(|| hint(profile))?;
+    let (name, word) = hint(env).or_else(|| hint(&i.id)).or_else(|| hint(profile))?;
     let vcpus = dms::class_specs(&i.class).map_or(1.0, |(v, _)| f64::from(v));
     let vcpu_hours = MONTH_HOURS * vcpus;
     Some(
@@ -215,7 +217,7 @@ fn multi_az(i: &Instance, profile: &str) -> Option<Finding> {
         .score(vcpu_hours)
         .evidence(format!("{name} reads as non-production ({word})"))
         .caveat(format!(
-            "The environment is judged from the AWS profile and the instance's name ({profile}, {}): ignore this if it is production.",
+            "Production is judged from the names of the environment, the AWS profile and the instance ({env}, {profile}, {}): ignore this if it is production.",
             i.id
         )),
     )
@@ -266,7 +268,7 @@ mod tests {
             task("orders", "busy", Migration::Cdc, "running", None),
             task("recent", "busy", Migration::Cdc, "stopped", Some(now - 86_400.0)),
         ];
-        let found = findings(&instances, &tasks, &HashMap::new(), "default", 14, now);
+        let found = findings(&instances, &tasks, &HashMap::new(), ("main", "default"), 14, now);
         assert_eq!(found.len(), 2, "{found:#?}");
         assert_eq!(found[0].summary, "its only task is a full load that finished 45 days ago");
         assert_eq!(found[0].reduction, "730 instance-hours a month of dms.c5.xlarge (2,920 vCPU-hours)");
@@ -294,10 +296,12 @@ mod tests {
 
     #[test]
     fn multi_az_outside_production() {
-        assert!(multi_az(&instance("dms-dev-reporting", "dms.r5.large", true), "default").is_some());
-        assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), "corp-staging").is_some());
-        assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), "default").is_none());
-        assert!(multi_az(&instance("dms-prod-dev", "dms.r5.large", true), "default").is_none());
-        assert!(multi_az(&instance("dms-dev", "dms.r5.large", false), "default").is_none());
+        assert!(multi_az(&instance("dms-dev-reporting", "dms.r5.large", true), ("main", "default")).is_some());
+        assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), ("main", "corp-staging")).is_some());
+        assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), ("qa", "default")).is_some());
+        assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), ("main", "default")).is_none());
+        assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), ("prod", "corp-dev")).is_none());
+        assert!(multi_az(&instance("dms-prod-dev", "dms.r5.large", true), ("main", "default")).is_none());
+        assert!(multi_az(&instance("dms-dev", "dms.r5.large", false), ("dev", "default")).is_none());
     }
 }

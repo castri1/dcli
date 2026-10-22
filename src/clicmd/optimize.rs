@@ -61,7 +61,7 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
     if progress {
         eprintln!("{}", paint(&format!("Looking at the last {} of {env_name} ({})…", savings::days_label(args.days), aws.region), "90"));
     }
-    let mut outcome = savings::run(&aws, args.days, &services, &|service, result| {
+    let mut outcome = savings::run(&aws, &env_name, args.days, &services, &|service, result| {
         if progress {
             match result {
                 Ok(found) => eprintln!("  {} {service} · {}", paint("✓", "32"), found.len()),

@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn candidates_need_traffic_and_scale_with_it() {
         let aws = Aws::new("test", "us-east-1");
-        let scan = Scan { aws: &aws, days: 14 };
+        let scan = Scan { aws: &aws, env: "dev", days: 14 };
         let d = detail(vec![route("AWS_PROXY")], vec![stage("dev"), stage("prod")]);
         let mut usage = HashMap::new();
         assert!(http_candidate(&scan, &api("REGIONAL"), &d, Some(&[]), &usage).is_none(), "no requests, nothing to save");
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn caches_that_serve_little_are_found() {
         let aws = Aws::new("test", "us-east-1");
-        let scan = Scan { aws: &aws, days: 14 };
+        let scan = Scan { aws: &aws, env: "dev", days: 14 };
         let mut prod = stage("prod");
         prod.cache = Some(("6.1".into(), "AVAILABLE".into()));
         prod.cached_methods = vec!["*/*".into()];
