@@ -90,6 +90,13 @@ pub fn describe_log_groups(aws: &Aws, prefix: Option<&str>, token: Option<&str>)
     Ok((out.log_groups, out.next_token.filter(|t| !t.is_empty())))
 }
 
+/// Keeps a group's events `days` days (one of the values CloudWatch accepts: 1, 3, 5, 7,
+/// 14, 30, 60, 90…); older events are deleted.
+pub fn put_retention_policy(aws: &Aws, group: &str, days: u32) -> Result<()> {
+    let _: Value = aws.call(&SERVICE, "PutRetentionPolicy", &json!({ "logGroupName": group, "retentionInDays": days }))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FilteredEvent {

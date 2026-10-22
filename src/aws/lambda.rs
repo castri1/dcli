@@ -171,6 +171,49 @@ pub fn event_invoke_config(aws: &Aws, name: &str) -> Result<Option<EventInvokeCo
     }
 }
 
+/// Provisioned concurrency of one alias or version of a function.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ProvisionedConcurrency {
+    /// The qualified ARN (`…:function:name:live`).
+    pub function_arn: String,
+    pub requested_provisioned_concurrent_executions: i64,
+    pub allocated_provisioned_concurrent_executions: i64,
+    pub status: Option<String>,
+}
+
+impl ProvisionedConcurrency {
+    /// The alias or version it is configured on.
+    pub fn qualifier(&self) -> &str {
+        self.function_arn.rsplit(':').next().unwrap_or_default()
+    }
+}
+
+/// Every provisioned concurrency configuration of a function (one per alias or version).
+pub fn provisioned_concurrency(aws: &Aws, name: &str) -> Result<Vec<ProvisionedConcurrency>> {
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "PascalCase", default)]
+    struct Out {
+        provisioned_concurrency_configs: Vec<ProvisionedConcurrency>,
+        next_marker: Option<String>,
+    }
+    let mut all = Vec::new();
+    let mut marker: Option<String> = None;
+    for _ in 0..10 {
+        let mut query = vec![("List".to_string(), "ALL".to_string())];
+        if let Some(m) = &marker {
+            query.push(("Marker".to_string(), m.clone()));
+        }
+        let out: Out = aws.rest(&SERVICE, "GET", &["2019-09-30", "functions", name, "provisioned-concurrency"], &query, None)?;
+        all.extend(out.provisioned_concurrency_configs);
+        match out.next_marker.filter(|m| !m.is_empty()) {
+            Some(m) => marker = Some(m),
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
 // ---- invoking ----------------------------------------------------------------------------
 
 /// What a synchronous invocation returned.

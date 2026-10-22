@@ -145,6 +145,13 @@ pub fn queue(aws: &Aws, url: &str) -> Result<Queue> {
     Ok(Queue::new(url.to_string(), out.attributes))
 }
 
+/// Changes attributes of a queue (`ReceiveMessageWaitTimeSeconds`…).
+pub fn set_attributes(aws: &Aws, url: &str, attributes: &[(&str, &str)]) -> Result<()> {
+    let attributes: HashMap<&str, &str> = attributes.iter().copied().collect();
+    let _: Value = aws.call_json10(&SERVICE, "SetQueueAttributes", &json!({ "QueueUrl": url, "Attributes": attributes }))?;
+    Ok(())
+}
+
 /// Every queue with its attributes (read in parallel), by name.
 pub fn list_queues(aws: &Aws) -> Result<Vec<Queue>> {
     let urls = list_queue_urls(aws)?;

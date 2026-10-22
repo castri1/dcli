@@ -770,6 +770,12 @@ FAILED_LOG = (
 )
 
 
+GiB = 1024 ** 3
+# Log group → (stored bytes, retention days or 0 for "never expire").
+LOG_STORAGE = {"/ecs/orders-api": (int(1300 * GiB), 0), "/aws/lambda/report-builder": (int(180 * GiB), 0),
+               "/aws/codebuild/app-dev": (int(0.4 * GiB), 0), "/aws/lambda/cron-cleanup": (int(0.2 * GiB), 0)}
+
+
 def log_groups():
     return [f"/aws/lambda/{f['FunctionName']}" for f in FUNCS] + [
         "/aws/codebuild/app-dev", "/ecs/orders-api", "API-Gateway-Execution-Logs_a1b2c3/prod"]
@@ -780,7 +786,7 @@ LAMBDA_LINES = [
     "WARN retrying payment provider (attempt 2)",
     "ERROR Unhandled exception: TimeoutError: payment provider did not answer in 3000 ms\n    at charge (/var/task/payments.js:42:11)\n    at handler (/var/task/index.js:17:5)",
     "END RequestId: {rid}",
-    "REPORT RequestId: {rid}  Duration: 211.40 ms  Billed Duration: 212 ms  Memory Size: 512 MB  Max Memory Used: 96 MB",
+    "REPORT RequestId: {rid}  Duration: 211.40 ms  Billed Duration: 212 ms  Memory Size: {mem} MB  Max Memory Used: {used} MB",
 ]
 
 
@@ -821,7 +827,10 @@ def synthetic_events(group, start_ms, pattern):
         lines = LINES_BY_GROUP.get(group, LAMBDA_LINES)
         # One request id per invocation (the lines from START to REPORT).
         uuid_ = f"{(k // len(lines)) * 2654435761 % 2**32:08x}-2b7a-4c55-9a0e-1f2d3c4b{(k // len(lines)) % 9999:04d}"
-        line = lines[k % len(lines)].format(rid=f"{k:08x}-7f3c", n=1000 + k % 977, uuid=uuid_)
+        fn = group.rsplit("/", 1)[-1]
+        mem = next((f["MemorySize"] for f in FUNCS if f["FunctionName"] == fn), 512)
+        used = round(LAMBDA_MEMORY_USED.get(fn, 96) * (0.85 + 0.15 * (k * 7919 % 100) / 99))
+        line = lines[k % len(lines)].format(rid=f"{k:08x}-7f3c", n=1000 + k % 977, uuid=uuid_, mem=mem, used=used)
         if not terms or any(term.lower() in line.lower() for term in terms):
             out.append({"logStreamName": f"2026/10/20/[$LATEST]{k % 3:04x}", "timestamp": t, "message": line + "\n",
                         "ingestionTime": t + 300, "eventId": f"{k}-{group}"})
@@ -878,6 +887,27 @@ def insights_run(q):
         records = [r for r in records if re.search(pattern, r[2]["@message"], re.I)]
     if re.search(r'filter\s+@type\s*=\s*"REPORT"', query):
         records = [r for r in records if r[2].get("@type") == "REPORT"]
+    by_log = re.search(r"stats\s+(.+?)\s+by\s+@log", query, re.S)
+    if by_log:
+        groups = {}
+        for g, _, record in records:
+            groups.setdefault(g, []).append(record)
+        rows = []
+        for g, recs in sorted(groups.items()):
+            row = [{"field": "@log", "value": f"123456789012:{g}"}]
+            for fn, field, arg, alias in re.findall(r"(count|max|min|avg|sum|pct)\((\*|@\w+)(?:,\s*(\d+))?\)\s+as\s+(\w+)", by_log[1]):
+                values = sorted(float(r[field]) for r in recs if field in r) if field != "*" else []
+                if fn == "count":
+                    v = len(recs)
+                elif not values:
+                    continue
+                elif fn == "pct":
+                    v = values[min(len(values) - 1, int(len(values) * int(arg) / 100))]
+                else:
+                    v = {"max": max, "min": min, "sum": sum, "avg": lambda xs: sum(xs) / len(xs)}[fn](values)
+                row.append({"field": alias, "value": str(v)})
+            rows.append(row)
+        return rows, len(records), scanned
     stats = re.search(r"stats\s+count\(\*\)\s+by\s+bin\((\d+)([smh])\)", query)
     if stats:
         size = int(stats[1]) * {"s": 1, "m": 60, "h": 3600}[stats[2]]
@@ -948,8 +978,21 @@ def cwlogs(op, body):
     if op == "DescribeLogGroups":
         prefix = body.get("logGroupNamePrefix", "")
         groups = [g for g in log_groups() if g.startswith(prefix)]
-        return {"logGroups": [{"logGroupName": g, "storedBytes": 1_000_000 * (i + 1), "retentionInDays": 30,
-                               "creationTime": int(T0 * 1000)} for i, g in enumerate(groups)]}
+        out = []
+        for i, g in enumerate(groups):
+            stored, retention = LOG_STORAGE.get(g, (1_000_000 * (i + 1), 30))
+            out.append({"logGroupName": g, "storedBytes": stored, "creationTime": int((T0 - 86400 * 300) * 1000),
+                        **({"retentionInDays": retention} if retention else {})})
+        return {"logGroups": out}
+    if op == "PutRetentionPolicy":
+        group = body["logGroupName"]
+        if group not in log_groups():
+            raise KeyError(f"ResourceNotFoundException: The specified log group does not exist: {group}")
+        if body.get("retentionInDays") not in (1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192,
+                                               2557, 2922, 3288, 3653):
+            raise KeyError(f"InvalidParameterException: retentionInDays {body.get('retentionInDays')} is not allowed")
+        LOG_STORAGE[group] = (LOG_STORAGE.get(group, (1_000_000, 0))[0], body["retentionInDays"])
+        return {}
     if op == "FilterLogEvents":
         group = body["logGroupName"]
         if group not in log_groups():
@@ -1034,12 +1077,15 @@ SECRETS = [
         ("dev/payments/stripe", "Stripe test keys", json.dumps({"publishable": "pk_test_abc", "secret": "sk_test_xyz"})),
         ("shared/slack-webhook", "", "https://hooks.slack.com/services/T000/B000/XXXX"),
     ], start=1)]
+SECRETS.append({"Name": "legacy/partner-api", "Description": "Partner API key (old integration)", "Value": json.dumps({"key": "pk_old"}),
+                "Created": time.time() - 86400 * 400, "Changed": time.time() - 86400 * 380, "Accessed": time.time() - 86400 * 140,
+                "Tags": [], "Versions": 1})
 
 
 def secret_meta(sec):
     return {"ARN": f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{sec['Name']}-AbCdEf", "Name": sec["Name"],
             **({"Description": sec["Description"]} if sec["Description"] else {}),
-            "LastChangedDate": sec["Changed"], "LastAccessedDate": time.time() - 86400, "CreatedDate": sec["Created"],
+            "LastChangedDate": sec["Changed"], "LastAccessedDate": sec.get("Accessed", time.time() - 86400), "CreatedDate": sec["Created"],
             "RotationEnabled": False, "Tags": sec["Tags"]}
 
 
@@ -1085,6 +1131,25 @@ FUNCS = [{"FunctionName": n, "FunctionArn": f"arn:aws:lambda:us-east-1:123456789
 
 
 FUNCS[0]["DeadLetterConfig"] = {"TargetArn": "arn:aws:sqs:us-east-1:123456789012:payments-dlq"}
+# x86 functions (arm64 candidates for the Savings checks) and the memory each one uses (MB).
+for _f in FUNCS:
+    if _f["FunctionName"] in ("report-builder", "orders-sync", "cron-cleanup"):
+        _f["Architectures"] = ["x86_64"]
+LAMBDA_MEMORY_USED = {"report-builder": 410, "users-auth": 70, "image-resizer": 1730, "cron-cleanup": 61}
+# Provisioned concurrency: function → [(qualifier, allocated)].
+LAMBDA_PROVISIONED = {"payments-webhook": [("live", 50)]}
+
+
+def lambda_provisioned_concurrency(path):
+    """GET /2019-09-30/functions/{name}/provisioned-concurrency?List=ALL: (status, body)."""
+    name = [p for p in path.split("?")[0].split("/") if p][2]
+    if not any(f["FunctionName"] == name for f in FUNCS):
+        return 404, {"Type": "User", "message": f"Function not found: {name}"}
+    arn = f"arn:aws:lambda:us-east-1:123456789012:function:{name}"
+    return 200, {"ProvisionedConcurrencyConfigs": [
+        {"FunctionArn": f"{arn}:{q}", "RequestedProvisionedConcurrentExecutions": n, "AvailableProvisionedConcurrentExecutions": n,
+         "AllocatedProvisionedConcurrentExecutions": n, "Status": "READY", "LastModified": "2026-09-01T10:00:00+0000"}
+        for q, n in LAMBDA_PROVISIONED.get(name, [])]}
 EVENT_INVOKE_CONFIG = {"payments-webhook": {
     "FunctionArn": FUNCS[0]["FunctionArn"], "MaximumRetryAttempts": 2, "MaximumEventAgeInSeconds": 3600,
     "DestinationConfig": {"OnFailure": {"Destination": "arn:aws:sqs:us-east-1:123456789012:payments-failures"}, "OnSuccess": {}}}}
@@ -1184,6 +1249,22 @@ S3_OBJECTS = {
 }
 
 
+# Lifecycle rules, versioning and abandoned multipart uploads per bucket (the Savings checks).
+S3_LIFECYCLE = {
+    "acme-reports.eu": "<Rule><ID>age</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>"
+                       "<Transition><Days>30</Days><StorageClass>STANDARD_IA</StorageClass></Transition>"
+                       "<AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>",
+    "acme-logs-archive": "<Rule><ID>expire</ID><Filter><Prefix>app/</Prefix></Filter><Status>Enabled</Status>"
+                         "<Expiration><Days>400</Days></Expiration></Rule>",
+}
+S3_VERSIONING = {"acme-app-assets": "Enabled", "acme-logs-archive": "Suspended"}
+S3_STALE_UPLOADS = {"acme-app-assets": 14}
+# Bucket → {BucketSizeBytes storage type: bytes}.
+S3_SIZES = {"acme-app-assets": {"StandardStorage": 620 * 1024 ** 3, "StandardIAStorage": 3 * 1024 ** 3},
+            "acme-reports.eu": {"StandardStorage": 80 * 1024 ** 3, "StandardIAStorage": 300 * 1024 ** 3},
+            "acme-logs-archive": {"GlacierInstantRetrievalStorage": 2048 * 1024 ** 3}}
+
+
 def s3_error(status, code, message, extra=None):
     body = f"<Error><Code>{code}</Code><Message>{xml_escape(message)}</Message></Error>".encode()
     return status, {"content-type": "application/xml", **(extra or {})}, body
@@ -1223,6 +1304,19 @@ def s3_rest(method, path, query, headers):
         return s3_error(301, "PermanentRedirect", "The bucket you are attempting to access must be addressed using the specified endpoint.",
                         {"x-amz-bucket-region": region})
     objects = S3_OBJECTS[bucket]
+    if not key and "lifecycle" in query:
+        rules = S3_LIFECYCLE.get(bucket)
+        if rules is None:
+            return s3_error(404, "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist")
+        return 200, xml, f"<LifecycleConfiguration>{rules}</LifecycleConfiguration>".encode()
+    if not key and "versioning" in query:
+        status = S3_VERSIONING.get(bucket)
+        body = f"<VersioningConfiguration><Status>{status}</Status></VersioningConfiguration>" if status else "<VersioningConfiguration/>"
+        return 200, xml, body.encode()
+    if not key and "uploads" in query:
+        uploads = "".join(f"<Upload><Key>exports/big-{i}.zip</Key><UploadId>u{i}</UploadId><Initiated>{s3_iso(T0 - 86400 * (10 + i))}</Initiated>"
+                          f"<StorageClass>STANDARD</StorageClass></Upload>" for i in range(S3_STALE_UPLOADS.get(bucket, 0)))
+        return 200, xml, f"<ListMultipartUploadsResult><Bucket>{bucket}</Bucket>{uploads}<IsTruncated>false</IsTruncated></ListMultipartUploadsResult>".encode()
     if not key:
         if method == "HEAD":  # HeadBucket
             return 200, {"x-amz-bucket-region": region}, b""
@@ -1676,7 +1770,9 @@ DDB_TABLES = {
     "users": {"keys": [("userId", "S", "HASH")], "items": DDB_USERS, "gsis": []},
     "orders": {"keys": [("customerId", "S", "HASH"), ("createdAt", "S", "RANGE")], "items": DDB_ORDERS,
                "gsis": [("status-index", [("status", "S", "HASH"), ("createdAt", "S", "RANGE")])]},
-    "invoices": {"keys": [("invoiceNo", "N", "HASH")], "items": DDB_INVOICES, "gsis": []},
+    "invoices": {"keys": [("invoiceNo", "N", "HASH")], "items": DDB_INVOICES, "gsis": [], "provisioned": (500, 500)},
+    "sessions-legacy": {"keys": [("sessionId", "S", "HASH")], "items": [], "gsis": [], "provisioned": (100, 50)},
+    "events-archive": {"keys": [("eventId", "S", "HASH")], "items": [], "gsis": [], "size": int(380 * 1024 ** 3)},
 }
 
 
@@ -1695,9 +1791,10 @@ def ddb_describe(name, t):
         "GlobalSecondaryIndexes": [{"IndexName": g, "KeySchema": [{"AttributeName": a, "KeyType": r} for a, _, r in ks],
                                     "Projection": {"ProjectionType": "ALL"}, "IndexStatus": "ACTIVE",
                                     "ItemCount": len(t["items"])} for g, ks in t["gsis"]],
-        "ItemCount": len(t["items"]), "TableSizeBytes": len(json.dumps(t["items"], default=sorted)),
-        "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"} if name != "invoices" else None,
-        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+        "ItemCount": len(t["items"]), "TableSizeBytes": t.get("size", len(json.dumps(t["items"], default=sorted))),
+        "BillingModeSummary": {"BillingMode": "PROVISIONED" if "provisioned" in t else "PAY_PER_REQUEST"},
+        "ProvisionedThroughput": {"ReadCapacityUnits": t.get("provisioned", (0, 0))[0], "WriteCapacityUnits": t.get("provisioned", (0, 0))[1]},
+        "TableClassSummary": {"TableClass": "STANDARD"},
         "StreamSpecification": {"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"} if name == "orders" else None,
         "CreationDateTime": T0 - 86400 * 400, "DeletionProtectionEnabled": name == "orders"}}
 
@@ -1926,6 +2023,11 @@ def cw_alarm_defs():
          "evals": 5, "dta": 5, "threshold": 10.0, "op": "GreaterThanThreshold", "missing": "notBreaching", "actions": [],
          "reason": "Threshold Crossed: no datapoints were greater than the threshold (10.0).",
          "history": [(10 * 86400, "INSUFFICIENT_DATA", "OK")]},
+        {"name": "legacy-\x1b[31mjobs-age", "state": "INSUFFICIENT_DATA", "since": now - 45 * 86400,
+         "ns": "AWS/SQS", "metric": "ApproximateAgeOfOldestMessage", "dims": [("QueueName", "legacy-jobs")], "stat": "Maximum",
+         "period": 60, "evals": 5, "dta": 5, "threshold": 900.0, "op": "GreaterThanThreshold", "missing": "missing",
+         "actions": [CW_SNS], "reason": "Insufficient Data: 5 datapoints were unknown.",
+         "history": [(45 * 86400, "OK", "INSUFFICIENT_DATA")]},
         {"name": "order-fulfillment-failures", "state": "INSUFFICIENT_DATA", "since": now - 86400,
          "ns": "AWS/States", "metric": "ExecutionsFailed", "stat": "Sum", "period": 300,
          "dims": [("StateMachineArn", "arn:aws:states:us-east-1:123456789012:stateMachine:order-fulfillment")],
@@ -2053,6 +2155,60 @@ def cw_metric_value(name, dims, ts):
     if name == "ConcurrentExecutions":
         return float(int(3 * wave + 3 * seed))
     return round(10 * wave + 5 * seed, 2)
+
+
+# ---- metrics read by the Savings checks ----------------------------------------------------------
+# Per day: Lambda invocations (multiples of the default 5-minute value), log bytes received,
+# empty receives, consumed capacity (units per second), executions.
+SAVINGS_INVOCATIONS = {"report-builder": 20.0, "orders-sync": 4.0, "image-resizer": 6.0}
+SAVINGS_LOG_BYTES = {"/ecs/orders-api": 12 * GiB, "/aws/lambda/report-builder": 6 * GiB, "/aws/lambda/orders-sync": 1.5 * GiB,
+                     "/aws/lambda/payments-webhook": 0.4 * GiB}
+SAVINGS_EMPTY_RECEIVES = {"notifications": (900_000, 30_000), "payments.fifo": (200_000, 50_000)}
+# Table → ((read mean, read peak), (write mean, write peak)) units per second; spiky tables peak rarely.
+SAVINGS_CAPACITY = {"invoices": ((10, 20), (12, 26)), "orders": ((500, 700), (100, 200)), "users": ((5, 400), (1, 2)),
+                    "events-archive": ((2, 9), (1, 3)), "sessions-legacy": ((0, 0), (0, 0))}
+SAVINGS_SFN = {"order-fulfillment": (150_000, 1800, 9000), "invoice-generation": (1, 40_000, 90_000),
+               "report-export": (300, 240_000, 1_300_000)}
+
+
+def savings_metric(namespace, name, dims, stat, period, ts):
+    seed = int(hashlib.sha256(f"{name}{sorted(dims.items())}{int(ts)}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    wave = 1 + 0.2 * math.sin(ts / 86400 * 2 * math.pi)
+    if namespace == "AWS/Lambda" and name == "Invocations" and period >= 86400:
+        fn = dims.get("FunctionName", "")
+        return cw_metric_value(name, dims, ts) * period / 300 * SAVINGS_INVOCATIONS.get(fn, 1.0)
+    if namespace == "AWS/Lambda" and name == "ProvisionedConcurrencyUtilization":
+        return round(0.06 + 0.06 * seed, 3)
+    if namespace == "AWS/Logs" and name == "IncomingBytes":
+        return SAVINGS_LOG_BYTES.get(dims.get("LogGroupName"), 0.02 * GiB) * period / 86400 * wave
+    if namespace == "AWS/SQS" and name in ("NumberOfEmptyReceives", "NumberOfMessagesReceived") and period >= 3600:
+        empty, received = SAVINGS_EMPTY_RECEIVES.get(dims.get("QueueName"), (0, 2_000))
+        return (empty if name == "NumberOfEmptyReceives" else received) * period / 86400 * wave
+    if namespace == "AWS/DynamoDB" and name in ("ConsumedReadCapacityUnits", "ConsumedWriteCapacityUnits"):
+        read, write = SAVINGS_CAPACITY.get(dims.get("TableName"), ((1, 2), (1, 2)))
+        mean, top = read if "Read" in name else write
+        if not mean:
+            return 0.0
+        # The busiest hour once in a while; around the mean the rest of the time, spiky
+        # tables (peaks over four times the mean) more unevenly.
+        spread = 1.0 if top / mean > 4 else 0.2
+        rate = top if int(ts // 3600) % 97 == 0 else mean * (1 - spread / 2 + spread * seed)
+        return rate * period
+    if namespace == "AWS/States" and name in ("ExecutionsStarted", "ExecutionTime") and period >= 86400:
+        machine = dims.get("StateMachineArn", "").rsplit(":", 1)[-1]
+        per_day, avg_ms, max_ms = SAVINGS_SFN.get(machine, (0, 0, 0))
+        if not per_day:
+            return CW_NO_DATA
+        if name == "ExecutionsStarted":
+            return per_day * period / 86400 * wave
+        return max_ms if stat == "Maximum" else avg_ms * wave
+    if namespace == "AWS/S3" and name == "BucketSizeBytes":
+        size = S3_SIZES.get(dims.get("BucketName"), {}).get(dims.get("StorageType"))
+        return float(size) if size else CW_NO_DATA
+    return None
+
+
+CW_METRIC_HOOKS.append(savings_metric)
 
 
 def cw_metrics(action, params):
@@ -2248,6 +2404,13 @@ def sqs(op, body):
                 r["TaskHandle"] = t["handle"]
             out.append(r)
         return {"Results": out}
+    if op == "SetQueueAttributes":
+        q = _sqs_by_url(body["QueueUrl"])
+        for k, v in body.get("Attributes", {}).items():
+            if k == "ReceiveMessageWaitTimeSeconds" and not (str(v).isdigit() and 0 <= int(v) <= 20):
+                raise KeyError(f"InvalidAttributeValue: Invalid value for the parameter ReceiveMessageWaitTimeSeconds: {v}")
+            q["attrs"][k] = str(v)
+        return {}
     if op == "CancelMessageMoveTask":
         t = next((t for t in SQS_TASKS if t["handle"] == body["TaskHandle"]), None)
         if t is None or t["status"] != "RUNNING":
@@ -2504,6 +2667,8 @@ class H(BaseHTTPRequestHandler):
             return self.reply(200, SIGNED)
         if self.path.startswith("/2019-09-25/functions/"):
             return self.reply(*lambda_event_invoke_config(self.path))
+        if self.path.startswith("/2019-09-30/functions/"):
+            return self.reply(*lambda_provisioned_concurrency(self.path))
         if not self.path.startswith("/2015-03-31/"):
             return self.route_rest("GET")
         try:

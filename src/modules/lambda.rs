@@ -1,8 +1,10 @@
 //! Lambda explorer: list functions, search, and inspect configuration, environment
 //! variables (masked until revealed), layers, VPC, tags; charts of their metrics; invoke
-//! them with a test payload; and copy a report for an AI agent.
+//! them with a test payload; read the memory they use from their logs; and copy a report
+//! for an AI agent.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -13,9 +15,12 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use super::common::{LoadState, filter_bar, matches_filter};
+use super::savings::{chosen_estimate, memory_form, update_memory_form};
 use crate::aws::lambda::{Invocation, Metrics, Range};
-use crate::aws::{self, AwsError, lambda};
+use crate::aws::{self, Aws, AwsError, lambda};
 use crate::config::is_production;
+use crate::savings::DEFAULT_DAYS;
+use crate::savings::lambda::{self as memory, Estimate, MemoryRun};
 use crate::tui::chart::{Agg, Chart, fmt_count, fmt_ms};
 use crate::tui::form::{Field, Form, FormEvent};
 use crate::tui::logview::{LogKey, LogView};
@@ -36,6 +41,15 @@ enum Msg {
     Metrics { name: String, range: Range, result: Box<aws::Result<Metrics>> },
     Invoked { name: String, payload: String, result: Box<aws::Result<Invocation>> },
     Report { name: String, result: aws::Result<String> },
+    MemoryEstimate { name: String, result: aws::Result<Estimate> },
+    Memory { name: String, result: aws::Result<MemoryRun> },
+}
+
+/// Confirming a memory analysis: what Logs Insights would scan.
+struct MemoryCheck {
+    name: String,
+    estimate: Estimate,
+    form: Form,
 }
 
 /// The invoke form, while it is open.
@@ -72,6 +86,11 @@ pub struct Lambda {
     result: Option<(String, LogView)>,
     /// Functions whose report is being written.
     reporting: HashSet<String>,
+    memory: Option<MemoryCheck>,
+    /// Functions whose memory use is being read.
+    reading_memory: HashSet<String>,
+    /// The environment's client, to find memory analyses already made.
+    aws: Option<Arc<Aws>>,
 }
 
 impl Lambda {
@@ -99,6 +118,9 @@ impl Lambda {
             payloads: HashMap::new(),
             result: None,
             reporting: HashSet::new(),
+            memory: None,
+            reading_memory: HashSet::new(),
+            aws: None,
         }
     }
 
@@ -126,6 +148,7 @@ impl Lambda {
         *self = Lambda::new();
         self.region = env.region.clone();
         self.env_name = env.name.clone();
+        self.aws = Some(env.aws.clone());
         self.load = LoadState::Loading;
         let aws = env.aws.clone();
         ctx.spawn_stream(move |em: Emitter<Msg>| {
@@ -310,6 +333,59 @@ impl Lambda {
         }
     }
 
+    /// Measures what reading the selected function's memory use would scan, then asks.
+    fn check_memory(&mut self, ctx: &mut Ctx) {
+        let Some(func) = self.selected().cloned() else { return };
+        let name = func.function_name.clone();
+        if !self.reading_memory.insert(name.clone()) {
+            return ctx.toast(Level::Info, format!("Still reading the memory use of {name}"));
+        }
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || {
+            let result = memory::memory_estimate(&aws, Some(vec![func]), DEFAULT_DAYS);
+            Msg::MemoryEstimate { name, result }
+        });
+    }
+
+    fn on_memory_estimate(&mut self, name: String, result: aws::Result<Estimate>, ctx: &mut Ctx) {
+        match result {
+            Ok(estimate) if estimate.functions.is_empty() => {
+                self.reading_memory.remove(&name);
+                ctx.toast(Level::Warn, format!("{name} shares its log group with other functions: their REPORT lines cannot be told apart"));
+            }
+            Ok(estimate) => {
+                let form = memory_form(&estimate, format!("Memory use · {name}"));
+                self.memory = Some(MemoryCheck { name, estimate, form });
+            }
+            Err(e) => {
+                self.reading_memory.remove(&name);
+                ctx.toast(Level::Error, format!("Could not measure the logs of {name}: {}", e.short()));
+            }
+        }
+    }
+
+    fn submit_memory(&mut self, ctx: &mut Ctx) {
+        let Some(check) = self.memory.take() else { return };
+        let (name, estimate) = (check.name, chosen_estimate(&check.form, &check.estimate));
+        let aws = ctx.env().aws.clone();
+        ctx.toast(Level::Info, format!("Reading the memory use of {name} ({})…", estimate.describe()));
+        ctx.spawn(move || {
+            let result = memory::memory_analysis(&aws, &estimate, &|_, _| {});
+            Msg::Memory { name, result }
+        });
+    }
+
+    fn on_memory(&mut self, name: String, result: aws::Result<MemoryRun>, ctx: &mut Ctx) {
+        self.reading_memory.remove(&name);
+        match result {
+            Ok(run) => match run.uses.iter().find(|u| u.function == name) {
+                Some(used) => ctx.toast(Level::Success, format!("{name}: {} · {} scanned", used.hint(), crate::savings::size(run.bytes_scanned))),
+                None => ctx.toast(Level::Info, format!("{name} has no invocations in the window")),
+            },
+            Err(e) => ctx.toast(Level::Error, format!("Could not read the memory use of {name}: {}", e.short())),
+        }
+    }
+
     fn render_list(&mut self, f: &mut Frame, area: Rect, view: &View) {
         self.list_area = area;
         let width = area.width.saturating_sub(4) as usize;
@@ -466,6 +542,18 @@ impl Lambda {
             Span::styled(c.memory_size.map(|m| format!("{m} MB")).unwrap_or_default(), theme::bold()),
             kw,
         ));
+        let used = self.aws.as_ref().and_then(|aws| memory::remembered(aws, &c.function_name));
+        let memory_use = match used {
+            Some(u) => {
+                let color = if u.smaller_mb().is_some() { theme::WARN } else { theme::OK };
+                Span::styled(u.hint(), Style::new().fg(color))
+            }
+            None if self.reading_memory.contains(&c.function_name) => {
+                Span::styled(format!("{} reading the logs…", theme::spinner(view.tick)), theme::accent())
+            }
+            None => Span::styled("M reads it from the logs (Logs Insights, billed per GB scanned)", theme::muted()),
+        };
+        lines.push(widgets::kv("Memory use", memory_use, kw));
         lines.push(widgets::kv("Timeout", c.timeout.map(|t| format!("{t} s")).unwrap_or_default(), kw));
         if let Some(e) = &c.ephemeral_storage {
             lines.push(widgets::kv("Ephemeral /tmp", format!("{} MB", e.size), kw));
@@ -609,6 +697,7 @@ impl Module for Lambda {
         *self = Lambda::new();
         self.region = ctx.env().region.clone();
         self.env_name = ctx.env().name.clone();
+        self.aws = Some(ctx.env().aws.clone());
     }
 
     fn activate(&mut self, ctx: &mut Ctx) {
@@ -627,6 +716,17 @@ impl Module for Lambda {
             }
             if !view.zoomed {
                 self.result = None;
+            }
+            return Handled::Yes;
+        }
+        if let Some(check) = &mut self.memory {
+            match check.form.handle(key) {
+                FormEvent::Submit => self.submit_memory(ctx),
+                FormEvent::Cancel => {
+                    self.reading_memory.remove(&check.name);
+                    self.memory = None;
+                }
+                FormEvent::Pending => update_memory_form(&mut check.form, &check.estimate),
             }
             return Handled::Yes;
         }
@@ -679,6 +779,7 @@ impl Module for Lambda {
                 self.fetch_metrics(ctx);
             }
             KeyCode::Char('i') => self.open_invoke(),
+            KeyCode::Char('M') => self.check_memory(ctx),
             KeyCode::Char('c') => self.copy_report(ctx),
             KeyCode::Char('y') => {
                 if let Some(func) = self.selected() {
@@ -721,7 +822,7 @@ impl Module for Lambda {
 
     fn mouse(&mut self, event: MouseEvent, _ctx: &mut Ctx) -> Handled {
         let pos = (event.column, event.row).into();
-        if self.invoke.is_some() || !self.list_area.contains(pos) {
+        if self.invoke.is_some() || self.memory.is_some() || !self.list_area.contains(pos) {
             return Handled::No;
         }
         let selected = self.list_state.selected().unwrap_or(0);
@@ -766,6 +867,8 @@ impl Module for Lambda {
             }
             Msg::Invoked { name, payload, result } => self.on_invoked(name, payload, *result, ctx),
             Msg::Report { name, result } => self.on_report(name, result, ctx),
+            Msg::MemoryEstimate { name, result } => self.on_memory_estimate(name, result, ctx),
+            Msg::Memory { name, result } => self.on_memory(name, result, ctx),
         }
     }
 
@@ -799,6 +902,9 @@ impl Module for Lambda {
         self.render_list(f, left, view);
         self.render_detail(f, right, view);
         self.render_invoke(f, area, view);
+        if let Some(check) = &self.memory {
+            check.form.render(f, area, theme::ACCENT);
+        }
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
@@ -808,6 +914,9 @@ impl Module for Lambda {
         if self.invoke.is_some() {
             return vec![("Enter", "invoke"), ("Esc", "cancel")];
         }
+        if self.memory.is_some() {
+            return vec![("←→", "window"), ("Enter", "analyse"), ("Esc", "cancel")];
+        }
         if self.filtering {
             return vec![("Enter", "keep filter"), ("Esc", "clear"), ("↑↓", "move")];
         }
@@ -816,6 +925,7 @@ impl Module for Lambda {
             ("/", "search"),
             ("m", "1h/24h/7d"),
             ("i", "invoke"),
+            ("M", "memory use"),
             ("c", "copy for AI"),
             ("y", "copy ARN"),
             ("v", "env values"),
@@ -832,11 +942,12 @@ impl Module for Lambda {
             || !self.in_flight.is_empty()
             || !self.metrics_in_flight.is_empty()
             || !self.reporting.is_empty()
+            || !self.reading_memory.is_empty()
             || self.invoke.as_ref().is_some_and(|i| i.busy)
     }
 
     fn capturing(&self) -> bool {
-        self.filtering || self.invoke.is_some() || self.result.is_some()
+        self.filtering || self.invoke.is_some() || self.memory.is_some() || self.result.is_some()
     }
 
     fn wants_mouse(&self) -> bool {

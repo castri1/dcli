@@ -81,6 +81,14 @@ pub struct TableDescription {
     pub stream_specification: Option<StreamSpecification>,
     pub creation_date_time: Option<f64>,
     pub deletion_protection_enabled: Option<bool>,
+    pub table_class_summary: Option<TableClassSummary>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct TableClassSummary {
+    /// `STANDARD` or `STANDARD_INFREQUENT_ACCESS`.
+    pub table_class: Option<String>,
 }
 
 /// Partition and (optional) sort key attribute names.
@@ -122,6 +130,16 @@ impl TableDescription {
             .iter()
             .find(|a| a.attribute_name == name)
             .map_or("S", |a| a.attribute_type.as_str())
+    }
+
+    /// Billed per request (on demand) rather than for provisioned capacity.
+    pub fn on_demand(&self) -> bool {
+        self.billing_mode_summary.as_ref().and_then(|b| b.billing_mode.as_deref()) == Some("PAY_PER_REQUEST")
+    }
+
+    /// The table class: `STANDARD` unless the table says otherwise.
+    pub fn table_class(&self) -> &str {
+        self.table_class_summary.as_ref().and_then(|c| c.table_class.as_deref()).unwrap_or("STANDARD")
     }
 
     pub fn billing(&self) -> String {
