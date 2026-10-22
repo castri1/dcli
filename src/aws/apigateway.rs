@@ -1628,8 +1628,11 @@ pub fn log_errors(aws: &Aws, group: &str, access: bool, needle: Option<&str>, wi
             let (events, next) = logs::filter_log_events(aws, group, start_ms, pattern, token.as_deref())?;
             read += events.len();
             for e in &events {
-                if keeps(&sanitize(&e.message)) {
-                    lines.push(logs::event_lines(e, true).join("\n"));
+                // Responses are already cleaned when parsed; what is kept is cleaned again so
+                // it stays safe whatever path the events came by.
+                let line = sanitize(&logs::event_lines(e, true).join("\n"));
+                if keeps(&line) {
+                    lines.push(line);
                 }
             }
             match next {
