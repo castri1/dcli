@@ -311,6 +311,12 @@ pub fn xml_text_raw(xml: &str, tag: &str) -> Option<String> {
     Some(xml_unescape(&xml[start..end]))
 }
 
+/// The raw content of an element (as [`xml_blocks`] returns it) as text: entities decoded,
+/// then sanitized like [`xml_text`].
+pub fn xml_decode(raw: &str) -> String {
+    sanitize(&xml_unescape(raw))
+}
+
 /// The `<tag>…</tag>` blocks of `xml`, in order (list members are `<member>`).
 pub fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));

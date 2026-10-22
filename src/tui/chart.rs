@@ -46,7 +46,11 @@ pub fn columns(points: &[(f64, f64)], (start, end): (f64, f64), n: usize, agg: A
 
 /// One row of blocks for `values` (`▁` to `█`, blank where there is none), as in the CLI.
 pub fn sparkline(values: &[Option<f64>]) -> String {
-    let max = values.iter().flatten().copied().fold(0.0f64, f64::max);
+    sparkline_to(values, values.iter().flatten().copied().fold(0.0f64, f64::max))
+}
+
+/// [`sparkline`] on a fixed scale: `max` is a full block (100 for a percentage).
+pub fn sparkline_to(values: &[Option<f64>], max: f64) -> String {
     values
         .iter()
         .map(|v| match v {
@@ -259,5 +263,6 @@ mod tests {
         assert_eq!([212.4, 1840.0, 30_000.0, 125_000.0].map(fmt_ms), ["212 ms", "1.8 s", "30 s", "2m 05s"]);
         assert_eq!([1800.0, 3600.0, 86_400.0, 604_800.0].map(fmt_window), ["30m", "1h", "24h", "7d"]);
         assert_eq!(sparkline(&[None, Some(0.0), Some(1.0), Some(4.0)]), " ▁▄█");
+        assert_eq!(sparkline_to(&[Some(10.0), Some(50.0), Some(100.0), Some(150.0)], 100.0), "▃▅██");
     }
 }
