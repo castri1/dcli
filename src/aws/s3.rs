@@ -319,6 +319,60 @@ pub fn console_url(region: &str, bucket: &str, key: &str, is_object: bool) -> St
     )
 }
 
+/// What a bucket's lifecycle rules do (enabled rules only).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lifecycle {
+    pub rules: usize,
+    /// Some rule expires or transitions current objects.
+    pub ages_objects: bool,
+    /// Some rule aborts incomplete multipart uploads.
+    pub aborts_uploads: bool,
+    /// Some rule expires or transitions noncurrent versions.
+    pub ages_versions: bool,
+}
+
+/// The bucket's lifecycle rules (`None` without a configuration). `aws` must talk to the
+/// bucket's region (see [`regional`]).
+pub fn lifecycle(aws: &Aws, bucket: &str) -> Result<Option<Lifecycle>> {
+    let query = [("lifecycle".to_string(), String::new())];
+    match aws.raw(&SERVICE, "GET", &[bucket], &query, Vec::new(), Vec::new()) {
+        Ok(resp) => Ok(Some(parse_lifecycle(&text(resp.body)))),
+        Err(AwsError::Api { code, .. }) if code == "NoSuchLifecycleConfiguration" => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn parse_lifecycle(xml: &str) -> Lifecycle {
+    let rules: Vec<&str> = xml_blocks(xml, "Rule").into_iter().filter(|r| xml_text(r, "Status").as_deref() == Some("Enabled")).collect();
+    let has = |tags: &[&str]| rules.iter().any(|r| tags.iter().any(|t| r.contains(&format!("<{t}>"))));
+    Lifecycle {
+        rules: rules.len(),
+        ages_objects: has(&["Expiration", "Transition"]),
+        aborts_uploads: has(&["AbortIncompleteMultipartUpload"]),
+        ages_versions: has(&["NoncurrentVersionExpiration", "NoncurrentVersionTransition"]),
+    }
+}
+
+/// `Enabled`, `Suspended`, or empty for a bucket that never had versioning.
+pub fn versioning(aws: &Aws, bucket: &str) -> Result<String> {
+    let query = [("versioning".to_string(), String::new())];
+    let xml = text(aws.raw(&SERVICE, "GET", &[bucket], &query, Vec::new(), Vec::new())?.body);
+    Ok(xml_text(&xml, "Status").unwrap_or_default())
+}
+
+/// Multipart uploads started before `before` (Unix seconds) and never completed or aborted,
+/// counted over the first page (1,000): their parts are stored and billed but no listing
+/// shows them. Returns the count and whether there were more uploads.
+pub fn stale_uploads(aws: &Aws, bucket: &str, before: f64) -> Result<(usize, bool)> {
+    let query = [("uploads".to_string(), String::new())];
+    let xml = text(aws.raw(&SERVICE, "GET", &[bucket], &query, Vec::new(), Vec::new())?.body);
+    let stale = xml_blocks(&xml, "Upload")
+        .into_iter()
+        .filter(|u| xml_text(u, "Initiated").and_then(|d| parse_rfc3339(&d)).is_some_and(|t| t < before))
+        .count();
+    Ok((stale, xml_text(&xml, "IsTruncated").as_deref() == Some("true")))
+}
+
 /// A missing object answers HEAD with a bare 404.
 pub fn is_not_found(e: &AwsError) -> bool {
     matches!(e, AwsError::Api { status: 404, .. })
@@ -327,6 +381,17 @@ pub fn is_not_found(e: &AwsError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_what_lifecycle_rules_do() {
+        let xml = "<LifecycleConfiguration>\
+            <Rule><ID>a</ID><Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition>\
+            <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>\
+            <Rule><ID>b</ID><Status>Disabled</Status><NoncurrentVersionExpiration><NoncurrentDays>9</NoncurrentDays></NoncurrentVersionExpiration></Rule>\
+            </LifecycleConfiguration>";
+        assert_eq!(parse_lifecycle(xml), Lifecycle { rules: 1, ages_objects: true, aborts_uploads: true, ages_versions: false });
+        assert_eq!(parse_lifecycle("<LifecycleConfiguration/>"), Lifecycle::default());
+    }
 
     #[test]
     fn parses_uris_and_names() {
