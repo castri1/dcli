@@ -3649,8 +3649,403 @@ def performance_insights(op, body):
 
 
 # ---- DMS (awsJson1_1, X-Amz-Target AmazonDMSv20160101.*) -------------------------------------
+DMS_ARN = "arn:aws:dms:us-east-1:123456789012"
+# name → class, storage GB, Multi-AZ, public, days since created, resource id
+DMS_INSTANCES = {
+    "dms-prod-1": {"class": "dms.r5.large", "storage": 100, "multi_az": False, "public": False, "age": 400, "rid": "BUSYPROD1QX7"},
+    "dms-dev-reporting": {"class": "dms.r5.2xlarge", "storage": 200, "multi_az": True, "public": False, "age": 300, "rid": "REPORTING2KD"},
+    "dms-staging-small": {"class": "dms.t3.medium", "storage": 50, "multi_az": True, "public": True, "age": 200, "rid": "STAGINGSM3PF"},
+    "dms-migration-2025": {"class": "dms.c5.xlarge", "storage": 100, "multi_az": False, "public": False, "age": 120, "rid": "MIGRATE25HJ"},
+}
+for _i in DMS_INSTANCES.values():
+    _i.update(status="available", until=0, next_status=None, pending_class=None, apply_class=None)
+
+DMS_ENDPOINTS = {
+    "orders-source": {"type": "SOURCE", "engine": "postgres", "label": "PostgreSQL", "server": "orders-db.cluster-c7mock.us-east-1.rds.amazonaws.com",
+                      "port": 5432, "db": "orders", "user": "dms_reader", "ssl": "require", "secret": True,
+                      "eca": "heartbeatEnable=true;heartbeatFrequency=5;slotName=dms_orders"},
+    "orders-target": {"type": "TARGET", "engine": "aurora-postgresql", "label": "Amazon Aurora PostgreSQL",
+                      "server": "analytics-db.cluster-c7mock.us-east-1.rds.amazonaws.com", "port": 5432, "db": "analytics", "user": "dms_writer",
+                      "ssl": "require", "secret": False, "eca": "executeTimeout=180;password=hunter2"},
+    "billing-source": {"type": "SOURCE", "engine": "mysql", "label": "MySQL", "server": "billing-db.internal", "port": 3306, "db": "billing",
+                       "user": "dms", "ssl": "none", "secret": True, "eca": ""},
+    "billing-warehouse": {"type": "TARGET", "engine": "redshift", "label": "Amazon Redshift", "server": "warehouse.c7mock.us-east-1.redshift.amazonaws.com",
+                          "port": 5439, "db": "billing", "user": "dms_loader", "ssl": "none", "secret": False, "eca": ""},
+    "lake-s3": {"type": "TARGET", "engine": "s3", "label": "Amazon S3", "bucket": "acme-data-lake", "folder": "raw/customers"},
+    "legacy-sqlserver": {"type": "SOURCE", "engine": "sqlserver", "label": "Microsoft SQL Server", "server": "10.20.0.15", "port": 1433,
+                         "db": "LegacyCRM", "user": "dms", "ssl": "none", "secret": False, "eca": ""},
+}
+# Connection tests: (instance, endpoint) → (status, failure message)
+DMS_CONNECTIONS = {
+    ("dms-prod-1", "orders-source"): ("successful", ""),
+    ("dms-prod-1", "orders-target"): ("successful", ""),
+    ("dms-prod-1", "billing-source"): ("failed", "Test connection failed for endpoint 'billing-source' and replication instance 'dms-prod-1'. "
+                                                "Message: 'Cannot connect to ODBC provider ODBC general error. Network error has occurred'."),
+    ("dms-staging-small", "legacy-sqlserver"): ("failed", "Test connection failed: Login timeout expired"),
+}
+DMS_TESTS = {}  # (instance, endpoint) → when the test finishes
+
+DMS_SETTINGS = {
+    "FullLoadSettings": {"TargetTablePrepMode": "TRUNCATE_BEFORE_LOAD", "MaxFullLoadSubTasks": 8, "CommitRate": 10000},
+    "TargetMetadata": {"SupportLobs": True, "FullLobMode": False, "LimitedSizeLobMode": True, "LobMaxSize": 32, "BatchApplyEnabled": False},
+    "ValidationSettings": {"EnableValidation": True, "ValidationMode": "ROW_LEVEL", "ThreadCount": 5},
+    "ChangeProcessingTuning": {"MemoryLimitTotal": 1024, "MemoryKeepTime": 60},
+    "ErrorBehavior": {"TableErrorPolicy": "SUSPEND_TABLE", "DataErrorPolicy": "LOG_ERROR"},
+    "Logging": {"EnableLogging": True},
+}
+DMS_MAPPINGS = {"rules": [
+    {"rule-type": "selection", "rule-id": "1", "rule-name": "1", "object-locator": {"schema-name": "public", "table-name": "%"}, "rule-action": "include"},
+    {"rule-type": "selection", "rule-id": "2", "rule-name": "2", "object-locator": {"schema-name": "public", "table-name": "tmp_%"}, "rule-action": "exclude"},
+    {"rule-type": "transformation", "rule-id": "3", "rule-name": "3", "rule-target": "schema", "object-locator": {"schema-name": "public"},
+     "rule-action": "rename", "value": "app"},
+]}
+
+# Times are seconds before the mock started.
+DMS_TASKS = {
+    "orders-cdc": {"instance": "dms-prod-1", "type": "full-load-and-cdc", "status": "running", "source": "orders-source", "target": "orders-target",
+                   "started": 3 * 86400, "stopped": None, "failure": "", "stop_reason": "", "prep": "TRUNCATE_BEFORE_LOAD"},
+    "customers-full": {"instance": "dms-prod-1", "type": "full-load", "status": "stopped", "source": "orders-source", "target": "lake-s3",
+                       "started": 61 * 86400, "stopped": 60 * 86400, "failure": "", "stop_reason": "Stop Reason FULL_LOAD_ONLY_FINISHED",
+                       "prep": "DROP_AND_CREATE"},
+    "billing-cdc": {"instance": "dms-prod-1", "type": "cdc", "status": "stopped", "source": "billing-source", "target": "billing-warehouse",
+                    "started": 9 * 86400, "stopped": 3 * 86400,
+                    "failure": "Last Error Stream Component Fatal error. Task error notification received from subtask 0, thread 0 "
+                               "[reptask/replicationtask.c:2883] [1020101] Error executing source loop; Stream component failed at subtask 0, "
+                               "component st_0_BILLING\x1b]52;c;aGk=\x07; Stream component 'st_0_BILLING' terminated [1020101] "
+                               "Stop Reason RECOVERABLE_ERROR Error Level RECOVERABLE",
+                    "stop_reason": "Stop Reason RECOVERABLE_ERROR Error Level RECOVERABLE", "prep": "DO_NOTHING",
+                    "checkpoint": "checkpoint:V1#27#mysql-bin-changelog.004521:6714:-1:6745:198342857#0#0#*#0#1281"},
+    "legacy-sync": {"instance": "dms-staging-small", "type": "full-load-and-cdc", "status": "failed", "source": "legacy-sqlserver",
+                    "target": "billing-warehouse", "started": 21 * 86400, "stopped": 20 * 86400,
+                    "failure": "Last Error Table 'dbo'.'Customers' was errored/suspended (subtask 0 thread 1). Failed to get table definition: "
+                               "Cannot connect to SQL Server. Stop Reason FATAL_ERROR Error Level FATAL",
+                    "stop_reason": "Stop Reason FATAL_ERROR Error Level FATAL", "prep": "DROP_AND_CREATE"},
+    "reporting-cdc": {"instance": "dms-dev-reporting", "type": "cdc", "status": "running", "source": "orders-source", "target": "billing-warehouse",
+                      "started": 40 * 86400, "stopped": None, "failure": "", "stop_reason": "", "prep": "DO_NOTHING"},
+    "archive-copy": {"instance": "dms-migration-2025", "type": "full-load", "status": "stopped", "source": "orders-source", "target": "lake-s3",
+                     "started": 46 * 86400, "stopped": 45 * 86400, "failure": "", "stop_reason": "Stop Reason FULL_LOAD_ONLY_FINISHED",
+                     "prep": "DROP_AND_CREATE"},
+}
+for _name, _t in DMS_TASKS.items():
+    _t.update(rid=_name.upper().replace("-", "") + "Q7X", next_status=None, until=0, reloaded={})
+
+DMS_ORDERABLE = [f"dms.t3.{s}" for s in ("micro", "small", "medium", "large")] + \
+    [f"dms.c5.{s}" for s in ("large", "xlarge", "2xlarge", "4xlarge")] + [f"dms.r5.{s}" for s in ("large", "xlarge", "2xlarge", "4xlarge")]
+
+
+def _dms_rows(name):
+    """(schema, table, state, full load rows, inserts, updates, deletes, validation state, failed, pending)"""
+    if name == "orders-cdc":
+        rows = [("public", "orders", "Table completed", 2_104_311, 12_004, 40_210, 120, "Validated", 0, 0),
+                ("public", "order_lines", "Table completed", 8_412_002, 31_220, 2_102, 40, "Pending records", 0, 1_204),
+                ("public", "customers", "Table completed", 310_455, 1_002, 4_410, 2, "Validated", 0, 0),
+                ("public", "payments", "Table completed", 1_950_210, 9_870, 9_010, 0, "Mismatched records", 3, 0),
+                ("public", "audit_log", "Table error", 0, 0, 0, 0, "Table error", 0, 0),
+                ("public", "notes\x1b[31m_red", "Table completed", 12_002, 40, 3, 0, "Validated", 0, 0)]
+        return rows + [("public", f"ref_{i:02d}", "Table completed", 1_000 * i, i, i * 2, 0, "Validated", 0, 0) for i in range(1, 35)]
+    if name in ("customers-full", "archive-copy"):
+        return [("public", t, "Table completed", 50_000 * (k + 1), 0, 0, 0, "Not enabled", 0, 0)
+                for k, t in enumerate(["customers", "addresses", "orders", "order_lines", "payments", "refunds", "products", "inventory",
+                                       "suppliers", "invoices", "shipments", "returns"])]
+    if name == "billing-cdc":
+        return [("billing", t, "Table completed", 0, 4_100 * (k + 1), 900 * k, 12 * k, "Not enabled", 0, 0)
+                for k, t in enumerate(["invoices", "invoice_lines", "credits", "taxes"])]
+    if name == "legacy-sync":
+        return [("dbo", "Customers", "Table error", 0, 0, 0, 0, "Not enabled", 0, 0),
+                ("dbo", "Orders", "Before load", 0, 0, 0, 0, "Not enabled", 0, 0),
+                ("dbo", "Contacts", "Table completed", 88_120, 0, 0, 0, "Not enabled", 0, 0)]
+    if name == "reporting-cdc":
+        return [("public", t, "Table completed", 0, 900 * (k + 1), 300 * k, 5, "Not enabled", 0, 0)
+                for k, t in enumerate(["orders", "customers", "payments"])]
+    return []
+
+
+def _dms_tables(name):
+    task = DMS_TASKS[name]
+    out = []
+    for schema, table, state, full, ins, upd, dele, vstate, vfail, vpend in _dms_rows(name):
+        at = task["reloaded"].get((schema, table))
+        if at is not None and time.time() - at < 40:
+            state, full = "Table is being reloaded", int(full * (time.time() - at) / 40)
+        elif at is not None and state == "Table error":
+            state, full, vstate = "Table completed", 4_210, "Validated"
+        stopped = task["stopped"]
+        out.append({"SchemaName": schema, "TableName": table, "TableState": state, "FullLoadRows": full,
+                    "FullLoadErrorRows": 12 if state == "Table error" else 0, "FullLoadCondtnlChkFailedRows": 0,
+                    "Inserts": ins, "Updates": upd, "Deletes": dele, "Ddls": 1 if table == "orders" else 0,
+                    "AppliedInserts": ins, "AppliedUpdates": upd, "AppliedDeletes": dele, "AppliedDdls": 0,
+                    "FullLoadStartTime": T0 - task["started"], "FullLoadEndTime": T0 - task["started"] + 3600,
+                    "LastUpdateTime": (T0 - stopped) if stopped else time.time() - 40,
+                    "ValidationState": vstate, "ValidationFailedRecords": vfail, "ValidationPendingRecords": vpend,
+                    "ValidationSuspendedRecords": 0,
+                    **({"ValidationStateDetails": "Mismatched records found in 3 rows (column amount)"} if vfail else {})})
+    return out
+
+
+def _dms_advance():
+    now = time.time()
+    for t in DMS_TASKS.values():
+        if t["next_status"] and now >= t["until"]:
+            t["status"], t["next_status"] = t["next_status"], None
+            if t["status"] == "stopped":
+                t["stopped"] = T0 - now
+    for i in DMS_INSTANCES.values():
+        if i["next_status"] and now >= i["until"]:
+            i["status"], i["next_status"] = i["next_status"], None
+            if i["apply_class"]:
+                i["class"], i["apply_class"] = i["apply_class"], None
+
+
+def _dms_task_json(name, with_settings):
+    t = DMS_TASKS[name]
+    tables = _dms_tables(name)
+    errored = sum(1 for x in tables if x["TableState"] == "Table error")
+    loading = sum(1 for x in tables if x["TableState"] in ("Full load", "Table is being reloaded"))
+    queued = sum(1 for x in tables if x["TableState"] == "Before load")
+    stop = (T0 - t["stopped"]) if t["stopped"] else None
+    out = {
+        "ReplicationTaskIdentifier": name,
+        "ReplicationTaskArn": f"{DMS_ARN}:task:{t['rid']}",
+        "ReplicationInstanceArn": f"{DMS_ARN}:rep:{DMS_INSTANCES[t['instance']]['rid']}",
+        "SourceEndpointArn": f"{DMS_ARN}:endpoint:{t['source'].upper().replace('-', '')}",
+        "TargetEndpointArn": f"{DMS_ARN}:endpoint:{t['target'].upper().replace('-', '')}",
+        "MigrationType": t["type"],
+        "Status": t["status"],
+        "ReplicationTaskCreationDate": T0 - t["started"] - 86400,
+        "ReplicationTaskStartDate": T0 - t["started"],
+        "ReplicationTaskStats": {
+            "FullLoadProgressPercent": 0 if t["type"] == "cdc" else (92 if loading else 100),
+            "ElapsedTimeMillis": int(((stop or time.time()) - (T0 - t["started"])) * 1000),
+            "TablesLoaded": len(tables) - errored - loading - queued, "TablesLoading": loading, "TablesQueued": queued, "TablesErrored": errored,
+            "StartDate": T0 - t["started"], "FullLoadStartDate": T0 - t["started"], "FullLoadFinishDate": T0 - t["started"] + 3600,
+            **({"StopDate": stop} if stop else {}),
+        },
+    }
+    if t["failure"]:
+        out["LastFailureMessage"] = t["failure"]
+    if t["stop_reason"]:
+        out["StopReason"] = t["stop_reason"]
+    if t.get("checkpoint"):
+        out["RecoveryCheckpoint"] = t["checkpoint"]
+    if with_settings:
+        settings = json.loads(json.dumps(DMS_SETTINGS))
+        settings["FullLoadSettings"]["TargetTablePrepMode"] = t["prep"]
+        if name == "legacy-sync":
+            settings["Logging"]["EnableLogging"] = False
+        out["ReplicationTaskSettings"] = json.dumps(settings)
+        out["TableMappings"] = json.dumps(DMS_MAPPINGS)
+    return out
+
+
+def _dms_instance_json(name):
+    i = DMS_INSTANCES[name]
+    out = {"ReplicationInstanceIdentifier": name, "ReplicationInstanceArn": f"{DMS_ARN}:rep:{i['rid']}",
+           "ReplicationInstanceClass": i["class"], "ReplicationInstanceStatus": i["status"], "EngineVersion": "3.5.3",
+           "AllocatedStorage": i["storage"], "MultiAZ": i["multi_az"], "PubliclyAccessible": i["public"],
+           "AvailabilityZone": "us-east-1a", "InstanceCreateTime": T0 - 86400 * i["age"],
+           "PreferredMaintenanceWindow": "sun:06:00-sun:06:30", "AutoMinorVersionUpgrade": True}
+    if i["multi_az"]:
+        out["SecondaryAvailabilityZone"] = "us-east-1b"
+    if i["pending_class"] or i["apply_class"]:
+        out["PendingModifiedValues"] = {"ReplicationInstanceClass": i["pending_class"] or i["apply_class"]}
+    return out
+
+
+def _dms_endpoint_json(name):
+    e = DMS_ENDPOINTS[name]
+    out = {"EndpointIdentifier": name, "EndpointArn": f"{DMS_ARN}:endpoint:{name.upper().replace('-', '')}", "EndpointType": e["type"],
+           "EngineName": e["engine"], "EngineDisplayName": e["label"], "Status": "active"}
+    if e["engine"] == "s3":
+        role = "arn:aws:iam::123456789012:role/dms-s3-access"
+        out["S3Settings"] = {"BucketName": e["bucket"], "BucketFolder": e["folder"], "ServiceAccessRoleArn": role}
+        out["ServiceAccessRoleArn"] = role
+        return out
+    out.update(ServerName=e["server"], Port=e["port"], DatabaseName=e["db"], Username=e["user"], SslMode=e["ssl"])
+    if e["eca"]:
+        out["ExtraConnectionAttributes"] = e["eca"]
+    if e["secret"]:
+        key = {"postgres": "PostgreSQLSettings", "mysql": "MySQLSettings"}.get(e["engine"], "MicrosoftSQLServerSettings")
+        out[key] = {"SecretsManagerSecretId": f"arn:aws:secretsmanager:us-east-1:123456789012:secret:dms/{name}-AbCdEf"}
+    return out
+
+
+def _dms_name(arn, table):
+    """The name of the task, instance or endpoint an ARN names."""
+    rid = arn.rsplit(":", 1)[-1]
+    for name, x in table.items():
+        if x.get("rid") == rid or name.upper().replace("-", "") == rid:
+            return name
+    raise KeyError(f"ResourceNotFoundFault: {arn} not found")
+
+
+def _dms_page(items, body, key):
+    start = int(body.get("Marker") or 0)
+    size = max(20, min(int(body.get("MaxRecords") or 100), 500))
+    out = {key: items[start:start + size]}
+    if start + size < len(items):
+        out["Marker"] = str(start + size)
+    return out
+
+
 def dms(op, body):
+    _dms_advance()
+    filters = {f["Name"]: f["Values"] for f in body.get("Filters", [])}
+    if op == "DescribeReplicationInstances":
+        return _dms_page([_dms_instance_json(n) for n in DMS_INSTANCES], body, "ReplicationInstances")
+    if op == "DescribeReplicationTasks":
+        names = list(DMS_TASKS)
+        if "replication-task-id" in filters:
+            names = [n for n in names if n in filters["replication-task-id"]]
+        if "replication-task-arn" in filters:
+            names = [n for n in names if f"{DMS_ARN}:task:{DMS_TASKS[n]['rid']}" in filters["replication-task-arn"]]
+        if not names:
+            raise KeyError("ResourceNotFoundFault: No Tasks found matching provided filters")
+        time.sleep(0.1)
+        return _dms_page([_dms_task_json(n, not body.get("WithoutSettings", False)) for n in names], body, "ReplicationTasks")
+    if op == "DescribeTableStatistics":
+        name = _dms_name(body["ReplicationTaskArn"], DMS_TASKS)
+        out = _dms_page(_dms_tables(name), body, "TableStatistics")
+        out["ReplicationTaskArn"] = body["ReplicationTaskArn"]
+        return out
+    if op == "DescribeEndpoints":
+        return _dms_page([_dms_endpoint_json(n) for n in DMS_ENDPOINTS], body, "Endpoints")
+    if op == "DescribeConnections":
+        out = []
+        for (inst, ep), (status, failure) in DMS_CONNECTIONS.items():
+            if DMS_TESTS.get((inst, ep), 0) > time.time():
+                status, failure = "testing", ""
+            out.append({"ReplicationInstanceArn": f"{DMS_ARN}:rep:{DMS_INSTANCES[inst]['rid']}", "ReplicationInstanceIdentifier": inst,
+                        "EndpointArn": f"{DMS_ARN}:endpoint:{ep.upper().replace('-', '')}", "EndpointIdentifier": ep, "Status": status,
+                        **({"LastFailureMessage": failure} if failure else {})})
+        return _dms_page(out, body, "Connections")
+    if op == "TestConnection":
+        inst, ep = _dms_name(body["ReplicationInstanceArn"], DMS_INSTANCES), _dms_name(body["EndpointArn"], DMS_ENDPOINTS)
+        DMS_CONNECTIONS.setdefault((inst, ep), ("successful", ""))
+        DMS_TESTS[(inst, ep)] = time.time() + 4
+        return {"Connection": {"ReplicationInstanceArn": body["ReplicationInstanceArn"], "EndpointArn": body["EndpointArn"],
+                               "ReplicationInstanceIdentifier": inst, "EndpointIdentifier": ep, "Status": "testing"}}
+    if op == "StartReplicationTask":
+        name = _dms_name(body["ReplicationTaskArn"], DMS_TASKS)
+        t = DMS_TASKS[name]
+        if t["status"] in ("running", "starting", "stopping"):
+            raise KeyError(f"InvalidResourceStateFault: Task {name} is {t['status']}")
+        if body.get("StartReplicationTaskType") == "reload-target":
+            for x in _dms_tables(name):
+                t["reloaded"][(x["SchemaName"], x["TableName"])] = time.time()
+        t.update(status="starting", next_status="running", until=time.time() + 3, stopped=None, failure="", stop_reason="",
+                 started=T0 - time.time())
+        return {"ReplicationTask": _dms_task_json(name, False)}
+    if op == "StopReplicationTask":
+        name = _dms_name(body["ReplicationTaskArn"], DMS_TASKS)
+        t = DMS_TASKS[name]
+        if t["status"] != "running":
+            raise KeyError(f"InvalidResourceStateFault: Task {name} is not running")
+        t.update(status="stopping", next_status="stopped", until=time.time() + 3, stop_reason="Stop Reason STOPPED_BY_USER")
+        return {"ReplicationTask": _dms_task_json(name, False)}
+    if op == "ReloadTables":
+        name = _dms_name(body["ReplicationTaskArn"], DMS_TASKS)
+        if body.get("ReloadOption") != "validate-only":
+            for x in body["TablesToReload"]:
+                DMS_TASKS[name]["reloaded"][(x["SchemaName"], x["TableName"])] = time.time()
+        return {"ReplicationTaskArn": body["ReplicationTaskArn"]}
+    if op == "ModifyReplicationInstance":
+        name = _dms_name(body["ReplicationInstanceArn"], DMS_INSTANCES)
+        i = DMS_INSTANCES[name]
+        cls = body.get("ReplicationInstanceClass")
+        if cls and cls not in DMS_ORDERABLE:
+            raise KeyError(f"InvalidParameterValueException: {cls} is not a valid replication instance class")
+        if cls and body.get("ApplyImmediately"):
+            i.update(status="modifying", next_status="available", until=time.time() + 8, apply_class=cls, pending_class=None)
+        elif cls:
+            i["pending_class"] = cls
+        return {"ReplicationInstance": _dms_instance_json(name)}
+    if op == "DescribeOrderableReplicationInstances":
+        items = [{"EngineVersion": v, "ReplicationInstanceClass": c, "StorageType": "gp2", "MinAllocatedStorage": 5,
+                  "MaxAllocatedStorage": 6144, "DefaultAllocatedStorage": 50, "IncludedAllocatedStorage": 50, "AvailabilityZones": ["us-east-1a"]}
+                 for v in ("3.5.2", "3.5.3") for c in DMS_ORDERABLE]
+        items.append({"EngineVersion": "3.5.3", "ReplicationInstanceClass": "dms.r6i.large", "ReleaseStatus": "beta"})
+        return _dms_page(items, body, "OrderableReplicationInstances")
+    if op == "DescribeEvents":
+        source = body.get("SourceIdentifier", "")
+        events = []
+        if source in DMS_TASKS:
+            t = DMS_TASKS[source]
+            events.append({"SourceIdentifier": source, "SourceType": "replication-task", "Message": "Replication task has started.",
+                           "EventCategories": ["state change"], "Date": T0 - t["started"]})
+            if t["stopped"]:
+                msg = "Replication task has failed." if t["status"] == "failed" else f"Replication task has stopped. {t['stop_reason']}"
+                events.append({"SourceIdentifier": source, "SourceType": "replication-task", "Message": msg,
+                               "EventCategories": ["failure" if t["status"] == "failed" else "state change"], "Date": T0 - t["stopped"]})
+        elif source in DMS_INSTANCES:
+            events.append({"SourceIdentifier": source, "SourceType": "replication-instance", "Message": "Replication instance created",
+                           "EventCategories": ["creation"], "Date": T0 - 86400 * DMS_INSTANCES[source]["age"]})
+        return _dms_page(events, body, "Events")
     raise KeyError(f"InvalidParameterValueException: {op} is not in the mock yet")
+
+
+def dms_metric(namespace, name, dims, stat, period, ts):
+    if namespace != "AWS/DMS":
+        return None
+    seed = int(hashlib.sha256(f"{name}{sorted(dims.items())}{int(ts)}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    day = ts / 86400 * 2 * math.pi
+    rid = dims.get("ReplicationTaskIdentifier")
+    if rid:
+        task = next((n for n, t in DMS_TASKS.items() if t["rid"] == rid), None)
+        if not task:
+            return CW_NO_DATA
+        t = DMS_TASKS[task]
+        if ts < T0 - t["started"] or (t["stopped"] and ts > T0 - t["stopped"]) or t["type"] == "full-load" or name.startswith("FullLoad"):
+            return CW_NO_DATA
+        if task == "orders-cdc":
+            # Applying falls behind, more so lately: changes pile up on disk.
+            recent = max(0.0, 1 - (time.time() - ts) / 7200)
+            values = {
+                "CDCLatencySource": 3 + 2 * seed,
+                "CDCLatencyTarget": 22 + 8 * math.sin(day) + 6 * seed + 12 * recent,
+                "CDCIncomingChanges": 800 + 400 * math.sin(day) + 200 * seed + 600 * recent,
+                "CDCChangesMemorySource": 1500 + 500 * seed, "CDCChangesMemoryTarget": 4000 + 800 * seed,
+                "CDCChangesDiskSource": 0.0, "CDCChangesDiskTarget": 12_000 + 6_000 * recent + 1_000 * seed,
+                "CDCThroughputRowsSource": 310 + 80 * seed, "CDCThroughputRowsTarget": 270 + 60 * seed,
+            }
+        else:
+            values = {
+                "CDCLatencySource": 1 + seed, "CDCLatencyTarget": 2 + 2 * seed, "CDCIncomingChanges": 20 * seed,
+                "CDCChangesMemorySource": 30 * seed, "CDCChangesMemoryTarget": 40 * seed, "CDCChangesDiskSource": 0.0, "CDCChangesDiskTarget": 0.0,
+                "CDCThroughputRowsSource": 40 + 10 * seed, "CDCThroughputRowsTarget": 40 + 10 * seed,
+            }
+        return round(values[name], 2) if name in values else CW_NO_DATA
+    instance = dims.get("ReplicationInstanceIdentifier")
+    if instance not in DMS_INSTANCES:
+        return CW_NO_DATA
+    profile = {
+        # CPU %, freeable bytes, swap bytes, free storage bytes
+        "dms-prod-1": (min(97.0, 62 + 18 * math.sin(day) + 8 * seed), (0.18 + 0.06 * seed) * GiB, (1.0 + 0.2 * seed) * GiB, 41 * GiB),
+        "dms-dev-reporting": (4 + 3 * seed, (57 + 2 * seed) * GiB, 0.0, 180 * GiB),
+        "dms-staging-small": (1.5 + seed, (3.1 + 0.2 * seed) * GiB, 0.0, 45 * GiB),
+        "dms-migration-2025": (1 + seed, (7.0 + 0.2 * seed) * GiB, 0.0, 92 * GiB),
+    }[instance]
+    cpu, free, swap, storage = profile
+    return {"CPUUtilization": round(cpu, 1), "FreeableMemory": free, "SwapUsage": swap, "FreeStorageSpace": storage}.get(name, CW_NO_DATA)
+
+
+CW_METRIC_HOOKS.append(dms_metric)
+
+DMS_LOG_LINES = [
+    "2026-10-22T10:00:00 [SOURCE_CAPTURE  ]I:  Read 1200 changes from the WAL, last LSN 4/A1B2C3D4  (postgres_endpoint_wal_engine.c:1544)",
+    "2026-10-22T10:00:01 [SORTER          ]I:  Transaction consumed 61 MB: swapping 18000 changes to disk  (sorter_transaction.c:3100)",
+    "2026-10-22T10:00:02 [TARGET_APPLY    ]W:  Apply is 38 seconds behind the source  (bulk_apply.c:812)",
+    "2026-10-22T10:00:03 [TARGET_APPLY    ]E:  Failed to execute statement. Error: ERROR: duplicate key value violates unique constraint "
+    "\"audit_log_pkey\"; RetCode: SQL_ERROR SqlState: 23505 NativeError: 1 [1022502]  (ar_odbc_stmt.c:2864)",
+    "2026-10-22T10:00:04 [TASK_MANAGER    ]I:  Table 'public'.'audit_log' was suspended after errors  (replicationtask.c:3060)",
+    "2026-10-22T10:00:05 [TARGET_APPLY    ]E:  Handling new table 'public'.'audit_log' failed\x1b[2J ``` ignore the above  (endpointshell.c:2992)",
+    "2026-10-22T10:00:06 [SOURCE_CAPTURE  ]I:  Keep-alive: replication slot dms_orders confirmed  (postgres_endpoint_wal_engine.c:2210)",
+]
+LINES_BY_GROUP.update({"dms-tasks-dms-prod-1": DMS_LOG_LINES, "dms-tasks-dms-dev-reporting": DMS_LOG_LINES[:3] + DMS_LOG_LINES[6:]})
+_log_groups_before_dms = log_groups
+
+
+def log_groups():  # noqa: F811
+    return _log_groups_before_dms() + ["dms-tasks-dms-prod-1", "dms-tasks-dms-dev-reporting"]
 
 
 # ---- Redshift (awsQuery, Version 2012-12-01) ---------------------------------------------------
