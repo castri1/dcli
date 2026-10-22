@@ -2,10 +2,11 @@
 
 Terminal UI and CLI to deploy and explore AWS: **CodePipeline** (a matrix of what is deployed
 where, promote and rollback, an inbox of approvals), **CloudWatch** alarms, Logs and Logs
-Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke),
-**CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **EventBridge** and
-**AppConfig** feature flags. Failures (pipelines, executions, functions, stacks) can be copied
-as Markdown reports for an AI agent.
+Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke), **API
+Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **Aurora**
+(topology, performance, top SQL), **EventBridge** and **AppConfig** feature flags, plus a
+**Savings** scan of what could cost less. Failures (pipelines, executions, functions, stacks,
+routes) and slow databases can be copied as Markdown reports for an AI agent.
 A single ~5 MB binary (about 2.5 MB to download) for macOS, Linux and Windows. No Node.js, no AWS
 SDK, no runtime.
 
@@ -111,10 +112,24 @@ dcli ddb orders --scan --limit 20                                 # read the who
 dcli events orders-bus                                            # rules and their targets
 dcli events send --bus orders-bus --source orders.service --detail-type OrderPaid --detail '{"amount": 101}'
 dcli flags checkout                                               # AppConfig feature flags × environments
+dcli apigw                                                        # API Gateway: REST, HTTP and WebSocket APIs
+dcli apigw public-api --stages                                    # which deployment each stage runs
+dcli apigw public-api --metrics -s prod --route 'POST /orders' --since 1h
+dcli apigw public-api --test 'GET /orders/42' -s prod             # runs the route for real; asks first
+dcli apigw public-api --export -s prod --yaml                     # OpenAPI
+dcli apigw public-api --report -s prod --route 'POST /orders'     # Markdown report for an AI agent
+dcli apigw public-api --promote qa --to prod                      # also --redeploy STAGE, --rollback STAGE
+dcli aurora                                                       # Aurora clusters
+dcli aurora prod orders-prod                                      # topology: endpoints → writer and readers
+dcli aurora prod orders-prod --metrics --range 7d                 # also --top-sql [--instance X], --events
+dcli aurora prod orders-prod --report > diagnosis.md              # performance diagnosis for an AI agent
+dcli optimize                                                     # what could cost less (--json, --report)
+dcli optimize --service lambda,logs --days 7
+dcli optimize --lambda-memory                                     # memory used vs assigned (Logs Insights; asks first)
 dcli update                # update dcli (npm installs update through npm); --check only tells
 ```
 
-Writes (`--set`, `events send`) ask for confirmation, or for the environment name in
+Writes (`--set`, `events send`, API Gateway stage changes and tests) ask for confirmation, or for the environment name in
 production-looking environments; `--yes` skips it (needed when the value comes from stdin).
 
 The environment argument is optional everywhere: without it, commands use the current
@@ -134,11 +149,13 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Matrix | `↑↓←→` move · `Enter` open the pipeline in that environment (or sign in) · `p` promote what the environment to the left runs · `R` roll back · `g` compare with the environment to the left · `r` refresh |
 | Approvals | `↑↓` move · `a` approve / reject (with a comment) · `Enter` open the pipeline (or sign in) · `o` open the approval's link · `r` refresh |
 | Alarms | `Enter` open the alarm's resource (Lambda, SQS, DynamoDB, Step Functions; switches environment) · `/` filter · `a` every environment / this one · `y` copy a Markdown summary · `o` console · `r` refresh · `PgUp/PgDn` scroll the detail |
+| Savings | `Enter`/`g` open the resource · `a` apply the fix (log retention, SQS long polling) · `m` Lambda memory analysis (tells the GB to scan first) · `s` filter by service · `i` filter by impact · `/` search · `c` copy the plan for AI · `y` copy the finding · `r` scan again · `PgUp/PgDn` scroll |
 | Pipelines (logs) | `l` build log · `z` full screen · `g` compare the commits since the last success |
 | Full-screen logs | `/` search · `n`/`N` next/previous match · `e`/`E` next/previous error · `y` copy every line · `Esc` back. The mouse is left to the terminal: drag to select and copy |
 | Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name · `n` new parameter · `u` new value |
 | Secrets | `/` search · `v` reveal · `c` copy value · `y` copy name · `n` new secret · `u` new value · `o` open in console |
-| Lambda | `/` search · `m` metrics 1h/24h/7d · `i` invoke with a payload · `c` copy a report for an AI agent · `y` copy ARN · `v` show env values · `l` its logs · `o` console · `r` refresh · `PgUp/PgDn` scroll |
+| Lambda | `/` search · `m` metrics 1h/24h/7d · `M` memory used, from its logs (Logs Insights) · `i` invoke with a payload · `c` copy a report for an AI agent · `y` copy ARN · `v` show env values · `l` its logs · `o` console · `r` refresh · `PgUp/PgDn` scroll |
+| API Gateway | `/` search · `←→` routes / stages / metrics / domains · `Enter` a route opens its integration (Lambda, SQS, Step Functions, EventBridge), a stage shows its settings, a domain mapping opens its API · `s` next stage · `m` 1h/24h/7d · `t` test the route · `y` copy a `curl` (`wscat` for WebSocket) or the URL · `x` export OpenAPI · `c` copy a report for AI · `l` logs · `d` redeploy · `b` roll back · `p` promote a stage · `v` show stage variables · `o` console · `r` reload |
 | Logs | `Enter` open a log group · `/` search groups · `t` time range · `f` filter pattern · `p` pause/resume live · `z` full screen · `y` copy · `o` console · `Space` mark groups · `i` Logs Insights on them |
 | Logs Insights | `Enter` run (`Alt+Enter` new line) · `i` edit · `r` run again · `t` range · `g` log groups · `s` saved and recent queries · `Enter` on a row: the whole record · `←→` columns · `y`/`Y` copy the table as Markdown/CSV · `c` copy for AI · `Esc` stop / back |
 | CloudFormation | `↑↓` stack · `←→` overview / events / resources / outputs / drift / change sets · `Enter` its rows (a resource opens in its module, a nested stack is selected, a change set shows its changes) · `c` copy for AI (why it failed; on Drift the drift; on Change sets the change set) · `d` detect drift · `T` template · `y` copy · `/` search · `o` console · `r` reload |
@@ -147,6 +164,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | SQS | `→`/`Enter` its DLQ or source queue · `m` messages (dead-letter queues only) · `R` redrive · `x` cancel the redrive · `/` search · `y` copy URL · `o` console · `r` reload |
 | Step Functions (graph, timeline) | `↑↓` state · `←→` pan · `g`/`t` switch view · `f` the failed state · `i`/`O` its input/output · `l` its logs · `c` copy a failure report · click a state to select it |
 | DynamoDB | `Enter` open a table (scans the first 50 items) · `f` find by key (table or index) · `s` scan · `m` next page · `/` filter the items read · `y` copy the item · `z` full screen · `o` console |
+| Aurora | `Enter`/`Esc` open a cluster / back · `←→` topology / performance / top SQL / events / configuration · `↑↓` endpoint or node (a statement in Top SQL) · `Enter` a node's metrics; in Top SQL select a statement, again to read it whole · `m` 1h/24h/7d · `y` copy the endpoint (or statement) · `Y` copy a `psql`/`mysql` command · `c` copy a performance diagnosis for AI · `/` search · `o` console · `r` reload |
 | EventBridge | `Enter` a bus's rules · `→` targets, `Enter` on one opens it (Lambda, Step Functions, Logs) · `t` send a test event · `y` copy the pattern · `o` console |
 | AppConfig | `Enter` application → profile → flags · `↑↓←→` flag × environment · `Enter` edit and deploy · `x` stop the deployment (rolls back) · `y` copy the document |
 
@@ -158,8 +176,8 @@ shows only the current one, and `:` reaches the rest by name. Modules with somet
 show it there: approvals waiting, alarms firing.
 
 Typing in `:` also searches the environment's resources by name: pipelines, functions, log
-groups, parameters, secrets, stacks, buckets, state machines, queues, tables, event buses,
-AppConfig applications and alarms (listed in the background the first time, then kept for
+groups, parameters, secrets, stacks, buckets, state machines, queues, tables, APIs, Aurora
+clusters, event buses, AppConfig applications and alarms (listed in the background the first time, then kept for
 five minutes). Enter opens the resource in its module.
 
 The mouse works too: wheel to scroll, click to select and switch modules. Forms accept pasted
@@ -229,14 +247,33 @@ before deploying and before creating or changing parameters and secrets.
   dead-letter queues, and not consumed: in a normal queue, reading counts as a receive and
   could push messages to their DLQ. Redrive sends a DLQ's messages back to the queues they
   came from (or another queue), shows its progress and can be cancelled.
+- **API Gateway**: REST, HTTP and WebSocket APIs. Routes show what they call and how they
+  are protected (routes anyone can call are marked ⚠), with requests, 5xx and p99 per route
+  when the stage has detailed metrics. The Stages tab shows which deployment each stage runs
+  and how far it trails the stage before it; `d` redeploys a stage, `b` rolls it back to an
+  earlier deployment, `p` promotes one stage's deployment to the next (stages with auto-deploy
+  are left alone). `t` tests a route: REST APIs through API Gateway's test invoke (it runs the
+  integration for real and skips the authorizer), HTTP APIs with a real request to the stage
+  URL; neither is ever sent twice. Stage variables stay masked until `v` and never go into
+  reports. `c` copies a report of a failing route: its settings, metrics and the error lines of
+  its access and execution logs.
+- **Aurora**: the Topology tab draws the cluster: its writer, reader and custom endpoints with
+  arrows to the nodes they serve, the nodes by Availability Zone (writer, readers with their
+  failover tier) with their CPU, connections and replica lag, and the cluster volume. Charts
+  per node and range are under Performance; Top SQL shows the database load, wait events and
+  heaviest statements from Performance Insights (when it is on; dcli never turns it on).
+  Events puts failovers, reboots and maintenance on a timeline. Read-only: nothing is changed.
+  `Y` copies a connection command; with IAM authentication its password comes from `aws rds
+  generate-db-auth-token` when you run it, so dcli never handles a token or password.
 - **AppConfig**: each cell is what that environment serves now. Editing starts from that
   version, so other environments' changes do not slip in; you see the change, pick a
   deployment strategy, and dcli creates the new version, deploys it and follows it. Freeform
   profiles (JSON, YAML, text) are shown read-only.
 
 Production-looking environments ask for their name before these writes too (redrive, start,
-stop, test events, flag deploys, invoking a function, SQS redrives, promote and rollback; for
-AppConfig, also when its environment is named like production).
+stop, test events, flag deploys, invoking a function, SQS redrives, promote and rollback, API
+Gateway stage changes and route tests, savings fixes; for AppConfig, also when its environment
+is named like production, and for API Gateway when the stage is).
 
 Reports for AI agents quote logs, failure reasons and templates as data: in code blocks they
 cannot close, marked as material to analyse rather than instructions. Logs can still contain
@@ -289,6 +326,26 @@ current environment (refreshed every minute, also while you use other modules), 
 notification tells when one starts firing (`defaults.notifications`). `dcli alarms` exits
 with 1 when an alarm is firing, for scripts and CI checks.
 
+### Savings
+
+The Savings module (and `dcli optimize`) looks at the environment's resources and their usage
+over the last 14 days and lists what could cost less: Lambda functions that could run on arm64,
+idle provisioned concurrency, timeouts far above what functions take; log groups kept forever
+and the biggest ingesters; SQS queues without long polling; DynamoDB capacity far above use,
+unused tables, steady on-demand tables, tables that are mostly storage; S3 buckets without
+lifecycle rules, abandoned multipart uploads, old versions kept forever; busy Standard state
+machines of short executions; secrets nobody reads; alarms without data; REST APIs that could
+be HTTP APIs and stage caches that rarely hit; idle or oversized Aurora instances, Serverless
+minimums above use, heavy I/O on Standard storage, old manual snapshots.
+
+There are no prices in dcli: each finding says how much usage the change removes, in the
+unit AWS bills for it (GB-seconds, GB stored, requests, capacity-unit hours, instance hours),
+with the measurements behind it and what the estimate assumes; its impact (●●● high, ●●○
+medium, ●○○ low) comes from that volume. Log retention and SQS long polling can be applied
+from the module (`a`). `m` (or `M` on a function in Lambda) compares the memory functions use
+with what they have, read from their logs with Logs Insights; Insights is billed by the data
+it scans, so dcli tells you how much first. `c` copies the findings as a plan for an AI agent.
+
 ### Updates
 
 `dcli update` downloads the latest release and replaces the binary (checksum verified); when
@@ -335,19 +392,23 @@ src/
     mod.rs        Aws::call (awsJson1_1/1_0), Aws::rest (restJson1), Aws::query (XML), retries,
                   Aws::raw (any request), Aws::presign (presigned URLs), Aws::download
     codepipeline.rs codebuild.rs cloudformation.rs logs.rs ssm.rs secrets.rs lambda.rs
-    s3.rs sfn.rs sqs.rs dynamodb.rs events.rs appconfig.rs
+    s3.rs sfn.rs sqs.rs dynamodb.rs events.rs appconfig.rs apigateway.rs
+    rds.rs pi.rs  Aurora (awsQuery) and Performance Insights
     cloudwatch.rs alarms.rs metrics.rs   CloudWatch (awsQuery): alarms and GetMetricData
   tui/            app shell: header, module palette, environment, toasts, help, SSO login, event loop
     module.rs     the Module trait every module implements
     picker.rs     searchable list, in the UI and inline in the shell
     logview.rs    log viewer with full screen, search and error jumps (Pipelines, Logs)
     form.rs       modal forms (new parameter, new secret…)
-    chart.rs      terminal charts (Lambda metrics)
-  modules/        one file per module: pipelines, matrix, approvals, alarms, parameters,
-                  secrets, lambda, cwlogs (+ cwlogs/insights.rs), cfn, s3, sfn, sqs,
-                  dynamodb, events, appconfig
+    chart.rs      terminal charts (metrics of Lambda, Alarms, API Gateway, Aurora)
+    canvas.rs     box-drawing canvas for diagrams (Step Functions graph, Aurora topology)
+  modules/        one file (or folder) per module: pipelines, matrix, approvals, alarms,
+                  savings, parameters, secrets, lambda, apigateway, cwlogs, cfn, s3, sfn,
+                  sqs, dynamodb, aurora, events, appconfig
   clicmd/         the commands of the newer modules (dcli s3, sfn, ddb, events, flags, lambda,
-                  alarms, approvals, promote, rollback, sqs, insights, cfn)
+                  alarms, approvals, promote, rollback, sqs, insights, cfn, apigw, aurora,
+                  optimize)
+  savings/        one check per service for the Savings module and `dcli optimize`
   catalog.rs      every resource of an environment by name, for the `:` search
   asl.rs          Amazon States Language: a state machine's definition arranged for its graph
   pipeline.rs     CodePipeline domain logic shared by the UI and the CLI
@@ -360,7 +421,7 @@ src/
 Background work runs on plain threads and reports back through a channel, so the UI never
 blocks. There is no async runtime and no AWS SDK: each service is a handful of typed JSON calls.
 
-### Adding a module (e.g. ECS, API Gateway)
+### Adding a module (e.g. ECS)
 
 1. **AWS calls**: create `src/aws/<service>.rs` with a `Service` constant and functions that
    call `aws.call(&SERVICE, "Operation", &json!({...}))` (or `aws.rest(...)` for REST APIs),
