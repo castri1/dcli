@@ -2,11 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{Finding, Impact, Scan};
+use super::{Finding, Impact, Scan, qty};
 use crate::aws::apigateway::{self as apigw, Api, ApiDetail, Integration};
 use crate::aws::metrics::{self, Query};
 use crate::aws::{self, Aws};
-use crate::tui::chart::fmt_count;
 use crate::util::now_secs;
 
 /// Requests a month that make an HTTP API candidate matter a lot, or somewhat: requests
@@ -188,12 +187,12 @@ fn http_candidate(
         api.name.clone(),
         "REST API that uses nothing only REST APIs have",
         "Move it to an HTTP API (Lambda and HTTP integrations carry over; Cognito becomes a JWT authorizer)",
-        format!("{} requests a month billed at the REST API rate", fmt_count(monthly)),
+        format!("{} requests a month billed at the REST API rate", qty(monthly)),
         requests_impact(monthly),
     )
     .evidence(format!(
         "{} requests in the last {} days on stage{} {}",
-        fmt_count(requests),
+        qty(requests),
         scan.days,
         if stages.len() == 1 { "" } else { "s" },
         stages.join(", ")
@@ -264,9 +263,9 @@ fn caches(scan: &Scan, api: &Api, detail: &ApiDetail, usage: &HashMap<(String, S
             .evidence(format!(
                 "Last {} days: {} requests, {} cache hits, {} misses · cache status {}",
                 scan.days,
-                fmt_count(u.requests),
-                fmt_count(u.hits),
-                fmt_count(u.misses),
+                qty(u.requests),
+                qty(u.hits),
+                qty(u.misses),
                 if status.is_empty() { "unknown" } else { status }
             ))
             .evidence(format!(
@@ -374,7 +373,7 @@ mod tests {
         usage.insert(("a1".to_string(), "prod".to_string()), Usage { requests: 7_000_000.0, ..Default::default() });
         let f = http_candidate(&scan, &api("REGIONAL"), &d, Some(&[]), &usage).unwrap();
         assert_eq!(f.impact, Impact::High);
-        assert_eq!(f.reduction, "15.0M requests a month billed at the REST API rate");
+        assert_eq!(f.reduction, "15 M requests a month billed at the REST API rate");
         assert!(!f.reduction.contains('$') && !f.summary.contains('%'));
         let f = http_candidate(&scan, &api("REGIONAL"), &d, None, &usage).unwrap();
         assert!(f.caveats.iter().any(|c| c.contains("Usage plans could not be read")));

@@ -2235,7 +2235,7 @@ def cw_metrics(action, params):
             if v is None:
                 v = cw_metric_value(name, dims, t) * scale
             if v is not CW_NO_DATA:
-                points.append((t, round(v, 2)))
+                points.append((t, round(v, 6)))
         stamps = "".join(f"<member>{cw_iso(t)}</member>" for t, _ in points)
         values = "".join(f"<member>{v}</member>" for _, v in points)
         results.append(f"<member><Timestamps>{stamps}</Timestamps><Values>{values}</Values><Label>{name}</Label>"
@@ -3317,13 +3317,6 @@ def rds(params):
     return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
 
 
-class RdsExact(float):
-    """A value cw_metrics' rounding to 2 decimals leaves alone: latencies are in seconds."""
-
-    def __round__(self, ndigits=None):
-        return self
-
-
 def rds_instance_info(name):
     """(cluster name, cluster, instance tuple) of an instance."""
     for cname, c in RDS_CLUSTERS.items():
@@ -3386,8 +3379,8 @@ def rds_metric(namespace, name, dims, stat, period, ts):
         "CPUUtilization": round(max(0.5, cpu), 1),
         "DatabaseConnections": round(max(0.0, conns) * peak),
         "FreeableMemory": (free_gib - 1.5 * seed) * 1024 ** 3,
-        "ReadLatency": RdsExact(0.0009 + 0.0008 * seed),
-        "WriteLatency": RdsExact(0.0018 + 0.0015 * seed if writer else 0.0),
+        "ReadLatency": 0.0009 + 0.0008 * seed,
+        "WriteLatency": 0.0018 + 0.0015 * seed if writer else 0.0,
         "ReadIOPS": round(read_iops + 50 * seed, 1),
         "WriteIOPS": round(write_iops + 20 * seed, 1),
         "BufferCacheHitRatio": round(99.6 - (4.5 * seed if iid == "orders-1" and seed > 0.9 else 0.4 * seed), 2),

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Finding, Impact, Scan};
+use super::{Finding, Impact, Scan, qty};
 use crate::aws::rds::{self, Cluster, Instance, Inventory, MetricDef, Metrics, Only, Snapshot, Unit, Want};
 use crate::aws;
 use crate::util::now_secs;
@@ -86,17 +86,6 @@ fn num(v: f64) -> String {
         out.push(c);
     }
     if v < 0.0 { format!("-{out}") } else { out }
-}
-
-/// `17.5 billion`, `582 million`
-fn big(v: f64) -> String {
-    if v >= 1e9 {
-        format!("{:.1} billion", v / 1e9)
-    } else if v >= 1e6 {
-        format!("{:.0} million", v / 1e6)
-    } else {
-        num(v)
-    }
 }
 
 fn gib(bytes: f64) -> f64 {
@@ -186,7 +175,7 @@ fn idle_cluster(c: &Cluster, instances: &[&Instance], m: &Metrics, days: f64) ->
         } else {
             format!("no connections in {days:.0} days on its {} instances", instances.len())
         },
-        "delete it after a final snapshot, or stop it while it is not needed (a stopped cluster starts again after 7 days)",
+        "Delete it after a final snapshot, or stop it while it is not needed (a stopped cluster starts again after 7 days)",
         reduction,
         impact,
     )
@@ -210,9 +199,9 @@ fn quiet_reader(c: &Cluster, instances: &[&Instance], i: &Instance, m: &Metrics,
     let readers = instances.iter().filter(|r| !r.writer).count();
     let (reduction, impact) = monthly_use(c, i);
     let (recommendation, impact) = if readers > 1 {
-        (format!("remove {}: the other readers keep serving reads and failing over", i.id), impact)
+        (format!("Remove {}: the other readers keep serving reads and failing over", i.id), impact)
     } else {
-        (format!("remove {} if the cluster can do without a failover target", i.id), Impact::Low)
+        (format!("Remove {} if the cluster can do without a failover target", i.id), Impact::Low)
     };
     Some(
         Finding::new("Aurora", c.id.clone(), format!("{} / {}", c.id, i.id), format!("reader {} barely used in {days:.0} days", i.id), recommendation, reduction, impact)
@@ -243,7 +232,7 @@ fn oversized(c: &Cluster, instances: &[&Instance], i: &Instance, m: &Metrics, da
         c.id.clone(),
         format!("{} / {}", c.id, i.id),
         format!("{} peaked at {cpu:.0}% CPU with at least {free:.0} of {memory:.0} GiB free in {days:.0} days", i.id),
-        format!("move {} from {} to {smaller}", i.id, i.class),
+        format!("Move {} from {} to {smaller}", i.id, i.class),
         format!("{} vCPU-hours a month ({vcpus} → {new_vcpus} vCPUs, {memory:.0} → {new_memory:.0} GiB)", num(hours)),
         by_vcpu_hours(hours),
     )
@@ -281,7 +270,7 @@ fn serverless_minimum(c: &Cluster, i: &Instance, m: &Metrics, days: f64) -> Opti
             c.id.clone(),
             format!("{} / {}", c.id, i.id),
             format!("{} stays at its {} ACU minimum on {:.0}% of days with CPU at most {cpu:.0}%", i.id, rds::fmt_acu(range.min), at_min * 100.0),
-            format!("lower the minimum capacity of {} from {} to {} ACU", c.id, rds::fmt_acu(range.min), rds::fmt_acu(new_min)),
+            format!("Lower the minimum capacity of {} from {} to {} ACU", c.id, rds::fmt_acu(range.min), rds::fmt_acu(new_min)),
             format!("up to {} ACU-hours a month ({} → {} ACU while quiet)", num(acu_hours), rds::fmt_acu(range.min), rds::fmt_acu(new_min)),
             by_acu_hours(acu_hours),
         )
@@ -305,7 +294,7 @@ fn graviton(c: &Cluster, instances: &[&Instance]) -> Option<Finding> {
             c.id.clone(),
             c.id.clone(),
             if moves.len() == 1 { "1 instance on an Intel class".to_string() } else { format!("{} instances on Intel classes", moves.len()) },
-            format!("move to Graviton: {list}"),
+            format!("Move to Graviton: {list}"),
             format!("{} vCPU-hours a month on Graviton instead of Intel", num(vcpu_hours)),
             if vcpu_hours >= 2920.0 { Impact::Medium } else { Impact::Low },
         )
@@ -329,12 +318,12 @@ fn io_heavy(c: &Cluster, m: &Metrics, days: f64) -> Option<Finding> {
             "Aurora",
             c.id.clone(),
             c.id.clone(),
-            format!("Standard storage billed {} I/O requests in {days:.0} days", big(reads + writes)),
-            "compare with I/O-Optimized storage, which bills no I/O requests",
-            format!("about {} I/O requests a month no longer billed per request", big(monthly)),
+            format!("Standard storage billed {} I/O requests in {days:.0} days", qty(reads + writes)),
+            "Compare with I/O-Optimized storage, which bills no I/O requests",
+            format!("about {} I/O requests a month no longer billed per request", qty(monthly)),
             if monthly >= IO_HIGH { Impact::High } else { Impact::Medium },
         )
-        .evidence(format!("{} reads and {} writes (VolumeReadIOPs, VolumeWriteIOPs)", big(reads), big(writes)))
+        .evidence(format!("{} reads and {} writes (VolumeReadIOPs, VolumeWriteIOPs)", qty(reads), qty(writes)))
         .caveat("I/O-Optimized charges more for instances and storage instead: it pays off when I/O is a large part of this cluster's bill. Compare those lines of the bill before switching.")
         .caveat("The storage type can be changed once every 30 days."),
     )
@@ -362,7 +351,7 @@ fn old_snapshots(snapshots: &[Snapshot], now: f64) -> Vec<Finding> {
                     if list.len() == 1 { "" } else { "s" },
                     (now - oldest) / 86_400.0
                 ),
-                "delete the snapshots no longer needed",
+                "Delete the snapshots no longer needed",
                 format!("{} GB of snapshot storage a month", num(gb)),
                 by_gb(gb),
             );
@@ -439,12 +428,12 @@ mod tests {
         let about: Vec<(&str, &str)> = found.iter().map(|f| (f.resource.as_str(), f.recommendation.as_str())).collect();
         assert_eq!(found.len(), 3, "{about:#?}");
         let smaller = &found[0];
-        assert_eq!(smaller.recommendation, "move r1 from db.r6g.xlarge to db.r6g.large");
+        assert_eq!(smaller.recommendation, "Move r1 from db.r6g.xlarge to db.r6g.large");
         assert_eq!((smaller.reduction.as_str(), smaller.impact), ("1,460 vCPU-hours a month (4 → 2 vCPUs, 32 → 16 GiB)", Impact::Medium));
-        assert_eq!(found[1].recommendation, "move to Graviton: r2 db.r5.large → db.r7g.large");
+        assert_eq!(found[1].recommendation, "Move to Graviton: r2 db.r5.large → db.r7g.large");
         assert_eq!(found[1].impact, Impact::Low);
         let io = &found[2];
-        assert_eq!(io.reduction, "about 15.0 billion I/O requests a month no longer billed per request");
+        assert_eq!(io.reduction, "about 15 B I/O requests a month no longer billed per request");
         assert_eq!(io.impact, Impact::High);
         assert!(found.iter().all(|f| !f.reduction.contains('$') && !f.reduction.contains('%')));
     }
@@ -461,7 +450,7 @@ mod tests {
         daily(&mut m, "s-1", "acu_avg", &[4.0; 14]);
         let found = findings(&inventory, &m, &[], 14.0, 14.0 * DAY);
         assert_eq!(found.len(), 1, "{found:#?}");
-        assert_eq!(found[0].recommendation, "lower the minimum capacity of sessions from 4 to 1 ACU");
+        assert_eq!(found[0].recommendation, "Lower the minimum capacity of sessions from 4 to 1 ACU");
         assert_eq!((found[0].reduction.as_str(), found[0].impact), ("up to 2,190 ACU-hours a month (4 → 1 ACU while quiet)", Impact::High));
     }
 
@@ -479,6 +468,5 @@ mod tests {
         assert_eq!((found[0].reduction.as_str(), found[0].impact), ("1,050 GB of snapshot storage a month", Impact::High));
         assert_eq!(found[0].evidence, ["a, 350 GB, 200 days old", "c, 700 GB, 120 days old"]);
         assert_eq!(num(1234567.0), "1,234,567");
-        assert_eq!(big(1.75e10), "17.5 billion");
     }
 }
