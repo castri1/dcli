@@ -3103,13 +3103,368 @@ CW_METRIC_HOOKS.append(_apigw_metric)
 
 
 # ---- RDS (awsQuery, Version 2014-10-31) -------------------------------------------------------
+RDS_ACCOUNT, RDS_REGION = "123456789012", "us-east-1"
+RDS_NS = "http://rds.amazonaws.com/doc/2014-10-31/"
+# Aurora clusters: orders-prod (busy, three zones, a custom endpoint, Performance Insights,
+# heavy I/O on Standard storage), sessions-dev (Serverless v2 kept at its 4 ACU minimum)
+# and analytics-old (idle, an Intel class). docs-legacy (DocumentDB) and legacy-mysql (a
+# plain RDS instance) must not show up.
+RDS_CLUSTERS = {
+    "orders-prod": {
+        "engine": "aurora-postgresql", "version": "16.4", "port": 5432, "user": "orders_admin", "db": "orders",
+        "storage": "aurora", "iam": True, "protect": True, "backups": 7, "age": 420, "serverless": None,
+        # (id, class, zone, writer, promotion tier, Performance Insights)
+        "instances": [("orders-1", "db.r6g.xlarge", "us-east-1a", True, 1, True),
+                      ("orders-2", "db.r6g.xlarge", "us-east-1b", False, 1, True),
+                      ("orders-3", "db.r5.large", "us-east-1c", False, 2, True)],
+        "custom": [("reporting", "READER", ["orders-3"], [])],
+    },
+    "sessions-dev": {
+        "engine": "aurora-mysql", "version": "8.0.mysql_aurora.3.05.2", "port": 3306, "user": "admin", "db": "sessions",
+        "storage": "aurora", "iam": False, "protect": False, "backups": 1, "age": 90, "serverless": (4.0, 16.0),
+        "instances": [("sessions-dev-1", "db.serverless", "us-east-1a", True, 1, False)],
+        "custom": [],
+    },
+    "analytics-old": {
+        "engine": "aurora-mysql", "version": "5.7.mysql_aurora.2.11.2", "port": 3306, "user": "admin", "db": "analytics",
+        "storage": "aurora", "iam": False, "protect": False, "backups": 1, "age": 1100, "serverless": None,
+        "instances": [("analytics-old-1", "db.r5.large", "us-east-1b", True, 1, False)],
+        "custom": [],
+    },
+}
+# (snapshot, cluster, days old, GB)
+RDS_SNAPSHOTS = [("analytics-old-final-2025", "analytics-old", 400, 120), ("orders-prod-before-migration", "orders-prod", 200, 350),
+                 ("orders-prod-yesterday", "orders-prod", 1, 410)]
+
+
+def rds_x(tag, value):
+    """An element; None leaves it out. ESC characters travel as &#x1b; as AWS would send them."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    return f"<{tag}>{xml_escape(str(value)).replace(chr(27), '&#x1b;').replace(chr(7), '&#x7;')}</{tag}>"
+
+
+def rds_iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+
+def rds_resource_id(name):
+    return "db-" + hashlib.sha256(name.encode()).hexdigest()[:26].upper()
+
+
+def rds_host(name, kind="cluster"):
+    return f"{name}.{kind}-c7mock1x2y3z.{RDS_REGION}.rds.amazonaws.com"
+
+
+def rds_cluster_arn(name):
+    return f"arn:aws:rds:{RDS_REGION}:{RDS_ACCOUNT}:cluster:{name}"
+
+
+def rds_family(c):
+    return "aurora-postgresql16" if "postgres" in c["engine"] else "aurora-mysql8.0"
+
+
+def rds_cluster_xml(name, c):
+    members = "".join(
+        f"<DBClusterMember>{rds_x('DBInstanceIdentifier', i)}{rds_x('IsClusterWriter', w)}"
+        f"{rds_x('DBClusterParameterGroupStatus', 'pending-reboot' if i == 'orders-3' else 'in-sync')}{rds_x('PromotionTier', t)}</DBClusterMember>"
+        for i, _, _, w, t, _ in c["instances"])
+    serverless = (f"<ServerlessV2ScalingConfiguration>{rds_x('MinCapacity', c['serverless'][0])}{rds_x('MaxCapacity', c['serverless'][1])}"
+                  f"</ServerlessV2ScalingConfiguration>" if c["serverless"] else "")
+    customs = "".join(f"<member>{rds_host(n, 'cluster-custom')}</member>" for n, *_ in c["custom"])
+    return (f"<DBCluster>{rds_x('AllocatedStorage', 1)}<AvailabilityZones><AvailabilityZone>us-east-1a</AvailabilityZone>"
+            f"<AvailabilityZone>us-east-1b</AvailabilityZone><AvailabilityZone>us-east-1c</AvailabilityZone></AvailabilityZones>"
+            f"{rds_x('BackupRetentionPeriod', c['backups'])}{rds_x('DatabaseName', c['db'])}{rds_x('DBClusterIdentifier', name)}"
+            f"{rds_x('DBClusterParameterGroup', 'default.' + rds_family(c))}{rds_x('DBSubnetGroup', 'default')}{rds_x('Status', 'available')}"
+            f"{rds_x('Endpoint', rds_host(name))}{rds_x('ReaderEndpoint', rds_host(name, 'cluster-ro'))}<CustomEndpoints>{customs}</CustomEndpoints>"
+            f"{rds_x('MultiAZ', len(c['instances']) > 1)}{rds_x('Engine', c['engine'])}{rds_x('EngineVersion', c['version'])}"
+            f"{rds_x('Port', c['port'])}{rds_x('MasterUsername', c['user'])}"
+            f"<DBClusterOptionGroupMemberships><DBClusterOptionGroupMembership><DBClusterOptionGroupName>default</DBClusterOptionGroupName>"
+            f"<Status>pending-apply</Status></DBClusterOptionGroupMembership></DBClusterOptionGroupMemberships>"
+            f"{rds_x('PreferredBackupWindow', '07:00-07:30')}{rds_x('PreferredMaintenanceWindow', 'sun:08:00-sun:08:30')}"
+            f"<DBClusterMembers>{members}</DBClusterMembers>"
+            f"<VpcSecurityGroups><VpcSecurityGroupMembership><VpcSecurityGroupId>sg-0a1b2c</VpcSecurityGroupId><Status>active</Status>"
+            f"</VpcSecurityGroupMembership></VpcSecurityGroups>{rds_x('StorageEncrypted', True)}"
+            f"{rds_x('DbClusterResourceId', 'cluster-' + rds_resource_id(name)[3:])}{rds_x('DBClusterArn', rds_cluster_arn(name))}"
+            f"{rds_x('IAMDatabaseAuthenticationEnabled', c['iam'])}{rds_x('ClusterCreateTime', rds_iso(T0 - 86400 * c['age']))}"
+            f"{rds_x('EngineMode', 'provisioned')}{rds_x('DeletionProtection', c['protect'])}{rds_x('StorageType', c['storage'])}"
+            f"{serverless}</DBCluster>")
+
+
+def rds_instances():
+    """(cluster name or None, instance XML) for every instance, Aurora or not."""
+    out = []
+    for name, c in RDS_CLUSTERS.items():
+        for i, cls, zone, _, tier, pi in c["instances"]:
+            pending = ("<PendingModifiedValues><DBInstanceClass>db.r6g.xlarge</DBInstanceClass></PendingModifiedValues>"
+                       if i == "orders-3" else "<PendingModifiedValues/>")
+            out.append((name, f"<DBInstance>{rds_x('DBInstanceIdentifier', i)}{rds_x('DBInstanceClass', cls)}{rds_x('Engine', c['engine'])}"
+                        f"{rds_x('DBInstanceStatus', 'available')}{rds_x('MasterUsername', c['user'])}"
+                        f"<Endpoint>{rds_x('Address', rds_host(i, 'instance'))}{rds_x('Port', c['port'])}<HostedZoneId>Z2R2ITUGPM61AM</HostedZoneId></Endpoint>"
+                        f"{rds_x('InstanceCreateTime', rds_iso(T0 - 86400 * c['age']))}"
+                        f"<DBParameterGroups><DBParameterGroup>{rds_x('DBParameterGroupName', 'default.' + rds_family(c))}"
+                        f"{rds_x('ParameterApplyStatus', 'pending-reboot' if i == 'orders-3' else 'in-sync')}</DBParameterGroup></DBParameterGroups>"
+                        f"{rds_x('AvailabilityZone', zone)}<DBSubnetGroup><DBSubnetGroupName>default</DBSubnetGroupName><Subnets><Subnet>"
+                        f"<SubnetIdentifier>subnet-1</SubnetIdentifier><SubnetAvailabilityZone><Name>us-east-1f</Name></SubnetAvailabilityZone>"
+                        f"<SubnetStatus>Active</SubnetStatus></Subnet></Subnets></DBSubnetGroup>{pending}"
+                        f"{rds_x('EngineVersion', c['version'])}{rds_x('AutoMinorVersionUpgrade', True)}{rds_x('PubliclyAccessible', False)}"
+                        f"<StatusInfos/>{rds_x('DBClusterIdentifier', name)}{rds_x('StorageEncrypted', True)}"
+                        f"{rds_x('DbiResourceId', rds_resource_id(i))}{rds_x('CACertificateIdentifier', 'rds-ca-rsa2048-g1')}"
+                        f"{rds_x('PromotionTier', tier)}{rds_x('DBInstanceArn', f'arn:aws:rds:{RDS_REGION}:{RDS_ACCOUNT}:db:{i}')}"
+                        f"{rds_x('MonitoringInterval', 60 if pi else 0)}{rds_x('PerformanceInsightsEnabled', pi)}"
+                        f"{rds_x('PerformanceInsightsRetentionPeriod', 7 if pi else None)}</DBInstance>"))
+    out.append((None, f"<DBInstance>{rds_x('DBInstanceIdentifier', 'legacy-mysql')}{rds_x('DBInstanceClass', 'db.m5.large')}"
+                      f"{rds_x('Engine', 'mysql')}{rds_x('DBInstanceStatus', 'available')}</DBInstance>"))
+    return out
+
+
+def rds_endpoints(name, c):
+    rows = [(None, "WRITER", None, rds_host(name), [], []), (None, "READER", None, rds_host(name, "cluster-ro"), [], [])]
+    rows += [(n, "CUSTOM", kind, rds_host(n, "cluster-custom"), static, excluded)
+             for n, kind, static, excluded in c["custom"]]
+    return "".join(
+        f"<DBClusterEndpointList>{rds_x('DBClusterEndpointIdentifier', ident)}{rds_x('DBClusterIdentifier', name)}"
+        f"{rds_x('Endpoint', host)}{rds_x('Status', 'available')}{rds_x('EndpointType', kind)}{rds_x('CustomEndpointType', custom)}"
+        f"<StaticMembers>{''.join(f'<member>{m}</member>' for m in static)}</StaticMembers>"
+        f"<ExcludedMembers>{''.join(f'<member>{m}</member>' for m in excluded)}</ExcludedMembers></DBClusterEndpointList>"
+        for ident, kind, custom, host, static, excluded in rows)
+
+
+# (seconds ago, source, source type, categories, message)
+RDS_EVENTS = [
+    (60 * 40, "orders-3", "db-instance", ["notification"], "Backup completed \x1b[31mwith warnings\x1b[0m"),
+    (3600 * 5, "sessions-dev", "db-cluster", ["notification"], "Scaled DB cluster capacity from 4.0 to 4.0 ACUs (minimum capacity)."),
+    (86400 * 2 + 30, "orders-prod", "db-cluster", ["failover"], "Started cross AZ failover to DB instance: orders-1"),
+    (86400 * 2, "orders-prod", "db-cluster", ["failover"], "Completed failover to DB instance: orders-1"),
+    (86400 * 2 - 20, "orders-2", "db-instance", ["availability"], "DB instance restarted"),
+    (86400 * 3, "orders-3", "db-instance", ["configuration change"], "Updated to use DBParameterGroup default.aurora-postgresql16"),
+    (86400 * 4, "analytics-old-1", "db-instance", ["backup"], "Automated backup completed"),
+    (86400 * 6, "docs-legacy", "db-cluster", ["maintenance"], "DocumentDB cluster patched"),
+    (86400 * 20, "orders-prod", "db-cluster", ["maintenance"], "Too old to be listed"),
+]
+
+
+def rds_events(params):
+    minutes = int(params.get("Duration", ["60"])[0])
+    rows = [e for e in RDS_EVENTS if e[0] <= minutes * 60]
+    return "".join(
+        f"<Event>{rds_x('SourceIdentifier', src)}{rds_x('SourceType', kind)}{rds_x('Message', msg)}"
+        f"<EventCategories>{''.join(rds_x('EventCategory', c) for c in cats)}</EventCategories>"
+        f"{rds_x('Date', rds_iso(T0 - ago))}{rds_x('SourceArn', f'arn:aws:rds:{RDS_REGION}:{RDS_ACCOUNT}:{src}')}</Event>"
+        for ago, src, kind, cats, msg in rows)
+
+
+def rds_pending():
+    actions = [(f"arn:aws:rds:{RDS_REGION}:{RDS_ACCOUNT}:db:orders-2", "system-update", "New Operating System update is available", 5, None),
+               (rds_cluster_arn("analytics-old"), "db-upgrade", "Upgrade to Aurora MySQL 3: version 2 is past the end of standard support",
+                None, 30)]
+    return "".join(
+        f"<ResourcePendingMaintenanceActions>{rds_x('ResourceIdentifier', arn)}<PendingMaintenanceActionDetails><PendingMaintenanceAction>"
+        f"{rds_x('Action', action)}{rds_x('Description', desc)}"
+        f"{rds_x('AutoAppliedAfterDate', rds_iso(T0 + 86400 * auto) if auto else None)}"
+        f"{rds_x('ForcedApplyDate', rds_iso(T0 + 86400 * forced) if forced else None)}"
+        f"</PendingMaintenanceAction></PendingMaintenanceActionDetails></ResourcePendingMaintenanceActions>"
+        for arn, action, desc, auto, forced in actions)
+
+
+def rds_xml(action, inner):
+    return (f'<{action}Response xmlns="{RDS_NS}"><{action}Result>{inner}</{action}Result>'
+            f"<ResponseMetadata><RequestId>{eid()}</RequestId></ResponseMetadata></{action}Response>")
+
+
 def rds(params):
-    action = params.get("Action", [""])[0]
+    """awsQuery: form-encoded request, XML response (status, body)."""
+    get = lambda k, d="": params.get(k, [d])[0]
+    action = get("Action")
+    if action == "DescribeDBClusters":
+        only = get("DBClusterIdentifier")
+        if only and only not in RDS_CLUSTERS:
+            return 404, query_error("DBClusterNotFoundFault", f"DBCluster {xml_escape(only)} not found.")
+        body = "".join(rds_cluster_xml(n, c) for n, c in RDS_CLUSTERS.items() if not only or n == only)
+        if not only:
+            body += f"<DBCluster>{rds_x('DBClusterIdentifier', 'docs-legacy')}{rds_x('Engine', 'docdb')}{rds_x('Status', 'available')}</DBCluster>"
+        return 200, rds_xml(action, f"<DBClusters>{body}</DBClusters>")
+    if action == "DescribeDBInstances":
+        only = get("Filters.Filter.1.Values.Value.1") if get("Filters.Filter.1.Name") == "db-cluster-id" else ""
+        rows = [x for c, x in rds_instances() if not only or c == only]
+        # Three per page, to exercise Marker.
+        start = int(get("Marker") or 0)
+        marker = rds_x("Marker", start + 3) if start + 3 < len(rows) else ""
+        return 200, rds_xml(action, f"<DBInstances>{''.join(rows[start:start + 3])}</DBInstances>{marker}")
+    if action == "DescribeDBClusterEndpoints":
+        only = get("DBClusterIdentifier")
+        body = "".join(rds_endpoints(n, c) for n, c in RDS_CLUSTERS.items() if not only or n == only)
+        return 200, rds_xml(action, f"<DBClusterEndpoints>{body}</DBClusterEndpoints>")
+    if action == "DescribeGlobalClusters":
+        members = (f"<GlobalClusterMember>{rds_x('DBClusterArn', rds_cluster_arn('orders-prod'))}{rds_x('IsWriter', True)}</GlobalClusterMember>"
+                   f"<GlobalClusterMember>{rds_x('DBClusterArn', 'arn:aws:rds:eu-west-1:123456789012:cluster:orders-eu')}"
+                   f"{rds_x('IsWriter', False)}</GlobalClusterMember>")
+        return 200, rds_xml(action, f"<GlobalClusters><GlobalClusterMember>{rds_x('GlobalClusterIdentifier', 'orders-global')}"
+                                    f"<GlobalClusterMembers>{members}</GlobalClusterMembers></GlobalClusterMember></GlobalClusters>")
+    if action == "DescribeEvents":
+        return 200, rds_xml(action, f"<Events>{rds_events(params)}</Events>")
+    if action == "DescribePendingMaintenanceActions":
+        return 200, rds_xml(action, f"<PendingMaintenanceActions>{rds_pending()}</PendingMaintenanceActions>")
+    if action == "DescribeDBClusterSnapshots":
+        body = "".join(
+            f"<DBClusterSnapshot>{rds_x('DBClusterSnapshotIdentifier', s)}{rds_x('DBClusterIdentifier', c)}"
+            f"{rds_x('SnapshotCreateTime', rds_iso(T0 - 86400 * days))}{rds_x('Engine', RDS_CLUSTERS[c]['engine'])}"
+            f"{rds_x('AllocatedStorage', gb)}{rds_x('Status', 'available')}{rds_x('SnapshotType', 'manual')}</DBClusterSnapshot>"
+            for s, c, days, gb in RDS_SNAPSHOTS)
+        return 200, rds_xml(action, f"<DBClusterSnapshots>{body}</DBClusterSnapshots>")
     return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
 
 
+class RdsExact(float):
+    """A value cw_metrics' rounding to 2 decimals leaves alone: latencies are in seconds."""
+
+    def __round__(self, ndigits=None):
+        return self
+
+
+def rds_instance_info(name):
+    """(cluster name, cluster, instance tuple) of an instance."""
+    for cname, c in RDS_CLUSTERS.items():
+        for inst in c["instances"]:
+            if inst[0] == name:
+                return cname, c, inst
+    return None
+
+
+def rds_metric(namespace, name, dims, stat, period, ts):
+    """AWS/RDS: the writer busiest (CPU past 75 % in the afternoon), readers lagging a little,
+    the reporting reader busy at night, sessions-dev pinned at its 4 ACU minimum, analytics-old
+    idle."""
+    if namespace != "AWS/RDS":
+        return None
+    seed = int(hashlib.sha256(f"{name}{sorted(dims.items())}{int(ts)}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    day = ts / 86400 * 2 * math.pi
+    wave = 1 + 0.6 * math.sin(day)
+    if "DBClusterIdentifier" in dims:
+        cluster = dims["DBClusterIdentifier"]
+        volume = {"orders-prod": 412e9, "sessions-dev": 6e9, "analytics-old": 120e9}.get(cluster)
+        if volume is None:
+            return CW_NO_DATA
+        if name == "VolumeBytesUsed":
+            return volume
+        if name in ("VolumeReadIOPs", "VolumeWriteIOPs"):
+            per5 = {"orders-prod": (1.6e6, 4.2e5), "sessions-dev": (2e3, 1.5e3), "analytics-old": (0, 0)}[cluster]
+            v = per5[0 if name == "VolumeReadIOPs" else 1] * wave * (0.8 + 0.4 * seed)
+            return v * period / 300 if stat == "Sum" else v
+        return CW_NO_DATA
+    info = rds_instance_info(dims.get("DBInstanceIdentifier", ""))
+    if not info:
+        return CW_NO_DATA
+    _, _, (iid, cls, _, writer, _, pi) = info
+    night = max(0.0, math.sin(day + math.pi))
+    peak = 1.25 if stat == "Maximum" else 1.0
+    if name == "AuroraReplicaLag":
+        if writer:
+            return CW_NO_DATA
+        spike = 1400 if seed > 0.985 else 0
+        return round(18 + 14 * seed + spike + (10 if iid == "orders-3" else 0), 1)
+    if name in ("ServerlessDatabaseCapacity", "ACUUtilization"):
+        if cls != "db.serverless":
+            return CW_NO_DATA
+        return 4.0 if name == "ServerlessDatabaseCapacity" else 25.0
+    if name == "DBLoad":
+        if not pi:
+            return CW_NO_DATA
+        return round((2.6 * wave + 0.8 * seed) * peak, 2) if iid == "orders-1" else round(0.6 * wave * seed + 0.3, 2)
+    profile = {
+        # CPU %, connections, freeable GiB, read IOPS, write IOPS
+        "orders-1": (min(98.0, (44 + 34 * math.sin(day) + 8 * seed) * peak), 180 * wave + 30 * seed, 9.5, 1200 * wave, 800 * wave),
+        "orders-2": ((14 + 6 * wave + 4 * seed) * peak, 55 * wave + 10 * seed, 21.0, 900 * wave, 15),
+        "orders-3": ((12 + 50 * night + 4 * seed) * peak, 8 + 4 * seed, 7.5, 300 * (1 + night), 10),
+        "sessions-dev-1": ((5 + 3 * seed) * peak, 3 + 3 * seed, 7.0, 40 * wave, 30 * wave),
+        "analytics-old-1": ((1.5 + seed) * peak, 0, 13.2, 0.2, 0.4),
+    }[iid]
+    cpu, conns, free_gib, read_iops, write_iops = profile
+    values = {
+        "CPUUtilization": round(max(0.5, cpu), 1),
+        "DatabaseConnections": round(max(0.0, conns) * peak),
+        "FreeableMemory": (free_gib - 1.5 * seed) * 1024 ** 3,
+        "ReadLatency": RdsExact(0.0009 + 0.0008 * seed),
+        "WriteLatency": RdsExact(0.0018 + 0.0015 * seed if writer else 0.0),
+        "ReadIOPS": round(read_iops + 50 * seed, 1),
+        "WriteIOPS": round(write_iops + 20 * seed, 1),
+        "BufferCacheHitRatio": round(99.6 - (4.5 * seed if iid == "orders-1" and seed > 0.9 else 0.4 * seed), 2),
+        "CommitLatency": round(2.2 + 1.5 * seed, 2) if writer else 0.0,
+        "Deadlocks": 0.02 if iid == "orders-1" and seed > 0.97 else 0.0,
+    }
+    return values.get(name, CW_NO_DATA)
+
+
+CW_METRIC_HOOKS.append(rds_metric)
+
+
 # ---- Performance Insights (awsJson1_1, X-Amz-Target PerformanceInsightsv20180227.*) -----------
+# Per instance: (tokenized statement, load in sessions, {wait type: share}).
+PI_SQL = {
+    "orders-1": [
+        ("SELECT o.id, o.status, o.total FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.email = ? "
+         "AND o.created_at > ? ORDER BY o.created_at DESC LIMIT ?", 1.12, {"CPU": 0.65, "IO": 0.35}),
+        ("UPDATE inventory SET reserved = reserved + ? WHERE sku = ? AND warehouse_id = ?", 0.61, {"Lock": 0.75, "CPU": 0.25}),
+        ("INSERT INTO order_events (order_id, kind, payload, created_at) VALUES (?, ?, ?, ?)", 0.34, {"IO": 0.7, "CPU": 0.3}),
+        ("SELECT * FROM audit_log WHERE note = ? /* \x1b]52;c;aGk=\x07 copied */", 0.18, {"CPU": 1.0}),
+        ("SELECT p.sku, p.name, sum(l.quantity) AS sold\nFROM order_lines l\nJOIN products p ON p.sku = l.sku\n"
+         "WHERE l.created_at BETWEEN ? AND ?\nGROUP BY p.sku, p.name\nORDER BY sold DESC\nLIMIT ?", 0.09, {"IO": 0.8, "CPU": 0.2}),
+    ],
+    "orders-2": [
+        ("SELECT id, status FROM orders WHERE id = ?", 0.42, {"CPU": 0.9, "IO": 0.1}),
+        ("SELECT count(*) FROM shipments WHERE order_id = ? AND state <> ?", 0.12, {"IO": 0.6, "CPU": 0.4}),
+    ],
+    "orders-3": [
+        ("WITH daily AS (SELECT date_trunc(?, created_at) AS day, sum(total) AS revenue FROM orders WHERE created_at > ? "
+         "GROUP BY ?) SELECT day, revenue, revenue - lag(revenue) OVER (ORDER BY day) AS change FROM daily ORDER BY day", 0.75,
+         {"IO": 0.85, "CPU": 0.15}),
+    ],
+}
+PI_WAITS = {
+    "orders-1": [("CPU", "CPU", 1.21), ("IO:DataFileRead", "IO", 0.52), ("Lock:transactionid", "Lock", 0.46),
+                 ("IO:XactSync", "IO", 0.21), ("Client:ClientRead", "Client", 0.08)],
+    "orders-2": [("CPU", "CPU", 0.41), ("IO:DataFileRead", "IO", 0.13)],
+    "orders-3": [("IO:DataFileRead", "IO", 0.64), ("CPU", "CPU", 0.12)],
+}
+
+
+def pi_instance(body):
+    ident = body.get("Identifier", "")
+    for c in RDS_CLUSTERS.values():
+        for iid, *_, pi in c["instances"]:
+            if rds_resource_id(iid) == ident:
+                if not pi:
+                    raise KeyError(f"InvalidArgumentException: Performance Insights is not enabled for {ident}")
+                return iid
+    raise KeyError(f"InvalidArgumentException: No resource {ident}")
+
+
 def performance_insights(op, body):
+    iid = pi_instance(body)
+    start, end = body.get("StartTime", T0 - 3600), body.get("EndTime", T0)
+    if op == "DescribeDimensionKeys":
+        group, limit = body["GroupBy"]["Group"], body["GroupBy"].get("Limit", 10)
+        if group == "db.sql_tokenized":
+            types = ["CPU", "IO", "Lock"]
+            keys = [{"Dimensions": {"db.sql_tokenized.statement": sql, "db.sql_tokenized.id": hashlib.md5(sql.encode()).hexdigest()[:16].upper(),
+                                    "db.sql_tokenized.db_id": f"pi-{iid}"},
+                     "Total": load, "Partitions": [round(load * split.get(t, 0), 3) for t in types]}
+                    for sql, load, split in PI_SQL.get(iid, [])[:limit]]
+            return {"AlignedStartTime": start, "AlignedEndTime": end, "Keys": keys,
+                    "PartitionKeys": [{"Dimensions": {"db.wait_event_type.name": t}} for t in types]}
+        if group == "db.wait_event":
+            keys = [{"Dimensions": {"db.wait_event.name": n, "db.wait_event.type": t}, "Total": load}
+                    for n, t, load in PI_WAITS.get(iid, [])[:limit]]
+            return {"AlignedStartTime": start, "AlignedEndTime": end, "Keys": keys}
+        raise KeyError(f"InvalidArgumentException: group {group} is not in the mock")
+    if op == "GetResourceMetrics":
+        period = body.get("PeriodInSeconds", 60)
+        points = [{"Timestamp": t, "Value": rds_metric("AWS/RDS", "DBLoad", {"DBInstanceIdentifier": iid}, "Average", period, t)}
+                  for t in range(int(start) // period * period, int(end), period)][-1440:]
+        return {"AlignedStartTime": start, "AlignedEndTime": end, "Identifier": body["Identifier"],
+                "MetricList": [{"Key": {"Metric": "db.load.avg"}, "DataPoints": points}]}
     raise KeyError(f"InvalidArgumentException: {op} is not in the mock yet")
 
 

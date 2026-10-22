@@ -121,8 +121,9 @@ fn tables(aws: &Aws) -> aws::Result<Vec<Resource>> {
 }
 
 /// Aurora clusters; the target is the cluster identifier.
-fn db_clusters(_aws: &Aws) -> aws::Result<Vec<Resource>> {
-    Ok(Vec::new())
+fn db_clusters(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    let list = aws::rds::describe_clusters(aws, None)?;
+    Ok(list.iter().map(|c| Resource::new("Aurora", &c.id, c.id.clone(), &c.engine_label())).collect())
 }
 
 fn buses(aws: &Aws) -> aws::Result<Vec<Resource>> {
