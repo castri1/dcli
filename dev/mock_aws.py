@@ -4461,13 +4461,263 @@ CE_CALLS = {"count": 0}
 CE_HOOKS = []
 
 
+CE_DAY = 86400
+# Each account's bill as a share of the dev account's; an unfiltered request (an environment
+# reading its own costs) is the dev account's.
+CE_ACCOUNTS = {"123456789012": 1.0, "210987654321": 2.6, "999999999999": 0.05}
+CE_DEFAULT_ACCOUNT = "123456789012"
+# Per service: (usage type, unit, quantity a day, rate). Cost = quantity × rate; consistent
+# with the mock's resources (≈391 GB of logs a month, Redshift and DMS instances…).
+CE_SERVICES = {
+    "Amazon Relational Database Service": [
+        ("InstanceUsage:db.r6g.xlarge", "Hrs", 72, 0.519),
+        ("InstanceUsage:db.r5.large", "Hrs", 24, 0.29),
+        ("Aurora:StorageIOUsage", "IOs", 607_000_000, 0.0000002),
+        ("Aurora:StorageUsage", "GB-Mo", 12.8, 0.10),
+        ("Aurora:ServerlessV2Usage", "ACU-Hr", 96, 0.12),
+        ("Aurora:BackupUsage", "GB-Mo", 15.7, 0.021),
+    ],
+    "AWS Lambda": [
+        ("Lambda-GB-Second", "Lambda-GB-Second", 1_500_000, 0.0000166667),
+        ("USW2-Lambda-GB-Second", "Lambda-GB-Second", 200_000, 0.0000166667),
+        ("Lambda-GB-Second-ARM", "Lambda-GB-Second", 100_000, 0.0000133334),
+        ("Request", "Requests", 2_000_000, 0.0000002),
+        ("Lambda-Provisioned-GB-Second", "Lambda-GB-Second", 2_200_000, 0.0000041667),
+    ],
+    "AmazonCloudWatch": [
+        ("USE1-DataProcessing-Bytes", "GB", 13.03, 0.50),
+        ("USE1-TimedStorage-ByteHrs", "GB-Mo", 50, 0.03),
+        ("CW:AlarmMonitorUsage", "Alarms", 1.33, 0.10),
+        ("CW:GMD-Metrics", "Metrics", 30_000, 0.00001),
+    ],
+    "Amazon DynamoDB": [
+        ("ReadCapacityUnit-Hrs", "ReadCapacityUnit-Hrs", 14_400, 0.00013),
+        ("WriteCapacityUnit-Hrs", "WriteCapacityUnit-Hrs", 13_200, 0.00065),
+        ("ReadRequestUnits", "ReadRequestUnits", 30_000_000, 0.000000125),
+        ("WriteRequestUnits", "WriteRequestUnits", 22_000_000, 0.000000625),
+        ("TimedStorage-ByteHrs", "GB-Mo", 14, 0.25),
+    ],
+    "Amazon Simple Storage Service": [
+        ("TimedStorage-ByteHrs", "GB-Mo", 41.7, 0.023),
+        ("TimedStorage-SIA-ByteHrs", "GB-Mo", 6.7, 0.0125),
+        ("Requests-Tier1", "Requests", 500_000, 0.000005),
+    ],
+    "Amazon Simple Queue Service": [("Requests-RBP", "Requests", 1_200_000, 0.0000004)],
+    "AWS Step Functions": [("StateTransition", "StateTransitions", 1_140_000, 0.000025)],
+    "AWS Secrets Manager": [
+        ("AWSSecretsManager-Secrets", "Secrets", 0.2, 0.40),
+        ("AWSSecretsManager-APIRequest", "API Requests", 30_000, 0.000005),
+    ],
+    "Amazon API Gateway": [
+        ("USE1-ApiGatewayRequest", "Requests", 613_000, 0.0000035),
+        ("USE1-ApiGatewayHttpRequest", "Requests", 300_000, 0.000001),
+        ("USE1-ApiGatewayCacheUsage:6.1", "Hrs", 24, 0.20),
+    ],
+    "Amazon Redshift": [
+        ("Node:ra3.4xlarge", "Hrs", 240, 3.26),
+        ("Node:ra3.xlplus", "Hrs", 48, 1.086),
+        ("RMS:ManagedStorage", "GB-Mo", 100, 0.024),
+    ],
+    "AWS Database Migration Service": [
+        ("InstanceUsg:dms.r5.large", "Hrs", 24, 0.21),
+        ("InstanceUsg:dms.r5.2xlarge", "Hrs", 24, 0.84),
+        ("Multi-AZUsg:dms.r5.2xlarge", "Hrs", 24, 0.84),
+        ("InstanceUsg:dms.c5.xlarge", "Hrs", 24, 0.192),
+        ("Multi-AZUsg:dms.t3.medium", "Hrs", 48, 0.078),
+    ],
+    "Amazon Elastic Compute Cloud - Compute": [("BoxUsage:m6i.large", "Hrs", 240, 0.096)],
+    "Amazon Elastic Container Service": [("Fargate-vCPU-Hours:perCPU", "vCPU-Hours", 96, 0.04)],
+    "AWS CodePipeline": [("V2-ActionExecutionMinutes", "Minutes", 300, 0.002)],
+    "CodeBuild": [("Build-Min:Linux:g1.small", "Minutes", 120, 0.005)],
+    "AWS Systems Manager": [("ParameterStore-APICalls\u001b[31m", "API Calls", 20_000, 0.00005)],
+}
+# What commitments cover of each service: (share, "Savings Plans" or "Reserved").
+CE_COVERED = {
+    "Amazon Elastic Compute Cloud - Compute": (1.0, "Savings Plans"),
+    "Amazon Elastic Container Service": (1.0, "Savings Plans"),
+    "AWS Lambda": (0.0, "Savings Plans"),
+    "Amazon Relational Database Service": (0.6, "Reserved"),
+    "Amazon Redshift": (0.4, "Reserved"),
+}
+CE_PLAN_ARN = "arn:aws:savingsplans::999999999999:savingsplan/sp-0a1b2c3d4e5f"
+
+
+def ce_day(t):
+    return int(t // CE_DAY) * CE_DAY
+
+
+def ce_date(t):
+    return time.strftime("%Y-%m-%d", time.gmtime(t))
+
+
+def ce_parse(s):
+    return calendar.timegm(time.strptime(s[:10], "%Y-%m-%d"))
+
+
+# Lambda costs more from the day after the oldest deploy of the pipelines' history.
+CE_JUMP = ce_day(T0 - 86400 * 5 - 3600) + CE_DAY
+
+
+def ce_accounts(expr):
+    """The LINKED_ACCOUNT values a Cost Explorer filter keeps, anywhere in it."""
+    if isinstance(expr, dict):
+        dims = expr.get("Dimensions") or {}
+        found = list(dims.get("Values", [])) if dims.get("Key") == "LINKED_ACCOUNT" else []
+        for k in ("And", "Or"):
+            for e in expr.get(k) or []:
+                found += ce_accounts(e)
+        return found
+    return []
+
+
+def ce_scale(body):
+    accounts = ce_accounts(body.get("Filter"))
+    if not accounts:
+        return CE_ACCOUNTS[CE_DEFAULT_ACCOUNT]
+    return sum(CE_ACCOUNTS.get(a, 0.0) for a in accounts)
+
+
+def ce_cost(service, usage, quantity, rate, day, scale):
+    """(quantity, cost) of a usage type on `day`: weekly waves, a little noise, Lambda's jump,
+    today only as far as it has gone."""
+    wave = 1 + 0.08 * math.sin(day / CE_DAY / 7 * 2 * math.pi)
+    noise = 1 + (int(hashlib.sha256(f"{service}{usage}{day}".encode()).hexdigest()[:6], 16) / 0xFFFFFF - 0.5) * 0.06
+    jump = 1.6 if service == "AWS Lambda" and day >= CE_JUMP else 1.0
+    part = min(1.0, max(0.0, (time.time() - day) / CE_DAY))
+    q = quantity * wave * noise * jump * scale * part
+    return q, q * rate
+
+
+def ce_days(body):
+    start, end = ce_parse(body["TimePeriod"]["Start"]), ce_parse(body["TimePeriod"]["End"])
+    today = ce_day(time.time())
+    return [d for d in range(int(start), int(end), CE_DAY) if d <= today]
+
+
+def ce_periods(body, days):
+    """The days of each result: one per day, or per calendar month."""
+    if body.get("Granularity") == "DAILY":
+        return [[d] for d in days]
+    periods = []
+    for d in days:
+        if periods and time.gmtime(periods[-1][0]).tm_mon == time.gmtime(d).tm_mon:
+            periods[-1].append(d)
+        else:
+            periods.append([d])
+    return periods
+
+
+def ce_money(v, unit="USD"):
+    return {"Amount": f"{v:.10f}".rstrip("0").rstrip(".") or "0", "Unit": unit}
+
+
+def ce_cost_and_usage(body):
+    scale = ce_scale(body)
+    keys = [g["Key"] for g in body.get("GroupBy", [])]
+    results = []
+    for days in ce_periods(body, ce_days(body)):
+        groups, total = [], 0.0
+        for service, usages in CE_SERVICES.items():
+            rows = [(u, unit) + ce_cost(service, u, q, r, d, scale) for u, unit, q, r in usages for d in days]
+            cost = sum(c for *_, c in rows)
+            total += cost
+            if keys == ["SERVICE"]:
+                groups.append({"Keys": [service], "Metrics": {"AmortizedCost": ce_money(cost)}})
+            elif keys == ["SERVICE", "USAGE_TYPE"]:
+                for u, unit, _, _ in usages:
+                    q = sum(x[2] for x in rows if x[0] == u)
+                    c = sum(x[3] for x in rows if x[0] == u)
+                    groups.append({"Keys": [service, u], "Metrics": {"AmortizedCost": ce_money(c), "UsageQuantity": ce_money(q, unit)}})
+            elif keys == ["SERVICE", "PURCHASE_TYPE"]:
+                share, kind = CE_COVERED.get(service, (0.0, ""))
+                if share > 0:
+                    name = "Savings Plans" if kind == "Savings Plans" else "Standard Reserved Instances"
+                    groups.append({"Keys": [service, name], "Metrics": {"AmortizedCost": ce_money(cost * share)}})
+                groups.append({"Keys": [service, "On Demand Instances"], "Metrics": {"AmortizedCost": ce_money(cost * (1 - share))}})
+        results.append({"TimePeriod": {"Start": ce_date(days[0]), "End": ce_date(days[-1] + CE_DAY)},
+                        "Total": {} if keys else {"AmortizedCost": ce_money(total)}, "Groups": groups, "Estimated": days[-1] >= ce_day(time.time())})
+    out = {"ResultsByTime": results, "GroupDefinitions": body.get("GroupBy", []),
+           "DimensionValueAttributes": []}
+    if keys == ["SERVICE", "USAGE_TYPE"]:
+        # A long answer comes in two pages, as Cost Explorer splits them.
+        second = body.get("NextPageToken") == "page-2"
+        for r in results:
+            half = len(r["Groups"]) // 2
+            r["Groups"] = r["Groups"][half:] if second else r["Groups"][:half]
+        if not second:
+            out["NextPageToken"] = "page-2"
+    return out
+
+
+def ce_window_cost(service, body, scale):
+    return sum(c for u, _, q, r in CE_SERVICES.get(service, []) for d in ce_days(body) for _, c in [ce_cost(service, u, q, r, d, scale)])
+
+
+def cost_explorer_mock(op, body):
+    if op == "MockCallCount":
+        CE_CALLS["count"] -= 1
+        return dict(CE_CALLS)
+    if op == "GetCostAndUsage":
+        return ce_cost_and_usage(body)
+    if op == "GetCostForecast":
+        scale = ce_scale(body)
+        today = ce_day(time.time())
+        week = [sum(ce_cost(s, u, q, r, d, scale)[1] for s, usages in CE_SERVICES.items() for u, _, q, r in usages)
+                for d in range(today - 7 * CE_DAY, today, CE_DAY)]
+        days = (ce_parse(body["TimePeriod"]["End"]) - ce_parse(body["TimePeriod"]["Start"])) // CE_DAY
+        rest = sum(week) / len(week) * max(days, 1)
+        return {"Total": ce_money(rest), "ForecastResultsByTime": [{"TimePeriod": body["TimePeriod"], "MeanValue": f"{rest:.2f}"}]}
+    if op == "GetSavingsPlansCoverage":
+        scale = ce_scale(body)
+        out = []
+        for service, (share, kind) in CE_COVERED.items():
+            if kind != "Savings Plans":
+                continue
+            cost = ce_window_cost(service, body, scale)
+            out.append({"Attributes": {"SERVICE": service}, "TimePeriod": body["TimePeriod"],
+                        "Coverage": {"SpendCoveredBySavingsPlans": f"{cost * share:.2f}", "OnDemandCost": f"{cost * (1 - share):.2f}",
+                                     "TotalCost": f"{cost:.2f}", "CoveragePercentage": f"{share * 100:.0f}"}})
+        return {"SavingsPlansCoverages": out}
+    if op == "GetSavingsPlansUtilizationDetails":
+        total = 2.1 * 24 * 30
+        return {"SavingsPlansUtilizationDetails": [{
+            "SavingsPlanArn": CE_PLAN_ARN, "Attributes": {"savingsPlansType": "ComputeSavingsPlans"},
+            "Utilization": {"TotalCommitment": f"{total:.2f}", "UsedCommitment": f"{total * 0.97:.2f}",
+                            "UnusedCommitment": f"{total * 0.03:.2f}", "UtilizationPercentage": "97"},
+            "Savings": {"NetSavings": "410.10", "OnDemandCostEquivalent": "1876.50"}}],
+            "TimePeriod": body.get("TimePeriod")}
+    if op == "GetReservationUtilization":
+        start, end = body["TimePeriod"]["Start"], body["TimePeriod"]["End"]
+        hours = (ce_parse(end) - ce_parse(start)) / 3600
+
+        def ri(sub, instance_type, count, fee_hour, days_left):
+            purchased = hours * count
+            return {"Key": "SUBSCRIPTION_ID", "Value": sub,
+                    "Attributes": {"instanceType": instance_type, "numberOfInstances": str(count), "subscriptionStatus": "Active",
+                                   "endDateTime": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(T0 + days_left * CE_DAY))},
+                    "Utilization": {"UtilizationPercentage": "100" if days_left > 60 else "88", "PurchasedHours": f"{purchased:.0f}",
+                                    "TotalActualHours": f"{purchased:.0f}", "UnusedHours": "0" if days_left > 60 else f"{purchased * 0.12:.0f}",
+                                    "TotalAmortizedFee": f"{fee_hour * hours:.2f}"}}
+        groups = [ri("ri-0db6g", "db.r6g.xlarge", 2, 0.62, 80), ri("ri-0rs3x", "ra3.4xlarge", 4, 8.6, 45)]
+        return {"UtilizationsByTime": [{"TimePeriod": {"Start": start, "End": end}, "Groups": groups}]}
+    if op == "GetSavingsPlansPurchaseRecommendation":
+        return {"Metadata": {"RecommendationId": "rec-1", "GenerationTimestamp": ce_date(T0 - CE_DAY), "LookbackPeriodInDays": "THIRTY_DAYS"},
+                "SavingsPlansPurchaseRecommendation": {
+                    "AccountScope": body.get("AccountScope", "PAYER"), "SavingsPlansType": "COMPUTE_SP", "TermInYears": "ONE_YEAR",
+                    "PaymentOption": "NO_UPFRONT", "LookbackPeriodInDays": "THIRTY_DAYS",
+                    "SavingsPlansPurchaseRecommendationSummary": {
+                        "HourlyCommitmentToPurchase": "0.80", "EstimatedMonthlySavingsAmount": "140.25", "CurrencyCode": "USD",
+                        "EstimatedSavingsPercentage": "14.9", "TotalRecommendationCount": "1"}}}
+    raise KeyError(f"ValidationException: {op} is not in the mock yet")
+
+
 def cost_explorer(op, body):
     CE_CALLS["count"] += 1
     for hook in CE_HOOKS:
         out = hook(op, body)
         if out is not None:
             return out
-    raise KeyError(f"ValidationException: {op} is not in the mock yet")
+    return cost_explorer_mock(op, body)
 
 
 # ---- Savings Plans (restJson1, POST /DescribeSavingsPlans) ------------------------------------
@@ -4476,6 +4726,13 @@ def is_savingsplans(path):
 
 
 def savingsplans_rest(method, path, query, headers, body):
+    if method == "POST" and path.split("?")[0] == "/DescribeSavingsPlans":
+        plan = {"savingsPlanId": "sp-0a1b2c3d4e5f", "savingsPlanArn": CE_PLAN_ARN, "savingsPlanType": "Compute",
+                "commitment": "2.1", "currency": "USD", "state": "active", "paymentOption": "No Upfront",
+                "productTypes": ["EC2", "Fargate", "Lambda"],
+                "start": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(T0 - 225 * CE_DAY)),
+                "end": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(T0 + 140 * CE_DAY))}
+        return 200, {"content-type": "application/json"}, json.dumps({"savingsPlans": [plan]}).encode()
     data = json.dumps({"message": f"mock: no route for {method} {path}"}).encode()
     return 404, {"content-type": "application/json", "x-amzn-errortype": "ValidationException"}, data
 
@@ -4483,6 +4740,11 @@ def savingsplans_rest(method, path, query, headers, body):
 # ---- STS (awsQuery, Version 2011-06-15) ---------------------------------------------------------
 def sts(params):
     action = params.get("Action", [""])[0]
+    if action == "GetCallerIdentity":
+        return 200, ('<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><GetCallerIdentityResult>'
+                     f"<Arn>arn:aws:iam::{CE_DEFAULT_ACCOUNT}:user/demo</Arn><UserId>AIDAMOCK</UserId>"
+                     f"<Account>{CE_DEFAULT_ACCOUNT}</Account></GetCallerIdentityResult>"
+                     "<ResponseMetadata><RequestId>mock</RequestId></ResponseMetadata></GetCallerIdentityResponse>")
     return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
 
 

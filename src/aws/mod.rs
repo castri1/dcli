@@ -66,6 +66,10 @@ pub struct Aws {
 
 const MAX_ATTEMPTS: u32 = 4;
 
+/// Services that answer on one host whatever the region (`savingsplans.amazonaws.com`),
+/// signed for the client's region (us-east-1).
+const GLOBAL_ENDPOINTS: &[&str] = &["savingsplans"];
+
 impl Aws {
     pub fn new(profile: &str, region: &str) -> Arc<Aws> {
         Arc::new(Aws {
@@ -94,7 +98,11 @@ impl Aws {
             return (base, host);
         }
         let suffix = if self.region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
-        let host = format!("{}.{}.{suffix}", svc.endpoint, self.region);
+        let host = if GLOBAL_ENDPOINTS.contains(&svc.endpoint) {
+            format!("{}.{suffix}", svc.endpoint)
+        } else {
+            format!("{}.{}.{suffix}", svc.endpoint, self.region)
+        };
         (format!("https://{host}"), host)
     }
 
@@ -378,6 +386,18 @@ pub fn console_url(region: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_services_answer_on_one_host() {
+        if std::env::var_os("AWS_ENDPOINT_URL").is_some() {
+            return;
+        }
+        let aws = Aws::new("default", "us-east-1");
+        assert_eq!(aws.endpoint(&savingsplans::SERVICE).1, "savingsplans.amazonaws.com");
+        assert_eq!(aws.endpoint(&ce::SERVICE).1, "ce.us-east-1.amazonaws.com");
+        assert_eq!(aws.in_region("eu-west-1").endpoint(&sts::SERVICE).1, "sts.eu-west-1.amazonaws.com");
+        assert!(sts::is_account_id("123456789012") && !sts::is_account_id("12345678901") && !sts::is_account_id("12345678901x"));
+    }
 
     #[test]
     fn nulls_fall_back_to_defaults() {

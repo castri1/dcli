@@ -13,6 +13,7 @@
 
 #![allow(dead_code)] // used by the costs and savings work
 
+pub mod analysis;
 pub mod attribution;
 pub mod explorer;
 pub mod ledger;
@@ -45,6 +46,17 @@ pub struct Snapshot {
     pub coverage: Vec<Coverage>,
     pub commitments: Vec<Commitment>,
     pub recommendation: Option<Recommendation>,
+    /// Last month up to the same day: what this month so far compares with.
+    pub last_month_to_date: f64,
+    /// Who read it: `the management account (profile billing)`, `the environment's profile`.
+    pub reader: String,
+    /// Parts that could not be read, and why (no permission for coverage, say).
+    pub missing: Vec<String>,
+    /// Cost Explorer requests the reading took.
+    pub requests: u64,
+    /// The environment of the same account whose reading this one reuses (read minutes
+    /// before, so no request was made).
+    pub copied_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -53,6 +65,8 @@ pub struct ServiceCost {
     pub service: String,
     pub month_to_date: f64,
     pub last_month: f64,
+    /// Last month up to the same day.
+    pub last_month_to_date: f64,
     /// (day start, Unix seconds; cost), oldest first: the last 30 days or more.
     pub daily: Vec<(f64, f64)>,
 }
@@ -85,6 +99,8 @@ pub struct Coverage {
     pub covered: f64,
     /// What its usage outside any commitment cost over the last 30 days.
     pub on_demand_cost: f64,
+    /// `Savings Plans` or `reservations`.
+    pub by: String,
 }
 
 /// A Savings Plan or a reservation.
