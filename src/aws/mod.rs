@@ -66,6 +66,10 @@ pub struct Aws {
 
 const MAX_ATTEMPTS: u32 = 4;
 
+/// Services that answer on one host whatever the region (`savingsplans.amazonaws.com`),
+/// signed for the client's region (us-east-1).
+const GLOBAL_ENDPOINTS: &[&str] = &["savingsplans"];
+
 impl Aws {
     pub fn new(profile: &str, region: &str) -> Arc<Aws> {
         Arc::new(Aws {
@@ -94,7 +98,11 @@ impl Aws {
             return (base, host);
         }
         let suffix = if self.region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
-        let host = format!("{}.{}.{suffix}", svc.endpoint, self.region);
+        let host = if GLOBAL_ENDPOINTS.contains(&svc.endpoint) {
+            format!("{}.{suffix}", svc.endpoint)
+        } else {
+            format!("{}.{}.{suffix}", svc.endpoint, self.region)
+        };
         (format!("https://{host}"), host)
     }
 
