@@ -5,8 +5,9 @@ where, promote and rollback, an inbox of approvals), **CloudWatch** alarms, Logs
 Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke), **API
 Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **Aurora**
 (topology, performance, top SQL, failover), **Redshift** (nodes, queries, table health),
-**DMS** (tasks, tables, CDC latency), **EventBridge** and **AppConfig** feature flags, plus a
-**Savings** scan of what could cost less. Failures (pipelines, executions, functions, stacks,
+**DMS** (tasks, tables, CDC latency), **EventBridge** and **AppConfig** feature flags, plus
+**Costs** from Cost Explorer and a **Savings** scan of what could cost less, priced with your
+bill's own rates. Failures (pipelines, executions, functions, stacks,
 routes, migration tasks) and slow databases can be copied as Markdown reports for an AI agent.
 A single ~5 MB binary (about 2.5 MB to download) for macOS, Linux and Windows. No Node.js, no AWS
 SDK, no runtime.
@@ -138,9 +139,16 @@ dcli dms orders-cdc --tables --state error                        # also --metri
 dcli dms billing-cdc --resume                                     # also --stop
 dcli dms orders-cdc --reload errors                               # or schema.t1,schema.t2; alone: every table
 dcli dms --scale dms-prod-1 --class dms.r5.xlarge                 # also --instances, --endpoints, --test-endpoint
-dcli optimize                                                     # what could cost less (--json, --report)
+dcli optimize                                                     # what could cost less, in US$ once costs were read (--json, --report)
 dcli optimize --service lambda,logs --days 7
 dcli optimize --lambda-memory                                     # memory used vs assigned (Logs Insights; asks first)
+dcli optimize --by-cost                                           # the bill's usage types split over the resources behind them
+dcli optimize --ledger                                            # changes followed; --verify reads the bill a week later
+dcli costs --setup --profile billing                              # who reads costs: the management account's profile (or --own-profile)
+dcli costs prod --refresh                                         # read Cost Explorer (about 8 requests, each billed; asks first)
+dcli costs prod                                                   # from what was read: totals, services, cost after deploys
+dcli costs prod --usage lambda                                    # usage types and their effective rates (also --daily SERVICE)
+dcli costs prod --commitments                                     # Savings Plans, reservations, coverage, AWS's recommendation
 dcli update                # update dcli (npm installs update through npm); --check only tells
 ```
 
@@ -165,7 +173,8 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Matrix | `↑↓←→` move · `Enter` open the pipeline in that environment (or sign in) · `p` promote what the environment to the left runs · `R` roll back · `g` compare with the environment to the left · `r` refresh |
 | Approvals | `↑↓` move · `a` approve / reject (with a comment) · `Enter` open the pipeline (or sign in) · `o` open the approval's link · `r` refresh |
 | Alarms | `Enter` open the alarm's resource (Lambda, SQS, DynamoDB, Step Functions; switches environment) · `/` filter · `a` every environment / this one · `y` copy a Markdown summary · `o` console · `r` refresh · `PgUp/PgDn` scroll the detail |
-| Savings | `Enter`/`g` open the resource · `a` apply the fix (log retention, SQS long polling) · `m` Lambda memory analysis (tells the GB to scan first) · `s` filter by service · `i` filter by impact · `/` search · `c` copy the plan for AI · `y` copy the finding · `r` scan again · `PgUp/PgDn` scroll |
+| Costs | `←→` services / commitments · `↑↓` service · `Enter` its usage types (cost, quantity, effective rate) · `o` open the service's dcli module · `g` Savings for that service · `r` read again (says how many requests first) · `s` settings: reader profile, manual or daily · `c` copy the report for AI · `PgUp/PgDn` scroll |
+| Savings | `←→` findings / by cost / verified · `Enter`/`g` open the resource (By cost: its finding) · `a` apply the fix (log retention, SQS long polling) · `d` mark done (the bill is compared a week later) · `m` Lambda memory analysis (tells the GB to scan first) · `s` filter by service · `i` filter by impact · `/` search · `c` copy the plan for AI · `y` copy the finding · `r` scan again (By cost: split again) · `v` verify on the bill (1 Cost Explorer request each) · `x` stop following a change · `PgUp/PgDn` scroll |
 | Pipelines (logs) | `l` build log · `z` full screen · `g` compare the commits since the last success |
 | Full-screen logs | `/` search · `n`/`N` next/previous match · `e`/`E` next/previous error · `y` copy every line · `Esc` back. The mouse is left to the terminal: drag to select and copy |
 | Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name · `n` new parameter · `u` new value |
@@ -385,10 +394,41 @@ DMS replication instances with nothing running, oversized ones, Multi-AZ outside
 There are no prices in dcli: each finding says how much usage the change removes, in the
 unit AWS bills for it (GB-seconds, GB stored, requests, capacity-unit hours, instance hours),
 with the measurements behind it and what the estimate assumes; its impact (●●● high, ●●○
-medium, ●○○ low) comes from that volume. Log retention and SQS long polling can be applied
-from the module (`a`). `m` (or `M` on a function in Lambda) compares the memory functions use
-with what they have, read from their logs with Logs Insights; Insights is billed by the data
-it scans, so dcli tells you how much first. `c` copies the findings as a plan for an AI agent.
+medium, ●○○ low) comes from that volume. Once the Costs module has read the bill, findings
+also say what they save in dollars, at the rate your account actually pays for that usage
+type (its cost divided by what was used, discounts and commitments included), and are
+sorted by it. Usage that Savings Plans or reservations cover only saves when the commitment
+renews: the amount is split into what you save now and what you save then, with the date.
+
+Log retention and SQS long polling can be applied from the module (`a`); `d` marks a finding
+done when you changed it elsewhere (a function's memory in your code). Either way the change
+is followed: a week later `v` reads the bill for that usage type before and after it and
+says whether it saved what was expected (a usage type mixes resources, so other changes can
+weigh in). Aurora, Redshift and DMS changes made from dcli are followed too. The By cost tab
+splits the bill's most expensive usage types over the resources behind them, by what each
+used (functions by duration × memory, log groups by bytes ingested, clusters by node hours…),
+with each resource's findings beside it. `m` (or `M` on a function in Lambda) compares the
+memory functions use with what they have, read from their logs with Logs Insights; Insights is
+billed by the data it scans, so dcli tells you how much first. `c` copies the findings as a
+plan for an AI agent.
+
+### Costs
+
+The Costs module (and `dcli costs`) reads Cost Explorer: what the environment's account cost
+this month, against the same days of last month and the forecast; each service with its last
+30 days, its usage types and the effective rate of each; Savings Plans and reservations with
+their use, what went unused and how much of each service they cover; and AWS's purchase
+recommendation, next to a reminder to apply the Savings findings first (committing before
+optimizing pays for usage you were about to remove). A service whose daily cost rose after a
+deploy shows the deploys of that day (a correlation, not proof). Costs are amortized:
+commitments are spread over the usage they cover.
+
+Cost Explorer bills every request, so dcli never reads it on its own: `r` (or `dcli costs
+--refresh`) says how many requests it will make first (about 8), what was read is kept, and
+the requests of the month are counted. With AWS Organizations, set a profile in the management
+account once (`s`, or `dcli costs --setup --profile NAME`): it reads every account, and each
+environment shows its own account's costs. `--mode daily` reads again when the module opens or
+the command runs and what was read is more than a day old.
 
 ### Updates
 
@@ -438,7 +478,7 @@ src/
     codepipeline.rs codebuild.rs cloudformation.rs logs.rs ssm.rs secrets.rs lambda.rs
     s3.rs sfn.rs sqs.rs dynamodb.rs events.rs appconfig.rs apigateway.rs
     rds.rs pi.rs  Aurora (awsQuery) and Performance Insights
-    redshift.rs redshift_data.rs dms.rs
+    redshift.rs redshift_data.rs dms.rs ce.rs savingsplans.rs sts.rs
     xml.rs        reading awsQuery XML responses
     cloudwatch.rs alarms.rs metrics.rs   CloudWatch (awsQuery): alarms and GetMetricData
   tui/            app shell: header, module palette, environment, toasts, help, SSO login, event loop
@@ -449,12 +489,15 @@ src/
     chart.rs      terminal charts (metrics of Lambda, Alarms, API Gateway, Aurora)
     canvas.rs     box-drawing canvas for diagrams (Step Functions graph, Aurora topology)
   modules/        one file (or folder) per module: pipelines, matrix, approvals, alarms,
-                  savings, parameters, secrets, lambda, apigateway, cwlogs, cfn, s3, sfn,
+                  costs, savings, parameters, secrets, lambda, apigateway, cwlogs, cfn, s3, sfn,
                   sqs, dynamodb, aurora, redshift, dms, events, appconfig
   clicmd/         the commands of the newer modules (dcli s3, sfn, ddb, events, flags, lambda,
                   alarms, approvals, promote, rollback, sqs, insights, cfn, apigw, aurora,
-                  redshift, dms, optimize)
-  savings/        one check per service for the Savings module and `dcli optimize`
+                  redshift, dms, costs, optimize)
+  savings/        one check per service for the Savings module and `dcli optimize`, and their
+                  pricing with the bill's rates
+  costs/          Cost Explorer: reading (counted), settings, the cache, cost after deploys,
+                  costs split over resources, the changes followed and their verification
   catalog.rs      every resource of an environment by name, for the `:` search
   asl.rs          Amazon States Language: a state machine's definition arranged for its graph
   pipeline.rs     CodePipeline domain logic shared by the UI and the CLI
