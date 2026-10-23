@@ -2,7 +2,7 @@
 //! on-demand tables with steady traffic, and large, quiet tables for the Standard-IA class.
 //! Global secondary indexes have capacity of their own and are not counted.
 
-use super::{Finding, GB, Impact, MONTH, Scan, metric_data, par_map, peak, per_month, qty, query, query_id, size, total};
+use super::{Finding, GB, Impact, MONTH, Scan, billing, metric_data, par_map, peak, per_month, qty, query, query_id, size, total};
 use crate::aws::dynamodb::{self, TableDescription};
 use crate::aws::metrics::Series;
 use crate::aws::{self, Aws};
@@ -47,7 +47,7 @@ pub fn check(scan: &Scan) -> aws::Result<Vec<Finding>> {
         .collect())
 }
 
-fn all_tables(aws: &Aws) -> aws::Result<Vec<String>> {
+pub(crate) fn all_tables(aws: &Aws) -> aws::Result<Vec<String>> {
     let mut all = Vec::new();
     let mut start: Option<String> = None;
     loop {
@@ -114,6 +114,8 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                     Impact::of(hours, UNIT_HOURS_MEDIUM, UNIT_HOURS_HIGH),
                 )
                 .score(hours / UNIT_HOURS_HIGH)
+                .billed(billing::DDB_RCU_HOURS, unit_hours(rcu))
+                .billed(billing::DDB_WCU_HOURS, unit_hours(wcu))
                 .evidence(format!("ConsumedRead/WriteCapacityUnits: none in {days} days"))
                 .evidence(format!("{} stored", size(stored)))
                 .caveat("Tables used rarely (a yearly job, a disaster-recovery copy) look unused in a short window."),
@@ -128,6 +130,7 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                     Impact::of(stored, IA_MEDIUM, IA_HIGH),
                 )
                 .score(stored / IA_HIGH)
+                .billed(storage_usage(t), stored / GB)
                 .evidence(format!("ConsumedRead/WriteCapacityUnits: none in {days} days"))
                 .caveat("Tables used rarely (a yearly job, a disaster-recovery copy) look unused in a short window."),
             ];
@@ -153,6 +156,8 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                     Impact::of(hours, UNIT_HOURS_MEDIUM, UNIT_HOURS_HIGH),
                 )
                 .score(hours / UNIT_HOURS_HIGH)
+                .billed(billing::DDB_RCU_HOURS, unit_hours(rcu - new_rcu))
+                .billed(billing::DDB_WCU_HOURS, unit_hours(wcu - new_wcu))
                 .evidence(traffic.clone())
                 .evidence("the suggestion keeps half again the busiest hour's average")
                 .caveat("Peaks within an hour are higher than its average: watch throttling after the change.")
@@ -188,11 +193,17 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                 Impact::of(stored, IA_MEDIUM, IA_HIGH),
             )
             .score(stored / IA_HIGH)
+            .billed_instead(billing::DDB_STORAGE, billing::DDB_STORAGE_IA, stored / GB)
             .evidence(traffic)
             .caveat("Standard-IA bills storage for less and reads and writes for more: it pays off only while storage dominates."),
         );
     }
     found
+}
+
+/// The usage type a table's storage is billed as, by its table class.
+fn storage_usage(t: &TableDescription) -> &'static str {
+    if t.table_class() == "STANDARD_INFREQUENT_ACCESS" { billing::DDB_STORAGE_IA } else { billing::DDB_STORAGE }
 }
 
 /// `0.4`, `12`, `1.5 k` (units per second).
@@ -227,6 +238,8 @@ mod tests {
         // 931 units removed × 730.5 hours.
         assert_eq!(found[0].reduction, "−470 RCU and −461 WCU (680 k capacity-unit hours a month)");
         assert_eq!(found[0].impact, Impact::High);
+        let billed: Vec<(&str, f64)> = found[0].billed.iter().map(|b| (b.usage.as_str(), b.quantity.round())).collect();
+        assert_eq!(billed, [("ReadCapacityUnit-Hrs", 343_335.0), ("WriteCapacityUnit-Hrs", 336_761.0)]);
         // Capacity used at more than half is left alone.
         assert!(table_findings(&table("busy", false, 30, 30, 1.0), &traffic(10.0, 15.0, 14), &traffic(10.0, 15.0, 14), 14).is_empty());
     }

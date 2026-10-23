@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 
-use super::{Finding, Impact, Scan, metric_data, par_map, peak, per_month, qty, query, query_id, total};
+use super::{Finding, Impact, Scan, billing, metric_data, par_map, peak, per_month, qty, query, query_id, total};
 use crate::aws::sfn::{self, StateMachine};
 use crate::aws::{self, metrics::Series};
 use crate::tui::chart::fmt_ms;
@@ -72,7 +72,7 @@ impl Runs {
 }
 
 /// States of a definition, those inside Map and Parallel states included.
-fn count_states(v: &Value) -> usize {
+pub(crate) fn count_states(v: &Value) -> usize {
     match v {
         Value::Object(map) => {
             let own = map.get("States").and_then(Value::as_object).map_or(0, |s| s.len());
@@ -110,6 +110,7 @@ fn express_candidate(m: &StateMachine, r: &Runs, definition: &str, days: u32) ->
             Impact::of(transitions, TRANSITIONS_MEDIUM, TRANSITIONS_HIGH),
         )
         .score(transitions / TRANSITIONS_HIGH)
+        .billed_at_most(billing::SFN_TRANSITIONS, transitions)
         .evidence(format!("{} executions started in {days} days (ExecutionsStarted)", qty(r.executions)))
         .evidence(format!("{states} states in the definition; no .sync or callback tasks"))
         .caveat("Express runs at least once (asynchronous) or at most once (synchronous), not exactly once: tasks must tolerate it.")

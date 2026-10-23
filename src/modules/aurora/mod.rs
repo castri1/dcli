@@ -603,6 +603,7 @@ impl Aurora {
         match result {
             Ok(()) => {
                 self.dialog = None;
+                crate::costs::ledger::note_aurora(&self.env_name, &self.region, &self.inventory, &action);
                 ctx.toast(Level::Success, action.accepted());
                 self.watch_until = Some(Instant::now() + WATCH_AFTER_CHANGE);
                 // The change shows in the events too.

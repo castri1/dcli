@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{Finding, Impact, Scan, qty};
+use super::{Finding, Impact, Scan, billing, qty};
 use crate::aws::apigateway::{self as apigw, Api, ApiDetail, Integration};
 use crate::aws::metrics::{self, Query};
 use crate::aws::{self, Aws};
@@ -190,6 +190,7 @@ fn http_candidate(
         format!("{} requests a month billed at the REST API rate", qty(monthly)),
         requests_impact(monthly),
     )
+    .billed_instead(billing::APIGW_REST, billing::APIGW_HTTP, monthly)
     .evidence(format!(
         "{} requests in the last {} days on stage{} {}",
         qty(requests),
@@ -201,7 +202,7 @@ fn http_candidate(
         "Checked: regional endpoint, no resource policy, API keys, usage plans, request validators, mapping templates, \
          mock or AWS service integrations, TOKEN authorizers, cache, WAF, canary, X-Ray or client certificates",
     )
-    .caveat("dcli has no prices: compare the REST and HTTP API request prices for your region")
+    .caveat("dcli keeps no prices: with the account's costs read, the dollars compare the two rates on your bill (when it has both)")
     .caveat("Some behaviour differs (payload format, error responses, CORS, binary media): try the HTTP API in dev first")
     .caveat("Clients call a new endpoint unless a custom domain moves with the API");
     if plans.is_none() {
@@ -260,6 +261,7 @@ fn caches(scan: &Scan, api: &Api, detail: &ApiDetail, usage: &HashMap<(String, S
                 format!("a {size} GB cache running all month (about 730 cache-hours)"),
                 cache_impact(gb, wasted),
             )
+            .billed(&billing::apigw_cache(size), 730.0)
             .evidence(format!(
                 "Last {} days: {} requests, {} cache hits, {} misses · cache status {}",
                 scan.days,
@@ -374,6 +376,7 @@ mod tests {
         let f = http_candidate(&scan, &api("REGIONAL"), &d, Some(&[]), &usage).unwrap();
         assert_eq!(f.impact, Impact::High);
         assert_eq!(f.reduction, "15 M requests a month billed at the REST API rate");
+        assert_eq!((f.billed[0].usage.as_str(), f.billed[0].instead.as_deref()), ("ApiGatewayRequest", Some("ApiGatewayHttpRequest")));
         assert!(!f.reduction.contains('$') && !f.summary.contains('%'));
         let f = http_candidate(&scan, &api("REGIONAL"), &d, None, &usage).unwrap();
         assert!(f.caveats.iter().any(|c| c.contains("Usage plans could not be read")));

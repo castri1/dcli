@@ -4596,6 +4596,61 @@ class H(BaseHTTPRequestHandler):
             self.reply(400, {"__type": f"com.amazon.coral#{code}", "message": f"{target}: {e!r}"})
 
 
+# ---- Savings: the bill's daily cost of usage types, for verifying changes ------------------------
+# dcli asks GetCostAndUsage DAILY, filtered by SERVICE, grouped by USAGE_TYPE. Costs a day per
+# usage type; those in SAVINGS_DROP fell to a share of it nine days ago (a change that saved).
+SAVINGS_DAILY = {
+    "AWS Lambda": {"Lambda-GB-Second": 25.5, "Lambda-GB-Second-ARM": 1.8, "Request": 0.27},
+    "AmazonCloudWatch": {"DataProcessing-Bytes": 13.3, "TimedStorage-ByteHrs": 1.6, "CW:AlarmMonitorUsage": 0.13},
+    "Amazon Simple Queue Service": {"Requests-Tier1": 0.8, "Requests-FIFO-Tier1": 0.17},
+    "Amazon Relational Database Service": {"InstanceUsage:db.r6g.xlarge": 24.9, "InstanceUsage:db.r5.large": 13.9},
+    "Amazon Redshift": {"Node:ra3.xlplus": 52.1, "Node:ra3.4xlarge": 782.4},
+    "AWS Database Migration Service": {"InstanceUsg:dms.r5.2xlarge": 23.0, "Multi-AZUsg:dms.r5.2xlarge": 23.0},
+}
+SAVINGS_DROP = {"DataProcessing-Bytes": 0.55, "TimedStorage-ByteHrs": 0.7, "Requests-Tier1": 0.2, "Node:ra3.xlplus": 0.35,
+                "Lambda-GB-Second": 0.9}
+SAVINGS_CHANGE = time.time() - 9 * 86400
+
+
+def _ce_day(text):
+    return calendar.timegm(time.strptime(text, "%Y-%m-%d"))
+
+
+def _ce_service(flt):
+    """The SERVICE a Cost Explorer filter names, inside an And or alone."""
+    if not isinstance(flt, dict):
+        return None
+    for part in flt.get("And", [flt]):
+        d = part.get("Dimensions", {})
+        if d.get("Key") == "SERVICE" and d.get("Values"):
+            return d["Values"][0]
+    return None
+
+
+def savings_cost_history(op, body):
+    by_usage = [g.get("Key") for g in body.get("GroupBy", [])] == ["USAGE_TYPE"]
+    service = _ce_service(body.get("Filter"))
+    if op != "GetCostAndUsage" or body.get("Granularity") != "DAILY" or not by_usage or service is None:
+        return None
+    start, end = _ce_day(body["TimePeriod"]["Start"]), _ce_day(body["TimePeriod"]["End"])
+    results, day = [], start
+    while day < end:
+        groups = []
+        for usage, cost in SAVINGS_DAILY.get(service, {}).items():
+            if day >= SAVINGS_CHANGE - 86400 and usage in SAVINGS_DROP:
+                cost *= SAVINGS_DROP[usage]
+            wobble = 1 + 0.04 * math.sin(day / 86400)
+            groups.append({"Keys": [usage], "Metrics": {"AmortizedCost": {"Amount": f"{cost * wobble:.4f}", "Unit": "USD"}}})
+        results.append({"TimePeriod": {"Start": time.strftime("%Y-%m-%d", time.gmtime(day)),
+                                       "End": time.strftime("%Y-%m-%d", time.gmtime(day + 86400))},
+                        "Total": {}, "Groups": groups, "Estimated": day > time.time() - 2 * 86400})
+        day += 86400
+    return {"ResultsByTime": results, "DimensionValueAttributes": [], "GroupDefinitions": body.get("GroupBy", [])}
+
+
+CE_HOOKS.append(savings_cost_history)
+
+
 if __name__ == "__main__":
     port = int(sys.argv[1])
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::{Finding, Impact, Scan, per_month, qty};
+use super::{Finding, Impact, Scan, billing, per_month, qty};
 use crate::aws::rds::Metrics;
 use crate::aws::redshift::{self, Cluster, MetricDef, Scope, Unit, Want};
 use crate::aws;
@@ -148,6 +148,7 @@ fn idle(c: &Cluster, m: &Metrics, days: u32) -> Option<(f64, Finding)> {
             by_node_hours(hours).max(Impact::Medium),
         )
         .score(hours)
+        .billed(&billing::redshift_node(&c.node_type), hours)
     } else {
         let hours = nodes * MONTH_HOURS * share;
         Finding::new(
@@ -160,6 +161,7 @@ fn idle(c: &Cluster, m: &Metrics, days: u32) -> Option<(f64, Finding)> {
             by_node_hours(hours),
         )
         .score(hours)
+        .billed(&billing::redshift_node(&c.node_type), hours)
     };
     let mut f = f;
     for e in evidence {
@@ -231,6 +233,7 @@ fn spare_nodes(c: &Cluster, hourly: &Metrics, daily: &Metrics) -> Option<Finding
         by_node_hours(hours),
     )
     .score(hours)
+    .billed(&billing::redshift_node(&c.node_type), hours)
     .evidence(format!("highest hourly CPU in the window: {cpu:.0}%"))
     .evidence(format!("highest daily disk use: {disk:.0}%"))
     .evidence(format!("on {needed:.0} nodes those would be about {:.0}% and {:.0}%", cpu * nodes / needed, disk * nodes / needed))

@@ -1,6 +1,6 @@
 //! CloudWatch Logs: log groups kept forever, by size, and the groups that ingest the most.
 
-use super::{Finding, Fix, GB, Impact, Scan, metric_data, per_month, query, query_id, size, total};
+use super::{Finding, Fix, GB, Impact, Scan, billing, metric_data, per_month, query, query_id, size, total};
 use crate::aws::logs::{self, LogGroup};
 use crate::aws::{self, Aws};
 use crate::util::fmt_ago;
@@ -30,7 +30,7 @@ pub fn check(scan: &Scan) -> aws::Result<Vec<Finding>> {
     Ok(found)
 }
 
-fn all_groups(aws: &Aws) -> aws::Result<Vec<LogGroup>> {
+pub(crate) fn all_groups(aws: &Aws) -> aws::Result<Vec<LogGroup>> {
     let mut all = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -79,6 +79,7 @@ fn forever(groups: &[LogGroup], ingested: &[f64], days: u32) -> Vec<Finding> {
             Impact::of(stored(g), STORED_MEDIUM, STORED_HIGH),
         )
         .score(stored(g) / STORED_HIGH)
+        .billed_at_most(billing::LOGS_STORED, stored(g) / GB)
         .evidence(format!("stored {} (compressed), no retention", size(stored(g))))
         .evidence(format!("received {} in the last {days} days", size(received)))
         .caveat("Deleted events cannot be recovered: export to S3 first what must be kept.")
@@ -103,6 +104,7 @@ fn forever(groups: &[LogGroup], ingested: &[f64], days: u32) -> Vec<Finding> {
             Impact::of(sum, STORED_MEDIUM, STORED_HIGH),
         )
         .score(sum / STORED_HIGH)
+        .billed_at_most(billing::LOGS_STORED, sum / GB)
         .caveat("Deleted events cannot be recovered: export to S3 first what must be kept.");
         for g in small.iter().take(NAMED) {
             finding = finding.evidence(format!("{} — {}", g.log_group_name, size(stored(g))));
@@ -134,6 +136,7 @@ fn ingesters(groups: &[LogGroup], ingested: &[f64], days: u32) -> Vec<Finding> {
                 Impact::of(monthly, INGESTED_MEDIUM, INGESTED_HIGH),
             )
             .score(monthly / INGESTED_HIGH)
+            .billed_at_most(billing::LOGS_INGESTED, monthly / GB)
             .evidence(format!("received {} in the last {days} days (IncomingBytes)", size(monthly / per_month(days))))
             .evidence(format!("{retention}, {} stored", size(stored(g))))
             .caveat("Ingestion is billed per GB received: only logging less lowers it.")
