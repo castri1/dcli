@@ -4456,10 +4456,17 @@ def rs_result(st):
 
 # ---- Cost Explorer (awsJson1_1, X-Amz-Target AWSInsightsIndexService.*) -----------------------
 CE_CALLS = {"count": 0}
+# Handlers of other sections, tried first: hook(op, body) returns a response or None (not
+# theirs). The savings work appends one for the cost history its verifications read.
+CE_HOOKS = []
 
 
 def cost_explorer(op, body):
     CE_CALLS["count"] += 1
+    for hook in CE_HOOKS:
+        out = hook(op, body)
+        if out is not None:
+            return out
     raise KeyError(f"ValidationException: {op} is not in the mock yet")
 
 
