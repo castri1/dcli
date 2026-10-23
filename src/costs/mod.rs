@@ -14,7 +14,10 @@
 #![allow(dead_code)] // used by the costs and savings work
 
 pub mod attribution;
+pub mod explorer;
 pub mod ledger;
+pub mod services;
+pub mod settings;
 
 use std::path::PathBuf;
 
