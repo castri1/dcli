@@ -268,7 +268,7 @@ fn print_ledger(env: &str, json: bool) -> Result<ExitCode> {
     for e in &entries {
         let status = ledger::status(e, now);
         let result = match &e.verified {
-            Some(v) => format!("{} · {} a month", status.label(), money(v.saved_monthly(), &e.currency)),
+            Some(v) => format!("{} · {}", status.label(), v.difference(&e.currency)),
             None => status.label(),
         };
         let expected = e.expected.map(|x| format!("expected ≈ {}/mo", money(x, &e.currency))).unwrap_or_else(|| "not priced".into());
@@ -295,10 +295,14 @@ fn verify(aws: &Aws, env: &str, yes: bool, json: bool) -> Result<ExitCode> {
     let (n, s) = (ready.len(), if ready.len() == 1 { "" } else { "s" });
     if !yes {
         if !interactive() {
-            bail!("pass --yes to read the bill for {n} change{s} ({n} Cost Explorer request{s}, each billed)");
+            bail!(
+                "pass --yes to read the bill for {n} change{s} ({n} Cost Explorer request{s}, up to {} each if paged; each billed)",
+                ledger::VERIFY_PAGES
+            );
         }
         let question = format!(
-            "Read the bill for {n} change{s}? {n} Cost Explorer request{s} (AWS bills each one; {} this month so far)",
+            "Read the bill for {n} change{s}? {n} Cost Explorer request{s}, up to {} each if the answer comes in pages (AWS bills each one; {} this month so far)",
+            ledger::VERIFY_PAGES,
             costs::settings::requests_this_month()
         );
         if !confirm(&question) {
@@ -308,7 +312,7 @@ fn verify(aws: &Aws, env: &str, yes: bool, json: bool) -> Result<ExitCode> {
     for mut e in ready {
         match ledger::verify(aws, &e, now) {
             Ok(v) => {
-                e.verified = Some(v);
+                ledger::verified(&mut e, v);
                 ledger::put(e.clone())?;
             }
             Err(err) => eprintln!("{}", paint(&format!("! {}: {}", sanitize(&e.what), err.short()), "33")),

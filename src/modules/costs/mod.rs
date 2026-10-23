@@ -16,7 +16,7 @@ use ratatui::widgets::ListState;
 use crate::aws::profile::AwsFiles;
 use crate::aws::{self, AwsError};
 use crate::costs::analysis::{self, Deploy, Step};
-use crate::costs::explorer::{self, REQUESTS};
+use crate::costs::explorer;
 use crate::costs::settings::{self, Refresh};
 use crate::costs::{self, ServiceCost, Snapshot, UsageCost, services};
 use crate::tui::form::{Field, Form, FormEvent};
@@ -24,8 +24,6 @@ use crate::tui::module::{Ctx, Emitter, Handled, Level, Module, Payload, View};
 use crate::util::now_secs;
 
 const DAY: f64 = 86_400.0;
-/// In daily mode, a reading older than this is read again when the module opens.
-const DAILY: f64 = DAY;
 /// Days of deploys looked at: as far back as the daily costs go.
 const DEPLOY_DAYS: f64 = 62.0;
 
@@ -202,18 +200,14 @@ impl Costs {
 
     // ---- reading ---------------------------------------------------------------------------
 
-    fn stale(&self) -> bool {
-        self.snapshot.as_ref().is_none_or(|s| now_secs() - s.read_at >= DAILY)
-    }
-
     fn start_read(&mut self, ctx: &mut Ctx, auto: bool) {
-        if self.reading.is_some() {
+        if self.reading.is_some() || explorer::is_reading(&self.env) {
             return ctx.toast(Level::Info, "Already reading the costs");
         }
         self.reading = Some("starting".into());
         self.error = None;
         if auto {
-            ctx.toast(Level::Info, format!("Reading the costs of {} (once a day): about {REQUESTS} Cost Explorer requests", self.env));
+            ctx.toast(Level::Info, format!("Reading the costs of {} (once a day): {} to Cost Explorer", self.env, explorer::requests_text(&self.env)));
         }
         let env = ctx.env();
         ctx.spawn_stream(move |em: Emitter<Msg>| {
@@ -298,13 +292,15 @@ impl Costs {
         if !profile.is_empty() && !AwsFiles::load().profile_names().contains(&profile) {
             return form.fail(format!("No profile named '{profile}' in ~/.aws/config"));
         }
-        let mut s = settings::load();
-        let changed = s.reader().unwrap_or("") != profile;
-        s.profile = (!profile.is_empty()).then_some(profile);
-        s.refresh = if form.get("Read") == READ_CHOICES[1] { Refresh::Daily } else { Refresh::Manual };
-        if let Err(e) = settings::save(&s) {
-            return form.fail(format!("Could not save the settings: {e}"));
-        }
+        let changed = settings::load().reader().unwrap_or("") != profile;
+        let refresh = if form.get("Read") == READ_CHOICES[1] { Refresh::Daily } else { Refresh::Manual };
+        let s = match settings::update(|s| {
+            s.profile = (!profile.is_empty()).then_some(profile);
+            s.refresh = refresh;
+        }) {
+            Ok(s) => s,
+            Err(e) => return form.fail(format!("Could not save the settings: {e}")),
+        };
         self.dialog = None;
         ctx.toast(Level::Success, format!("Costs are read by {}", explorer::reader_label(&s)));
         if self.snapshot.is_none() || changed {
@@ -318,7 +314,7 @@ impl Costs {
             format!("Read the costs of {}", self.env),
             vec![
                 Field::fixed("Reader", explorer::reader_label(&s)),
-                Field::fixed("Requests", format!("about {REQUESTS} to Cost Explorer (more when an answer comes in pages)")),
+                Field::fixed("Requests", format!("{} to Cost Explorer (more when an answer comes in pages)", explorer::requests_text(&self.env))),
                 Field::fixed("This month", format!("{} requests so far", settings::requests_this_month())),
             ],
         )
@@ -403,7 +399,11 @@ impl Module for Costs {
             self.dialog = Some(Dialog::Setup(Costs::setup_form()));
             return;
         }
-        if settings::load().refresh == Refresh::Daily && self.stale() {
+        // Once a day: not while a reading of this environment runs (one started before the
+        // environment was switched and back, say), and not again soon after an attempt.
+        let read_at = self.snapshot.as_ref().map(|s| s.read_at);
+        if !explorer::is_reading(&self.env) && settings::daily_due(&self.env, read_at, now_secs()) {
+            settings::daily_attempted(&self.env, now_secs());
             self.start_read(ctx, true);
         }
         if self.snapshot.is_some() && self.deploys.is_none() && !self.deploys_loading {

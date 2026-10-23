@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Snapshot {
+    /// The dcli environment it was read for: a cache file only serves that one.
+    pub env: String,
     /// The environment's AWS account id.
     pub account: String,
     /// Unix seconds when it was read.
@@ -46,7 +48,9 @@ pub struct Snapshot {
     pub coverage: Vec<Coverage>,
     pub commitments: Vec<Commitment>,
     pub recommendation: Option<Recommendation>,
-    /// Last month up to the same day: what this month so far compares with.
+    /// This month's complete days (today, still being counted, left out), and last month's
+    /// same number of days: what compares fairly (both 0 on the 1st).
+    pub month_to_date_complete: f64,
     pub last_month_to_date: f64,
     /// Who read it: `the management account (profile billing)`, `the environment's profile`.
     pub reader: String,
@@ -65,7 +69,8 @@ pub struct ServiceCost {
     pub service: String,
     pub month_to_date: f64,
     pub last_month: f64,
-    /// Last month up to the same day.
+    /// This month's complete days, and last month's same number of days.
+    pub month_to_date_complete: f64,
     pub last_month_to_date: f64,
     /// (day start, Unix seconds; cost), oldest first: the last 30 days or more.
     pub daily: Vec<(f64, f64)>,
@@ -166,22 +171,76 @@ pub fn usage_is(usage_type: &str, name: &str) -> bool {
     usage_type == name || usage_type.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('-') && !prefix[..prefix.len() - 1].contains('-'))
 }
 
-/// `~/.deployment-cli/cache/costs-<env>.json`.
+/// `~/.deployment-cli/cache/costs-<env>.json`, the name escaped so that two environments never
+/// share a file (`prod.eu` → `prod%2Eeu`).
 pub fn cache_path(env: &str) -> Option<PathBuf> {
-    let name: String = env.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' }).collect();
-    Some(crate::util::home_dir()?.join(".deployment-cli").join("cache").join(format!("costs-{name}.json")))
+    Some(crate::util::home_dir()?.join(".deployment-cli").join("cache").join(format!("costs-{}.json", file_name(env))))
+}
+
+/// `env` with every byte but ASCII letters, digits, `-` and `_` written `%XX`: reversible, so
+/// distinct names stay distinct.
+fn file_name(env: &str) -> String {
+    let mut out = String::new();
+    for b in env.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// What was last read for `env`, if anything.
 pub fn cached(env: &str) -> Option<Snapshot> {
     let text = std::fs::read_to_string(cache_path(env)?).ok()?;
-    serde_json::from_str(&text).ok()
+    parse(&text).filter(|s| s.env == env)
+}
+
+/// A snapshot from disk, its figures checked: a damaged or edited file cannot make dcli draw
+/// endless bars or walk years of days.
+pub fn parse(text: &str) -> Option<Snapshot> {
+    let mut s: Snapshot = serde_json::from_str(text).ok()?;
+    if !s.read_at.is_finite() || s.read_at <= 0.0 {
+        return None;
+    }
+    let fix = |v: &mut f64| {
+        if !v.is_finite() {
+            *v = 0.0;
+        }
+    };
+    for v in [&mut s.month_to_date, &mut s.last_month, &mut s.month_to_date_complete, &mut s.last_month_to_date] {
+        fix(v);
+    }
+    s.forecast = s.forecast.filter(|f| f.is_finite());
+    // Days within a reading's reach: a little over two months before it.
+    let (from, to) = (s.read_at - 75.0 * 86_400.0, s.read_at + 86_400.0);
+    for svc in &mut s.services {
+        for v in [&mut svc.month_to_date, &mut svc.last_month, &mut svc.month_to_date_complete, &mut svc.last_month_to_date] {
+            fix(v);
+        }
+        svc.daily.retain(|(t, c)| t.is_finite() && c.is_finite() && *t >= from && *t <= to);
+        svc.daily.truncate(80);
+    }
+    s.usage.retain(|u| u.cost.is_finite() && u.quantity.is_finite());
+    for c in &mut s.coverage {
+        c.covered = if c.covered.is_finite() { c.covered.clamp(0.0, 1.0) } else { 0.0 };
+        fix(&mut c.on_demand_cost);
+    }
+    for c in &mut s.commitments {
+        fix(&mut c.hourly);
+        c.utilization = c.utilization.filter(|u| u.is_finite()).map(|u| u.clamp(0.0, 1.0));
+        c.unused_cost = c.unused_cost.filter(|u| u.is_finite());
+        c.end = c.end.filter(|e| e.is_finite());
+    }
+    Some(s)
 }
 
 /// Keeps `snapshot` as `env`'s costs (a private file: costs are not for every local user).
 pub fn save(env: &str, snapshot: &Snapshot) -> std::io::Result<()> {
     let path = cache_path(env).ok_or_else(|| std::io::Error::other("cannot find the home directory"))?;
-    crate::platform::write_private(&path, serde_json::to_string(snapshot).unwrap_or_default().as_bytes())
+    let kept = Snapshot { env: env.to_string(), ..snapshot.clone() };
+    crate::platform::write_private(&path, serde_json::to_string(&kept).unwrap_or_default().as_bytes())
 }
 
 #[cfg(test)]
@@ -212,5 +271,29 @@ mod tests {
         assert!(s.rate("Amazon DynamoDB", "Lambda-GB-Second").is_none());
         assert!(usage_is("APN1-TimedStorage-ByteHrs", "TimedStorage-ByteHrs"));
         assert!(!usage_is("USE1-Other-TimedStorage-ByteHrs", "TimedStorage-ByteHrs"));
+    }
+
+    #[test]
+    fn cache_names_never_collide_and_files_are_checked() {
+        assert_eq!(file_name("prod-eu_1"), "prod-eu_1");
+        assert_eq!(file_name("prod.eu"), "prod%2Eeu");
+        assert_ne!(file_name("prod.eu"), file_name("prod_eu"));
+        assert_ne!(file_name("a%2E"), file_name("a."));
+        assert!(!file_name("x/y\\z").contains(['/', '\\']));
+
+        let read_at = 1_790_000_000.0;
+        let text = serde_json::json!({
+            "env": "dev", "readAt": read_at, "monthToDate": 10.0,
+            "services": [{ "service": "AWS Lambda", "daily": [[read_at - 86_400.0, 1.0], [0.0, 5.0], [read_at + 9e9, 2.0]] }],
+            "coverage": [{ "service": "AWS Lambda", "covered": 7.5 }],
+            "commitments": [{ "kind": "x", "utilization": -3.0 }],
+        })
+        .to_string();
+        let s = parse(&text).unwrap();
+        assert_eq!(s.services[0].daily, [(read_at - 86_400.0, 1.0)], "days far from the reading are dropped");
+        assert_eq!(s.coverage[0].covered, 1.0);
+        assert_eq!(s.commitments[0].utilization, Some(0.0));
+        assert!(parse(r#"{"env":"dev","readAt":-1}"#).is_none());
+        assert!(parse("not json").is_none());
     }
 }

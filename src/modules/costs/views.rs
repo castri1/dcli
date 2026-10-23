@@ -9,7 +9,7 @@ use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 
 use super::{Costs, Dialog, Row, Tab};
 use crate::costs::analysis::{Deploy, change, money, rate};
-use crate::costs::explorer::REQUESTS;
+use crate::costs::explorer;
 use crate::costs::{ServiceCost, Snapshot, UsageCost, services, settings};
 use crate::savings::qty;
 use crate::tui::chart::{Agg, Chart, columns, fmt_count, sparkline};
@@ -91,11 +91,15 @@ fn totals(s: &Snapshot, full: bool) -> Line<'static> {
         Span::styled(format!(" {} to the {}  ", month_name(s.read_at), ordinal(day)), theme::muted()),
         Span::styled(money(s.month_to_date, c), theme::bold()),
     ];
-    if let Some(ch) = change(s.month_to_date, s.last_month_to_date) {
-        let color = if s.month_to_date > s.last_month_to_date * 1.05 { theme::WARN } else { theme::OK };
+    // Complete days on both sides: today is still being counted (nothing to compare on the 1st).
+    if let Some(ch) = change(s.month_to_date_complete, s.last_month_to_date) {
+        let color = if s.month_to_date_complete > s.last_month_to_date * 1.05 { theme::WARN } else { theme::OK };
         spans.push(Span::styled(format!("  {ch}"), Style::new().fg(color)));
         if full {
-            spans.push(Span::styled(format!(" vs the same days of {} ({})", month_name(last), money(s.last_month_to_date, c)), theme::muted()));
+            spans.push(Span::styled(
+                format!(" to yesterday vs the same days of {} ({})", month_name(last), money(s.last_month_to_date, c)),
+                theme::muted(),
+            ));
         }
     }
     spans.push(Span::styled(format!(" · {} ", month_name(last)), theme::muted()));
@@ -128,7 +132,7 @@ fn empty(m: &Costs, f: &mut Frame, area: Rect) {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled("r", theme::key()),
-            Span::raw(format!(" reads them from Cost Explorer: about {REQUESTS} requests, which AWS bills. What is read is kept.")),
+            Span::raw(format!(" reads them from Cost Explorer: {}, which AWS bills. What is read is kept.", explorer::requests_text(&m.env))),
         ]));
         lines.push(Line::from(vec![
             Span::styled("s", theme::key()),
@@ -193,8 +197,9 @@ fn services_table(m: &mut Costs, f: &mut Frame, area: Rect) {
                 let stepped = m.step_of(&svc.service).is_some();
                 let name = ellipsize(&svc.service, name_w.saturating_sub(if stepped { 2 } else { 0 }));
                 let values = columns(&svc.daily, (now - 30.0 * DAY, now), spark_w, Agg::Sum);
-                let ch = change(svc.month_to_date, svc.last_month_to_date).unwrap_or_default();
-                let ch_color = if svc.month_to_date > svc.last_month_to_date * 1.1 && svc.last_month_to_date > 0.0 { theme::WARN } else { theme::MUTED };
+                let ch = change(svc.month_to_date_complete, svc.last_month_to_date).unwrap_or_default();
+                let ch_color =
+                    if svc.month_to_date_complete > svc.last_month_to_date * 1.1 && svc.last_month_to_date > 0.0 { theme::WARN } else { theme::MUTED };
                 let mut spans = vec![Span::styled(format!("{marker} "), theme::muted()), Span::raw(name.clone())];
                 if stepped {
                     spans.push(Span::styled(" ▲", Style::new().fg(theme::WARN)));
@@ -228,8 +233,8 @@ fn service_detail(m: &Costs, s: &Snapshot, svc: &ServiceCost, width: usize) -> V
     let c = s.currency.as_str();
     let kw = 12;
     let mut lines = Vec::new();
-    let vs = change(svc.month_to_date, svc.last_month_to_date)
-        .map(|ch| format!("  {ch} vs the same days of last month ({})", money(svc.last_month_to_date, c)))
+    let vs = change(svc.month_to_date_complete, svc.last_month_to_date)
+        .map(|ch| format!("  {ch} to yesterday vs the same days of last month ({})", money(svc.last_month_to_date, c)))
         .unwrap_or_default();
     lines.push(widgets::kv("This month", Span::styled(format!("{}{vs}", money(svc.month_to_date, c)), theme::bold()), kw));
     lines.push(widgets::kv("Last month", money(svc.last_month, c), kw));

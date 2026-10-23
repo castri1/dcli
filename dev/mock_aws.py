@@ -4570,6 +4570,23 @@ def ce_accounts(expr):
     return []
 
 
+def ce_filter_values(expr, key):
+    """The values a Cost Explorer filter gives a dimension `key`, anywhere in it."""
+    if isinstance(expr, dict):
+        dims = expr.get("Dimensions") or {}
+        found = list(dims.get("Values", [])) if dims.get("Key") == key else []
+        for k in ("And", "Or"):
+            for e in expr.get(k) or []:
+                found += ce_filter_values(e, key)
+        return found
+    return []
+
+
+# Instance-hour usage types reservations can cover, and the share they do (the rest of each
+# service's usage, storage and I/O, is never reserved).
+CE_RESERVED_HOURS = {"InstanceUsage:db.r6g.xlarge": 1.0, "Node:ra3.4xlarge": 0.4}
+
+
 def ce_scale(body):
     accounts = ce_accounts(body.get("Filter"))
     if not accounts:
@@ -4634,6 +4651,16 @@ def ce_cost_and_usage(body):
                     name = "Savings Plans" if kind == "Savings Plans" else "Standard Reserved Instances"
                     groups.append({"Keys": [service, name], "Metrics": {"AmortizedCost": ce_money(cost * share)}})
                 groups.append({"Keys": [service, "On Demand Instances"], "Metrics": {"AmortizedCost": ce_money(cost * (1 - share))}})
+            elif keys == ["USAGE_TYPE", "PURCHASE_TYPE"]:
+                wanted = ce_filter_values(body.get("Filter"), "SERVICE")
+                if wanted and service not in wanted:
+                    continue
+                for u, _, _, _ in usages:
+                    c = sum(x[3] for x in rows if x[0] == u)
+                    share = CE_RESERVED_HOURS.get(u, 0.0)
+                    if share > 0:
+                        groups.append({"Keys": [u, "Standard Reserved Instances"], "Metrics": {"AmortizedCost": ce_money(c * share)}})
+                    groups.append({"Keys": [u, "On Demand Instances"], "Metrics": {"AmortizedCost": ce_money(c * (1 - share))}})
         results.append({"TimePeriod": {"Start": ce_date(days[0]), "End": ce_date(days[-1] + CE_DAY)},
                         "Total": {} if keys else {"AmortizedCost": ce_money(total)}, "Groups": groups, "Estimated": days[-1] >= ce_day(time.time())})
     out = {"ResultsByTime": results, "GroupDefinitions": body.get("GroupBy", []),
@@ -4687,6 +4714,13 @@ def cost_explorer_mock(op, body):
             "Savings": {"NetSavings": "410.10", "OnDemandCostEquivalent": "1876.50"}}],
             "TimePeriod": body.get("TimePeriod")}
     if op == "GetReservationUtilization":
+        # Like AWS: one SERVICE value at most, OpenSearch under its old name.
+        services = ce_filter_values(body.get("Filter"), "SERVICE")
+        if len(services) > 1:
+            raise KeyError("ValidationException: The Service dimension value should not exceed 1")
+        if services and services[0] not in ("Amazon Relational Database Service", "Amazon Redshift", "Amazon ElastiCache",
+                                            "Amazon Elasticsearch Service", "Amazon Elastic Compute Cloud - Compute"):
+            raise KeyError(f"ValidationException: {services[0]} is not a supported service")
         start, end = body["TimePeriod"]["Start"], body["TimePeriod"]["End"]
         hours = (ce_parse(end) - ce_parse(start)) / 3600
 
@@ -4698,7 +4732,9 @@ def cost_explorer_mock(op, body):
                     "Utilization": {"UtilizationPercentage": "100" if days_left > 60 else "88", "PurchasedHours": f"{purchased:.0f}",
                                     "TotalActualHours": f"{purchased:.0f}", "UnusedHours": "0" if days_left > 60 else f"{purchased * 0.12:.0f}",
                                     "TotalAmortizedFee": f"{fee_hour * hours:.2f}"}}
-        groups = [ri("ri-0db6g", "db.r6g.xlarge", 2, 0.62, 80), ri("ri-0rs3x", "ra3.4xlarge", 4, 8.6, 45)]
+        groups = [g for service, g in [("Amazon Relational Database Service", ri("ri-0db6g", "db.r6g.xlarge", 2, 0.62, 80)),
+                                       ("Amazon Redshift", ri("ri-0rs3x", "ra3.4xlarge", 4, 8.6, 45))]
+                  if not services or services[0] == service]
         return {"UtilizationsByTime": [{"TimePeriod": {"Start": start, "End": end}, "Groups": groups}]}
     if op == "GetSavingsPlansPurchaseRecommendation":
         return {"Metadata": {"RecommendationId": "rec-1", "GenerationTimestamp": ce_date(T0 - CE_DAY), "LookbackPeriodInDays": "THIRTY_DAYS"},
