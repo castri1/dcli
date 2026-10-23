@@ -181,19 +181,43 @@ pub fn money(v: f64, currency: &str) -> String {
     format!("{}{} {}", if v < 0.0 { "-" } else { "" }, symbol(currency), grouped(v.abs(), digits))
 }
 
-/// `US$ 0.50`, `US$ 0.0000167`: a rate, with three significant digits however small.
+/// `US$ 2.10`, `US$ 0.519`, `US$ 0.0000167`: a rate, with at least two decimals and three
+/// significant digits however small.
 pub fn rate(v: f64, currency: &str) -> String {
     let a = v.abs();
-    let digits = if a >= 1.0 || a == 0.0 { 2 } else { ((-a.log10()).floor() as usize + 3).min(12) };
-    format!("{} {}", symbol(currency), grouped(a, digits).trim_end_matches('0').trim_end_matches('.'))
+    let digits = if a >= 1.0 || a == 0.0 {
+        2
+    } else if a >= 0.01 {
+        3
+    } else {
+        ((-a.log10()).floor() as usize + 3).min(12)
+    };
+    let mut text = grouped(a, digits);
+    while text.ends_with('0') && text.split_once('.').is_some_and(|(_, f)| f.len() > 2) {
+        text.pop();
+    }
+    format!("{} {text}", symbol(currency))
 }
 
-/// `▲ 12 %`, `▼ 3 %`: how `now` compares with `before`.
+/// `▲ 12 %`, `▼ 3 %`, `≈ 0 %`: how `now` compares with `before`.
 pub fn change(now: f64, before: f64) -> Option<String> {
     (before > 0.0).then(|| {
-        let c = now / before - 1.0;
-        format!("{} {:.0} %", if c >= 0.0 { "▲" } else { "▼" }, (c * 100.0).abs())
+        let c = (now / before - 1.0) * 100.0;
+        if c.abs() < 0.5 {
+            "≈ 0 %".to_string()
+        } else {
+            format!("{} {:.0} %", if c > 0.0 { "▲" } else { "▼" }, c.abs())
+        }
     })
+}
+
+/// What a reading cost in requests: `9 Cost Explorer requests`, or where its figures came
+/// from when another environment of the account had just been read.
+pub fn read_note(s: &Snapshot) -> String {
+    match &s.copied_from {
+        Some(env) => format!("no Cost Explorer request: the account was read for {env} {}", crate::util::fmt_ago(s.read_at)),
+        None => format!("{} Cost Explorer requests", s.requests),
+    }
 }
 
 /// `2026-10-23`.
@@ -350,10 +374,14 @@ mod tests {
         assert_eq!(money(-3.0, "EUR"), "-€ 3.00");
         assert_eq!(money(1_234_567.0, "USD"), "US$ 1,234,567");
         assert_eq!(rate(0.0000166667, "USD"), "US$ 0.0000167");
-        assert_eq!(rate(0.5, "USD"), "US$ 0.5");
+        assert_eq!(rate(0.0000002, "USD"), "US$ 0.0000002");
+        assert_eq!(rate(0.5, "USD"), "US$ 0.50");
+        assert_eq!(rate(0.519, "USD"), "US$ 0.519");
+        assert_eq!(rate(2.1, "USD"), "US$ 2.10");
         assert_eq!(rate(3.26, "USD"), "US$ 3.26");
         assert_eq!(change(112.0, 100.0).as_deref(), Some("▲ 12 %"));
         assert_eq!(change(97.0, 100.0).as_deref(), Some("▼ 3 %"));
+        assert_eq!(change(100.2, 100.0).as_deref(), Some("≈ 0 %"));
         assert_eq!(change(5.0, 0.0), None);
     }
 

@@ -83,6 +83,7 @@ pub fn account_of(profile: &str, env_aws: &Aws) -> aws::Result<String> {
     if !from_env {
         let configured = AwsFiles::load().profile(&name).and_then(|p| p.get("sso_account_id").cloned());
         if let Some(account) = configured.filter(|a| sts::is_account_id(a)) {
+            settings::remember_account(&name, &account);
             return Ok(account);
         }
         if let Some(account) = settings::load().accounts.get(&name) {
@@ -255,6 +256,14 @@ pub fn read(env: &str, profile: &str, env_aws: &Aws, now: f64, progress: &dyn Fn
     progress("finding the account");
     let account = account_of(profile, env_aws)?;
     let settings = settings::load();
+    if let Some(mut recent) = recent_reading(env, &account, &reader_label(&settings), now) {
+        // Another environment in the same account was just read: the same figures, for free.
+        recent.requests = 0;
+        if let Err(e) = super::save(env, &recent) {
+            recent.missing.push(format!("not kept on disk: {e}"));
+        }
+        return Ok(recent);
+    }
     let reader_aws = billing(env_aws);
     let r = Reader { aws: &reader_aws, account: account_filter(&account), requests: Cell::new(0) };
     let w = Window::at(now);
@@ -330,6 +339,35 @@ pub fn read(env: &str, profile: &str, env_aws: &Aws, now: f64, progress: &dyn Fn
     }
     Ok(s)
 }
+
+/// A reading of `account` by the same reader kept for another environment less than
+/// [`REUSE_SECS`] ago (environments often share an account; Cost Explorer only updates a few
+/// times a day), marked with where it came from.
+fn recent_reading(env: &str, account: &str, reader: &str, now: f64) -> Option<Snapshot> {
+    let own = super::cache_path(env)?;
+    let dir = own.parent()?;
+    let mut best: Option<(String, Snapshot)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let Some(other) = name.strip_prefix("costs-").and_then(|n| n.strip_suffix(".json")) else { continue };
+        if path == own {
+            continue;
+        }
+        let Some(s) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Snapshot>(&t).ok()) else { continue };
+        let fresh = now - s.read_at < REUSE_SECS && s.read_at <= now;
+        if s.account == account && s.reader == reader && fresh && best.as_ref().is_none_or(|(_, b)| s.read_at > b.read_at) {
+            best = Some((other.to_string(), s));
+        }
+    }
+    best.map(|(from, mut s)| {
+        s.copied_from = Some(from);
+        s
+    })
+}
+
+/// How long a reading serves the other environments of its account.
+pub const REUSE_SECS: f64 = 3600.0;
 
 /// Cost Explorer errors that say what to do about them.
 fn explain(e: AwsError, essential: bool) -> AwsError {

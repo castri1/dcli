@@ -54,6 +54,9 @@ pub struct Snapshot {
     pub missing: Vec<String>,
     /// Cost Explorer requests the reading took.
     pub requests: u64,
+    /// The environment of the same account whose reading this one reuses (read minutes
+    /// before, so no request was made).
+    pub copied_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
