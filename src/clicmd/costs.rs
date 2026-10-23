@@ -24,7 +24,7 @@ const DAY: f64 = 86_400.0;
 pub struct Args {
     /// Environment (default: the current one, see `use`)
     env: Option<String>,
-    /// Read the costs again from Cost Explorer (about 8 requests, each billed by AWS)
+    /// Read the costs again from Cost Explorer (about 7 requests, plus one per service with reserved instances; each billed by AWS)
     #[arg(long)]
     refresh: bool,
     /// The usage types of a service (Cost Explorer's name or the dcli module's) with their

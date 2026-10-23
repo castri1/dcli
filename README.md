@@ -145,7 +145,7 @@ dcli optimize --lambda-memory                                     # memory used 
 dcli optimize --by-cost                                           # the bill's usage types split over the resources behind them
 dcli optimize --ledger                                            # changes followed; --verify reads the bill a week later
 dcli costs --setup --profile billing                              # who reads costs: the management account's profile (or --own-profile)
-dcli costs prod --refresh                                         # read Cost Explorer (about 8 requests, each billed; asks first)
+dcli costs prod --refresh                                         # read Cost Explorer (about 7-10 requests, each billed; asks first)
 dcli costs prod                                                   # from what was read: totals, services, cost after deploys
 dcli costs prod --usage lambda                                    # usage types and their effective rates (also --daily SERVICE)
 dcli costs prod --commitments                                     # Savings Plans, reservations, coverage, AWS's recommendation
@@ -402,9 +402,10 @@ renews: the amount is split into what you save now and what you save then, with 
 
 Log retention and SQS long polling can be applied from the module (`a`); `d` marks a finding
 done when you changed it elsewhere (a function's memory in your code). Either way the change
-is followed: a week later `v` reads the bill for that usage type before and after it and
-says whether it saved what was expected (a usage type mixes resources, so other changes can
-weigh in). Aurora, Redshift and DMS changes made from dcli are followed too. The By cost tab
+is followed: once the bill has 7 complete days after it, `v` reads that usage type before and
+after (1 Cost Explorer request, up to 3 if the answer comes in pages) and says whether it
+saved what was expected (a usage type mixes resources, so other changes can weigh in; a class
+change set for the maintenance window is not followed, since dcli cannot tell when it applies). Aurora, Redshift and DMS changes made from dcli are followed too. The By cost tab
 splits the bill's most expensive usage types over the resources behind them, by what each
 used (functions by duration × memory, log groups by bytes ingested, clusters by node hours…),
 with each resource's findings beside it. `m` (or `M` on a function in Lambda) compares the
@@ -424,8 +425,10 @@ deploy shows the deploys of that day (a correlation, not proof). Costs are amort
 commitments are spread over the usage they cover.
 
 Cost Explorer bills every request, so dcli never reads it on its own: `r` (or `dcli costs
---refresh`) says how many requests it will make first (about 8), what was read is kept, and
-the requests of the month are counted. With AWS Organizations, set a profile in the management
+--refresh`) says how many requests it will make first (about 7, plus one per service with
+reserved instances), what was read is kept, and the requests of the month are counted. This
+month is compared with the same complete days of last month (to yesterday: Cost Explorer has
+not finished today). With AWS Organizations, set a profile in the management
 account once (`s`, or `dcli costs --setup --profile NAME`): it reads every account, and each
 environment shows its own account's costs. `--mode daily` reads again when the module opens or
 the command runs and what was read is more than a day old.
