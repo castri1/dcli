@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Finding, Impact, Scan, qty};
+use super::{Finding, Impact, Scan, billing, qty};
 use crate::aws::rds::{self, Cluster, Instance, Inventory, MetricDef, Metrics, Only, Snapshot, Unit, Want};
 use crate::aws;
 use crate::util::now_secs;
@@ -162,6 +162,17 @@ fn monthly_use(c: &Cluster, i: &Instance) -> (String, Impact) {
     }
 }
 
+/// What an instance bills a month: its class's hours, or a Serverless v2 instance's
+/// ACU-hours at its minimum.
+fn bill_instance(f: Finding, c: &Cluster, i: &Instance) -> Finding {
+    if i.serverless() {
+        let min = c.serverless.as_ref().map_or(0.5, |s| s.min);
+        f.billed(billing::AURORA_SERVERLESS, min * MONTH_HOURS)
+    } else {
+        f.billed(&billing::rds_instance(&i.class), MONTH_HOURS)
+    }
+}
+
 fn idle_cluster(c: &Cluster, instances: &[&Instance], m: &Metrics, days: f64) -> Finding {
     let uses: Vec<(String, Impact)> = instances.iter().map(|i| monthly_use(c, i)).collect();
     let impact = if instances.len() > 1 { Impact::High } else { uses[0].1.max(Impact::Medium) };
@@ -180,6 +191,9 @@ fn idle_cluster(c: &Cluster, instances: &[&Instance], m: &Metrics, days: f64) ->
         impact,
     )
     .evidence(format!("highest daily connection count over {days:.0} days: 0 on {}", instances.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(", ")));
+    for i in instances {
+        f = bill_instance(f, c, i);
+    }
     if let Some(cpu) = instances.iter().filter_map(|i| m.max(&i.id, "cpu_max")).reduce(f64::max) {
         f = f.evidence(format!("CPU peaked at {cpu:.0}% (background work only)"));
     }
@@ -203,8 +217,9 @@ fn quiet_reader(c: &Cluster, instances: &[&Instance], i: &Instance, m: &Metrics,
     } else {
         (format!("Remove {} if the cluster can do without a failover target", i.id), Impact::Low)
     };
+    let f = Finding::new("Aurora", c.id.clone(), format!("{} / {}", c.id, i.id), format!("reader {} barely used in {days:.0} days", i.id), recommendation, reduction, impact);
     Some(
-        Finding::new("Aurora", c.id.clone(), format!("{} / {}", c.id, i.id), format!("reader {} barely used in {days:.0} days", i.id), recommendation, reduction, impact)
+        bill_instance(f, c, i)
             .evidence(format!("at most {connections:.0} connection{} a day", if connections == 1.0 { "" } else { "s" }))
             .evidence(format!("CPU peaked at {cpu:.0}%"))
             .caveat("Readers are failover targets: without one, a failover has to create a new writer and takes longer.")
@@ -236,6 +251,7 @@ fn oversized(c: &Cluster, instances: &[&Instance], i: &Instance, m: &Metrics, da
         format!("{} vCPU-hours a month ({vcpus} → {new_vcpus} vCPUs, {memory:.0} → {new_memory:.0} GiB)", num(hours)),
         by_vcpu_hours(hours),
     )
+    .billed_instead(&billing::rds_instance(&i.class), &billing::rds_instance(&smaller), MONTH_HOURS)
     .evidence(format!("on {smaller} the same work would peak near {projected:.0}% CPU"))
     .caveat("These are daily peaks of 1-minute averages: shorter bursts do not show.")
     .caveat("Free memory also caches data: with less of it, more reads go to storage.");
@@ -274,6 +290,7 @@ fn serverless_minimum(c: &Cluster, i: &Instance, m: &Metrics, days: f64) -> Opti
             format!("up to {} ACU-hours a month ({} → {} ACU while quiet)", num(acu_hours), rds::fmt_acu(range.min), rds::fmt_acu(new_min)),
             by_acu_hours(acu_hours),
         )
+        .billed(billing::AURORA_SERVERLESS, acu_hours)
         .evidence(format!("capacity averaged at most {used:.1} ACU a day over {days:.0} days"))
         .evidence(format!("about {need:.1} ACU would keep CPU under {:.0}%", ACU_CPU_TARGET * 100.0))
         .caveat("Each ACU brings about 2 GiB of memory: a lower minimum caches less while quiet, so the first queries after a calm period can be slower.")
@@ -288,19 +305,22 @@ fn graviton(c: &Cluster, instances: &[&Instance]) -> Option<Finding> {
     }
     let vcpu_hours: f64 = moves.iter().filter_map(|(i, _)| rds::class_specs(&i.class)).map(|(v, _)| f64::from(v) * MONTH_HOURS).sum();
     let list = moves.iter().map(|(i, to)| format!("{} {} → {to}", i.id, i.class)).collect::<Vec<_>>().join(", ");
+    let mut f = Finding::new(
+        "Aurora",
+        c.id.clone(),
+        c.id.clone(),
+        if moves.len() == 1 { "1 instance on an Intel class".to_string() } else { format!("{} instances on Intel classes", moves.len()) },
+        format!("Move to Graviton: {list}"),
+        format!("{} vCPU-hours a month on Graviton instead of Intel", num(vcpu_hours)),
+        if vcpu_hours >= 2920.0 { Impact::Medium } else { Impact::Low },
+    );
+    for (i, to) in &moves {
+        f = f.billed_instead(&billing::rds_instance(&i.class), &billing::rds_instance(to), MONTH_HOURS);
+    }
     Some(
-        Finding::new(
-            "Aurora",
-            c.id.clone(),
-            c.id.clone(),
-            if moves.len() == 1 { "1 instance on an Intel class".to_string() } else { format!("{} instances on Intel classes", moves.len()) },
-            format!("Move to Graviton: {list}"),
-            format!("{} vCPU-hours a month on Graviton instead of Intel", num(vcpu_hours)),
-            if vcpu_hours >= 2920.0 { Impact::Medium } else { Impact::Low },
-        )
-        .evidence(format!("engine {}", c.engine_label()))
-        .caveat("Check that the engine version offers the class: older versions (Aurora MySQL 2, for one) need an upgrade first.")
-        .caveat("Changing the class restarts the instance; do the readers first, then fail over."),
+        f.evidence(format!("engine {}", c.engine_label()))
+            .caveat("Check that the engine version offers the class: older versions (Aurora MySQL 2, for one) need an upgrade first.")
+            .caveat("Changing the class restarts the instance; do the readers first, then fail over."),
     )
 }
 
@@ -323,6 +343,7 @@ fn io_heavy(c: &Cluster, m: &Metrics, days: f64) -> Option<Finding> {
             format!("about {} I/O requests a month no longer billed per request", qty(monthly)),
             if monthly >= IO_HIGH { Impact::High } else { Impact::Medium },
         )
+        .billed_at_most(billing::AURORA_IO, monthly)
         .evidence(format!("{} reads and {} writes (VolumeReadIOPs, VolumeWriteIOPs)", qty(reads), qty(writes)))
         .caveat("I/O-Optimized charges more for instances and storage instead: it pays off when I/O is a large part of this cluster's bill. Compare those lines of the bill before switching.")
         .caveat("The storage type can be changed once every 30 days."),
@@ -354,7 +375,8 @@ fn old_snapshots(snapshots: &[Snapshot], now: f64) -> Vec<Finding> {
                 "Delete the snapshots no longer needed",
                 format!("{} GB of snapshot storage a month", num(gb)),
                 by_gb(gb),
-            );
+            )
+            .billed(billing::AURORA_BACKUP, gb);
             for s in list {
                 let size = s.allocated.map(|g| format!(", {g} GB")).unwrap_or_default();
                 let age = s.created.map(|t| format!(", {:.0} days old", (now - t) / 86_400.0)).unwrap_or_default();
@@ -430,10 +452,14 @@ mod tests {
         let smaller = &found[0];
         assert_eq!(smaller.recommendation, "Move r1 from db.r6g.xlarge to db.r6g.large");
         assert_eq!((smaller.reduction.as_str(), smaller.impact), ("1,460 vCPU-hours a month (4 → 2 vCPUs, 32 → 16 GiB)", Impact::Medium));
+        assert_eq!(smaller.billed[0].usage, "InstanceUsage:db.r6g.xlarge");
+        assert_eq!(smaller.billed[0].instead.as_deref(), Some("InstanceUsage:db.r6g.large"));
+        assert_eq!(smaller.billed[0].quantity, 730.0);
         assert_eq!(found[1].recommendation, "Move to Graviton: r2 db.r5.large → db.r7g.large");
         assert_eq!(found[1].impact, Impact::Low);
         let io = &found[2];
         assert_eq!(io.reduction, "about 15 B I/O requests a month no longer billed per request");
+        assert!(io.billed[0].at_most && io.billed[0].usage == "Aurora:StorageIOUsage", "I/O-Optimized bills instances and storage for more");
         assert_eq!(io.impact, Impact::High);
         assert!(found.iter().all(|f| !f.reduction.contains('$') && !f.reduction.contains('%')));
     }

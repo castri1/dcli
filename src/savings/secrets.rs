@@ -1,6 +1,6 @@
 //! Secrets Manager: secrets nobody has read in a long time (each is billed every month).
 
-use super::{Finding, Impact, Scan};
+use super::{Finding, Impact, Scan, billing};
 use crate::aws::secrets::{self, Secret};
 use crate::aws::{self, Aws};
 use crate::util::{fmt_utc, now_secs};
@@ -52,6 +52,7 @@ fn unused(s: &Secret, idle_days: f64, now: f64) -> Option<Finding> {
         Impact::Low,
     )
     .score(days / 3650.0)
+    .billed(billing::SECRETS, 1.0)
     .caveat("Secrets Manager keeps the last read to the day: a secret read once a year looks unused.");
     if let Some(at) = s.last_accessed_date {
         finding = finding.evidence(format!("last read {}", &fmt_utc(at)[..10]));

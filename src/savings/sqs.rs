@@ -1,7 +1,7 @@
 //! SQS: queues polled without long polling. Every ReceiveMessage is a billed request, the
 //! empty ones too; long polling waits for messages instead of answering empty at once.
 
-use super::{Finding, Fix, Impact, Scan, metric_data, per_month, percent, qty, query, query_id, total};
+use super::{Finding, Fix, Impact, Scan, billing, metric_data, per_month, percent, qty, query, query_id, total};
 use crate::aws::sqs::{self, Queue};
 use crate::aws::{self, metrics::Series};
 
@@ -49,6 +49,7 @@ fn finding(q: &Queue, empty: &Series, received: &Series, days: u32) -> Option<Fi
             Impact::of(monthly, EMPTY_MEDIUM, EMPTY_HIGH),
         )
         .score(monthly / EMPTY_HIGH)
+        .billed(if q.name.ends_with(".fifo") { billing::SQS_FIFO_REQUESTS } else { billing::SQS_REQUESTS }, monthly)
         .evidence(format!("{} empty receives and {} messages received in {days} days", qty(empty), qty(received)))
         .evidence("ReceiveMessageWaitTimeSeconds is 0")
         .caveat("Consumers that pass their own WaitTimeSeconds keep it.")
@@ -82,6 +83,8 @@ mod tests {
         assert_eq!(f.reduction, "up to −20 M requests a month");
         assert_eq!(f.impact, Impact::Medium);
         assert_eq!(f.fix, Some(Fix::LongPolling { queue_url: q.url.clone() }));
+        assert_eq!(f.billed[0].usage, "Requests-Tier1");
+        assert_eq!(finding(&queue("orders.fifo", "0"), &sum(9.2e6), &sum(0.8e6), 14).unwrap().billed[0].usage, "Requests-FIFO-Tier1");
         assert_eq!(f.target, q.url);
         // A few empty receives are not worth a finding.
         assert!(finding(&q, &sum(100_000.0), &sum(0.0), 14).is_none());

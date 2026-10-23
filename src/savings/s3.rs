@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use super::{Finding, GB, Impact, Scan, metric_data, par_map, query, query_id, size};
+use super::{Finding, GB, Impact, Scan, billing, metric_data, par_map, query, query_id, size};
 use crate::aws::s3::{self, Bucket, Lifecycle};
 use crate::aws::{self, Aws, AwsError};
 use crate::util::now_secs;
@@ -140,6 +140,9 @@ fn findings(name: &str, region: &str, config: &Config, classes: &[(&'static str,
             Impact::of(standard, STANDARD_MEDIUM, STANDARD_HIGH),
         )
         .score(standard / STANDARD_HIGH)
+        // As if it all moved to Standard-IA: lifecycle rules move what ages, so at most that.
+        .billed_instead(billing::S3_STANDARD, billing::S3_STANDARD_IA, standard / GB)
+        .at_most()
         .evidence(format!("{rules} · region {region}"))
         .caveat("Infrequent-access classes bill retrievals and keep objects a minimum time: they suit data read rarely.");
         for line in &per_class {

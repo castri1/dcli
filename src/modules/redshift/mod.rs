@@ -645,13 +645,21 @@ impl Redshift {
     fn run(&mut self, action: Action, ctx: &mut Ctx) {
         let aws = ctx.env().aws.clone();
         match action {
-            Action::Pause(id) => ctx.spawn(move || Msg::Done { result: redshift::pause(&aws, &id), what: format!("{id} is pausing"), cluster: id }),
+            Action::Pause(id) => {
+                let note = self.cost_note(&id, |c| (vec![c.node_type.clone()], format!("Paused {} ({})", c.id, c.shape())));
+                ctx.spawn(move || Msg::Done { result: redshift::pause(&aws, &id).inspect(|()| note.record()), what: format!("{id} is pausing"), cluster: id })
+            }
             Action::Resume(id) => ctx.spawn(move || Msg::Done { result: redshift::resume(&aws, &id), what: format!("{id} is resuming"), cluster: id }),
-            Action::Resize { cluster, option } => ctx.spawn(move || Msg::Done {
-                result: redshift::resize(&aws, &cluster, &option.node_type, option.nodes, false),
-                what: format!("{cluster} is resizing to {}", option.shape()),
-                cluster,
-            }),
+            Action::Resize { cluster, option } => {
+                let note = self.cost_note(&cluster, |c| {
+                    (vec![c.node_type.clone(), option.node_type.clone()], format!("Resized {} from {} to {}", c.id, c.shape(), option.shape()))
+                });
+                ctx.spawn(move || Msg::Done {
+                    result: redshift::resize(&aws, &cluster, &option.node_type, option.nodes, false).inspect(|()| note.record()),
+                    what: format!("{cluster} is resizing to {}", option.shape()),
+                    cluster,
+                })
+            }
             Action::Cancel { cluster, query } => {
                 let Some(identity) = self.identity(&cluster).cloned() else { return };
                 let pid = query.pid.unwrap_or_default();
@@ -662,6 +670,21 @@ impl Redshift {
                 });
             }
         }
+    }
+
+    /// What to record in the savings ledger once an action on `cluster` that changes the
+    /// bill is made: its node types and a description, from `what`.
+    fn cost_note(&self, cluster: &str, what: impl Fn(&Cluster) -> (Vec<String>, String)) -> crate::costs::ledger::Note {
+        let (types, text) = self.clusters.iter().find(|c| c.id == cluster).map(what).unwrap_or_default();
+        let mut usage: Vec<String> = Vec::new();
+        for t in types {
+            for u in crate::costs::ledger::usage_of_instance("Redshift", &t) {
+                if !usage.contains(&u) {
+                    usage.push(u);
+                }
+            }
+        }
+        crate::costs::ledger::Note::new(&self.env_name, &self.region, "Redshift", cluster, usage, text)
     }
 
     fn on_done(&mut self, cluster: String, what: String, result: aws::Result<()>, ctx: &mut Ctx) {

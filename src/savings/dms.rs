@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use super::{Finding, Impact, Scan, metric_data, query, query_id};
+use super::{Finding, Impact, Scan, billing, metric_data, query, query_id};
 use crate::aws;
 use crate::aws::dms::{self, Instance, Replication};
 use crate::config::is_production;
@@ -150,7 +150,11 @@ fn idle(i: &Instance, mine: &[&Replication], now: f64) -> Option<Finding> {
         by_vcpu_hours(vcpu_hours),
     )
     .score(vcpu_hours)
+    .billed(&billing::dms_instance(&i.class), MONTH_HOURS)
     .evidence(format!("{} · {}", dms::class_label(&i.class), if i.multi_az { "Multi-AZ" } else { "single AZ" }));
+    if i.multi_az {
+        f = f.billed(&billing::dms_standby(&i.class), MONTH_HOURS);
+    }
     for t in mine {
         let when = t.stopped_at().map(|s| format!(", stopped {}", fmt_ago(s))).unwrap_or_default();
         f = f.evidence(format!("{}: {} ({}){when}", t.id, t.status, t.migration.label()));
@@ -177,7 +181,7 @@ fn oversized(i: &Instance, u: &Usage, days: u32) -> Option<Finding> {
     }
     let copies = if i.multi_az { 2.0 } else { 1.0 };
     let vcpu_hours = f64::from(vcpus - new_vcpus) * MONTH_HOURS * copies;
-    let f = Finding::new(
+    let mut f = Finding::new(
         "DMS",
         i.id.clone(),
         i.id.clone(),
@@ -190,7 +194,11 @@ fn oversized(i: &Instance, u: &Usage, days: u32) -> Option<Finding> {
     .evidence(format!("highest hourly CPU in {days} days: {cpu:.0}% (about {projected_cpu:.0}% on {smaller})"))
     .evidence(format!("least freeable memory: {:.1} GiB of {gib:.0} (about {:.1} GiB in use)", free / gib_bytes, used / gib_bytes))
     .caveat("Memory holds changes waiting to be applied: on a smaller class, peaks may go to disk (CDCChangesDiskTarget) and add latency.")
-    .caveat("Changing the class restarts the instance and interrupts its tasks: pick a quiet hour (S in the DMS module).");
+    .caveat("Changing the class restarts the instance and interrupts its tasks: pick a quiet hour (S in the DMS module).")
+    .billed_instead(&billing::dms_instance(&i.class), &billing::dms_instance(&smaller), MONTH_HOURS);
+    if i.multi_az {
+        f = f.billed_instead(&billing::dms_standby(&i.class), &billing::dms_standby(&smaller), MONTH_HOURS);
+    }
     Some(f)
 }
 
@@ -215,6 +223,7 @@ fn multi_az(i: &Instance, (env, profile): (&str, &str)) -> Option<Finding> {
             by_vcpu_hours(vcpu_hours),
         )
         .score(vcpu_hours)
+        .billed(&billing::dms_standby(&i.class), MONTH_HOURS)
         .evidence(format!("{name} reads as non-production ({word})"))
         .caveat(format!(
             "Production is judged from the names of the environment, the AWS profile and the instance ({env}, {profile}, {}): ignore this if it is production.",
@@ -296,7 +305,8 @@ mod tests {
 
     #[test]
     fn multi_az_outside_production() {
-        assert!(multi_az(&instance("dms-dev-reporting", "dms.r5.large", true), ("main", "default")).is_some());
+        let f = multi_az(&instance("dms-dev-reporting", "dms.r5.large", true), ("main", "default")).unwrap();
+        assert_eq!((f.billed[0].usage.as_str(), f.billed[0].quantity), ("Multi-AZUsg:dms.r5.large", 730.0));
         assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), ("main", "corp-staging")).is_some());
         assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), ("qa", "default")).is_some());
         assert!(multi_az(&instance("dms-reporting", "dms.r5.large", true), ("main", "default")).is_none());

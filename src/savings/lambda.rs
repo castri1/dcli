@@ -9,7 +9,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::{
-    Finding, Impact, MONTH, Scan, days_label, metric_data, par_map, peak, per_month, percent, qty, query, query_id, size, total,
+    Finding, Impact, MONTH, Scan, billing, days_label, metric_data, par_map, peak, per_month, percent, qty, query, query_id, size,
+    total,
 };
 use crate::aws::lambda::{self, FunctionConfiguration};
 use crate::aws::metrics::Series;
@@ -113,11 +114,11 @@ fn usage_of(invocations: &Series, duration: &Series, p99: &Series) -> Usage {
     }
 }
 
-fn memory_mb(f: &FunctionConfiguration) -> i64 {
+pub(crate) fn memory_mb(f: &FunctionConfiguration) -> i64 {
     f.memory_size.unwrap_or(128)
 }
 
-fn on_x86(f: &FunctionConfiguration) -> bool {
+pub(crate) fn on_x86(f: &FunctionConfiguration) -> bool {
     f.architectures.is_empty() || f.architectures.iter().any(|a| a == "x86_64")
 }
 
@@ -144,6 +145,7 @@ fn arm64(f: &FunctionConfiguration, u: &Usage, days: u32) -> Option<Finding> {
         Impact::of(gbs, GBS_MEDIUM, GBS_HIGH),
     )
     .score(gbs / GBS_HIGH)
+    .billed_instead(billing::LAMBDA_GBS, billing::LAMBDA_GBS_ARM, gbs)
     .evidence(format!("{} invocations in {days} days (≈ {} a month)", qty(u.invocations), qty(monthly)))
     .evidence(format!("average duration {}, {} MB of memory", fmt_ms(u.mean_ms), memory_mb(f)))
     .evidence(format!("runtime {}, {} package", f.runtime.as_deref().unwrap_or("custom"), f.package_type.as_deref().unwrap_or("Zip")));
@@ -241,6 +243,7 @@ fn provisioned_finding(f: &FunctionConfiguration, qualifier: &str, allocated: i6
             Impact::of(gbs, PROVISIONED_MEDIUM, PROVISIONED_HIGH),
         )
         .score(gbs / PROVISIONED_HIGH)
+        .billed(if on_x86(f) { billing::LAMBDA_PROVISIONED } else { billing::LAMBDA_PROVISIONED_ARM }, gbs)
         .evidence(format!("highest hourly ProvisionedConcurrencyUtilization in {days} days: {}", percent(peak_use)))
         .evidence(format!("{allocated} instances × {} MB, provisioned around the clock", memory_mb(f)))
         .caveat("Provisioned concurrency keeps cold starts away at peaks: keep what the latency target needs.")
@@ -320,6 +323,8 @@ pub fn memory_estimate(aws: &Aws, functions: Option<Vec<FunctionConfiguration>>,
 #[serde(rename_all = "camelCase")]
 pub struct MemoryUse {
     pub function: String,
+    /// It runs on arm64 (its GB-seconds are billed as such).
+    pub arm64: bool,
     /// Assigned (MB).
     pub memory_mb: i64,
     /// Used by 99 % of invocations (MB).
@@ -406,6 +411,7 @@ pub fn memory_analysis(aws: &Aws, estimate: &Estimate, progress: &dyn Fn(usize, 
             let samples = number("invocations");
             run.uses.push(MemoryUse {
                 function: f.function_name.clone(),
+                arm64: !on_x86(f),
                 memory_mb: assigned,
                 p99_mb: mb(number("p99Used")),
                 max_mb: mb(number("maxUsed")),
@@ -466,6 +472,7 @@ pub fn memory_finding(u: &MemoryUse) -> Option<Finding> {
             Impact::of(gbs, GBS_MEDIUM, GBS_HIGH),
         )
         .score(gbs / GBS_HIGH)
+        .billed(if u.arm64 { billing::LAMBDA_GBS_ARM } else { billing::LAMBDA_GBS }, gbs)
         .evidence(format!(
             "p99 memory used {:.0} MB, at most {:.0} MB, over {} invocations ({} of REPORT lines)",
             u.p99_mb,
@@ -536,6 +543,10 @@ mod tests {
         // 3.04 M invocations a month × 0.8 s × 2 GB.
         assert_eq!(f.reduction, "4.9 M GB-s a month on x86_64");
         assert_eq!(f.impact, Impact::Medium);
+        // Priced as the difference between the x86_64 and arm64 rates of the bill.
+        assert_eq!(f.billed.len(), 1);
+        assert_eq!((f.billed[0].usage.as_str(), f.billed[0].instead.as_deref()), ("Lambda-GB-Second", Some("Lambda-GB-Second-ARM")));
+        assert!((f.billed[0].quantity - 4.9e6).abs() < 0.1e6);
         assert!(arm64(&function("resize", 2048, "arm64", 60), &u, 14).is_none());
         assert!(arm64(&function("idle", 2048, "x86_64", 60), &Usage::default(), 14).is_none());
         let mut go = function("old", 512, "x86_64", 60);
@@ -564,6 +575,7 @@ mod tests {
         assert_eq!(found.recommendation, "Lower it to 8 on live");
         assert_eq!(found.reduction, "−110.5 M provisioned GB-s a month (42 of 50)");
         assert_eq!(found.impact, Impact::High);
+        assert_eq!(found.billed[0].usage, "Lambda-Provisioned-Concurrency-ARM", "an arm64 function");
         assert_eq!(provisioned_finding(&f, "live", 5, 0.0, 14).unwrap().recommendation, "Remove it from live: nothing used it");
         assert!(provisioned_finding(&f, "live", 50, 0.6, 14).is_none());
     }
@@ -571,6 +583,7 @@ mod tests {
     fn used(memory: i64, p99: f64, max: f64) -> MemoryUse {
         MemoryUse {
             function: "f".into(),
+            arm64: false,
             memory_mb: memory,
             p99_mb: p99,
             max_mb: max,

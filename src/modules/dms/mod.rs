@@ -942,8 +942,10 @@ impl Dms {
             }
             Action::Scale { instance, class, now } => {
                 let Some(i) = instances.iter().find(|i| i.arn == instance).cloned() else { return };
+                let usage = [&i.class, &class].iter().flat_map(|c| crate::costs::ledger::usage_of_instance("DMS", c)).collect();
+                let note = crate::costs::ledger::Note::new(&self.env_name, &self.region, "DMS", &i.id, usage, format!("{} from {} to {class}", i.id, i.class));
                 ctx.spawn(move || {
-                    let result = dms::modify_class(&aws, &i, &class, now).map(|fresh| match (now, &fresh.pending_class) {
+                    let result = dms::modify_class(&aws, &i, &class, now).inspect(|_| note.record()).map(|fresh| match (now, &fresh.pending_class) {
                         (false, _) => format!("{} moves to {class} in its next maintenance window", fresh.id),
                         (true, _) => format!("{} is moving to {class} ({})", fresh.id, fresh.status),
                     });

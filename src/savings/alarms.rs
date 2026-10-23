@@ -1,7 +1,7 @@
 //! CloudWatch alarms: alarms without data for weeks, usually because what they watch is
 //! gone (each alarm, and each metric of a metric math alarm, is billed every month).
 
-use super::{Finding, Impact, Scan};
+use super::{Finding, Impact, Scan, billing};
 use crate::aws;
 use crate::aws::alarms::{self, Alarm, State, fmt_period};
 use crate::util::{fmt_utc, now_secs, show_invisible};
@@ -43,6 +43,7 @@ fn without_data(a: &Alarm, silent_days: f64, now: f64) -> Option<Finding> {
         Impact::Low,
     )
     .score(days / 3650.0)
+    .billed(billing::ALARMS, metric_count(a).max(1) as f64)
     .evidence(format!("INSUFFICIENT_DATA since {}", fmt_utc(since)))
     .caveat("Alarms on rare events (a nightly job, errors that seldom happen) can lack data and still be useful.");
     if let Some(m) = &a.metric {
