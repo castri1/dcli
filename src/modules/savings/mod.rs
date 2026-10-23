@@ -616,7 +616,14 @@ impl Savings {
             vec![
                 Field::fixed("Change", e.what.clone()),
                 Field::fixed("Usage types", e.usage.join(", ")),
-                Field::fixed("Requests", format!("1 to Cost Explorer ({} this month so far)", costs::settings::requests_this_month())),
+                Field::fixed(
+                    "Requests",
+                    format!(
+                        "1 to Cost Explorer, up to {} if the answer comes in pages ({} this month so far)",
+                        ledger::VERIFY_PAGES,
+                        costs::settings::requests_this_month()
+                    ),
+                ),
             ],
         )
         .submit_label("read the bill")
@@ -1225,7 +1232,7 @@ impl Module for Savings {
                     Ok(v) => {
                         self.dialog = None;
                         if let Some(mut entry) = self.ledger.iter().find(|e| e.id == id).cloned() {
-                            entry.verified = Some(v);
+                            ledger::verified(&mut entry, v);
                             let status = ledger::status(&entry, now_secs()).label();
                             if let Err(e) = ledger::put(entry) {
                                 ctx.toast(Level::Warn, format!("Could not keep the result: {e}"));

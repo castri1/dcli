@@ -249,8 +249,8 @@ pub fn report(env: &str, s: &Snapshot, steps: &[Step]) -> String {
         "- This month to {}: {}{}",
         day_label(s.read_at),
         money(s.month_to_date, c),
-        change(s.month_to_date, s.last_month_to_date)
-            .map(|ch| format!(" ({ch} against {} for the same days of last month)", money(s.last_month_to_date, c)))
+        change(s.month_to_date_complete, s.last_month_to_date)
+            .map(|ch| format!(" ({ch} to yesterday against {} for the same days of last month)", money(s.last_month_to_date, c)))
             .unwrap_or_default()
     );
     let _ = writeln!(md, "- Last month: {}", money(s.last_month, c));
@@ -268,7 +268,7 @@ pub fn report(env: &str, s: &Snapshot, steps: &[Step]) -> String {
             md_cell(&x.service),
             money(x.month_to_date, c),
             money(x.last_month, c),
-            change(x.month_to_date, x.last_month_to_date).unwrap_or_else(|| "—".into()),
+            change(x.month_to_date_complete, x.last_month_to_date).unwrap_or_else(|| "—".into()),
             covered,
             services::module(&x.service).unwrap_or("—")
         );

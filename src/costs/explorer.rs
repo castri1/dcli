@@ -1,8 +1,8 @@
 //! Reading Cost Explorer. Every request is counted ([`super::settings::count_requests`]) and
-//! sent at most once more, only when AWS throttled it: AWS bills each one.
+//! sent again only when AWS throttled it (a few times at most): AWS bills each one.
 //!
 //! A reading ([`read`]) takes [`REQUESTS`] requests when every answer fits in one page (each
-//! further page is one more):
+//! further page is one more), plus one per service with reserved instances:
 //! 1. GetCostAndUsage, daily from the first day of last month, by service: the totals, this
 //!    month against last, the daily series;
 //! 2. GetCostAndUsage, the last 30 days by service and usage type, cost and quantity: the
@@ -10,11 +10,14 @@
 //! 3. GetCostForecast, from today to the end of the month;
 //! 4. GetSavingsPlansCoverage, the last 30 days by service;
 //! 5. GetSavingsPlansUtilizationDetails, the last 30 days, plan by plan;
-//! 6. GetCostAndUsage, the last 30 days by service and purchase type: the share reservations
-//!    cover;
-//! 7. GetReservationUtilization, the last 30 days, reservation by reservation (RDS, Redshift,
-//!    ElastiCache, OpenSearch);
-//! 8. GetSavingsPlansPurchaseRecommendation (Compute, one year, no upfront, last 30 days).
+//! 6. GetCostAndUsage, the last 30 days of the reservable services' instance hours by usage
+//!    type and purchase type: the share reservations cover;
+//! 7. GetSavingsPlansPurchaseRecommendation (Compute, one year, no upfront, last 30 days);
+//! 8. and on: GetReservationUtilization, the last 30 days, reservation by reservation, once
+//!    per service whose instance hours reservations covered (AWS takes one service a request).
+//!
+//! Every request keeps the environment's account (LINKED_ACCOUNT), even when it reads its own:
+//! a profile in the management account would otherwise see the whole organization.
 //!
 //! DescribeSavingsPlans (each plan's end and what it covers) and STS GetCallerIdentity (whose
 //! account) are other services, not billed per request.
@@ -34,8 +37,24 @@ use crate::util::{parse_rfc3339, sanitize, utc_parts};
 /// Cost Explorer answers from us-east-1.
 pub const REGION: &str = "us-east-1";
 
-/// Cost Explorer requests in a reading whose answers each fit in one page.
-pub const REQUESTS: u64 = 8;
+/// Cost Explorer requests in a reading whose answers each fit in one page, before the one
+/// per service with reserved instances.
+pub const REQUESTS: u64 = 7;
+
+/// The requests reading `env` should take: [`REQUESTS`], and one per service whose instance
+/// hours reservations covered when it was last read.
+pub fn expected_requests(env: &str) -> u64 {
+    let reserved = super::cached(env).map_or(0, |s| s.coverage.iter().filter(|c| c.by == "reservations" && c.covered > 0.0).count());
+    REQUESTS + reserved as u64
+}
+
+/// `about 7 requests`, `about 9 requests (2 for reservations)`.
+pub fn requests_text(env: &str) -> String {
+    match expected_requests(env) {
+        n if n > REQUESTS => format!("about {n} requests ({} for reservations)", n - REQUESTS),
+        n => format!("about {n} requests"),
+    }
+}
 
 /// Pages read at most per request kind.
 const MAX_PAGES: usize = 10;
@@ -45,13 +64,48 @@ const DAY: f64 = 86_400.0;
 /// Days the usage types, coverage and commitments look back over.
 pub const WINDOW_DAYS: f64 = 30.0;
 
-/// The services whose reservations a reading looks at.
-const RESERVED: &[&str] = &["Amazon Relational Database Service", "Amazon Redshift", "Amazon ElastiCache", "Amazon OpenSearch Service"];
+/// The services whose reservations a reading looks at (Cost Explorer's names), and the name
+/// GetReservationUtilization takes for each.
+const RESERVED: &[(&str, &str)] = &[
+    ("Amazon Relational Database Service", "Amazon Relational Database Service"),
+    ("Amazon Redshift", "Amazon Redshift"),
+    ("Amazon ElastiCache", "Amazon ElastiCache"),
+    ("Amazon OpenSearch Service", "Amazon Elasticsearch Service"),
+];
 
 /// One Cost Explorer request, counted.
 pub fn call<T: DeserializeOwned>(aws: &Aws, operation: &str, input: &Value) -> aws::Result<T> {
     settings::count_requests(1);
     aws.call_once(&ce::SERVICE, operation, input)
+}
+
+/// The environments being read now, in this process: a reading started twice (a module
+/// revisited while its reading runs) would bill every request twice.
+static READING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// While it lives, `env` is being read.
+struct Reading(String);
+
+impl Reading {
+    fn begin(env: &str) -> Option<Reading> {
+        let mut list = READING.lock().unwrap_or_else(|e| e.into_inner());
+        if list.iter().any(|e| e == env) {
+            return None;
+        }
+        list.push(env.to_string());
+        Some(Reading(env.to_string()))
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        READING.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| *e != self.0);
+    }
+}
+
+/// Whether `env`'s costs are being read now (in this process).
+pub fn is_reading(env: &str) -> bool {
+    READING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e == env)
 }
 
 /// Who reads the costs of an environment whose AWS client is `env_aws`: the profile set in
@@ -63,34 +117,29 @@ pub fn billing(env_aws: &Aws) -> Arc<Aws> {
     }
 }
 
-/// The filter that keeps `account`'s costs, for a reader that sees several (the management
-/// account); `None` when the environment reads its own.
+/// The filter that keeps `account`'s costs (a 12-digit account id; `None` for anything else).
+/// Always applied: whoever reads, the management account included when an environment lives
+/// there, sees only that account.
 pub fn account_filter(account: &str) -> Option<Value> {
-    settings::load()
-        .profile
-        .filter(|p| !p.is_empty())
-        .map(|_| json!({ "Dimensions": { "Key": "LINKED_ACCOUNT", "Values": [account] } }))
+    sts::is_account_id(account).then(|| json!({ "Dimensions": { "Key": "LINKED_ACCOUNT", "Values": [account] } }))
 }
 
 // ---- the account ---------------------------------------------------------------------------
 
 /// The AWS account the environment's `profile` signs in to: the profile's `sso_account_id`,
-/// else what STS says (free), remembered in the costs settings. Credentials taken from the
-/// environment variables are asked every time: they can change between runs.
+/// else what STS says, asked at every reading (it is free, and a profile can be pointed at
+/// another account). Remembered in the costs settings to tell which environments share one.
 pub fn account_of(profile: &str, env_aws: &Aws) -> aws::Result<String> {
     let name = credentials::effective_profile(profile);
     let from_env = profile.is_empty() && std::env::var("AWS_ACCESS_KEY_ID").is_ok_and(|v| !v.is_empty());
-    if !from_env {
-        let configured = AwsFiles::load().profile(&name).and_then(|p| p.get("sso_account_id").cloned());
-        if let Some(account) = configured.filter(|a| sts::is_account_id(a)) {
-            settings::remember_account(&name, &account);
-            return Ok(account);
-        }
-        if let Some(account) = settings::load().accounts.get(&name) {
-            return Ok(account.clone());
-        }
+    let configured = if from_env { None } else { AwsFiles::load().profile(&name).and_then(|p| p.get("sso_account_id").cloned()) };
+    let account = match configured.filter(|a| sts::is_account_id(a)) {
+        Some(a) => a,
+        None => sts::caller_account(env_aws)?,
+    };
+    if !sts::is_account_id(&account) {
+        return Err(AwsError::Config(format!("'{}' is not an AWS account id", sanitize(&account))));
     }
-    let account = sts::caller_account(env_aws)?;
     if !from_env {
         settings::remember_account(&name, &account);
     }
@@ -156,10 +205,10 @@ impl Window {
         Window { today, this_month, last_month: month_start(this_month - DAY), since: today - WINDOW_DAYS * DAY }
     }
 
-    /// The end (exclusive) of last month's days that match this month's so far: the 1st to
-    /// the 23rd of both, today included.
+    /// The end (exclusive) of last month's days that match this month's complete ones: on the
+    /// 23rd, the 1st to the 22nd of both (today is still being counted); none on the 1st.
     fn last_month_to_date_end(&self) -> f64 {
-        (self.last_month + (self.today - self.this_month) + DAY).min(self.this_month)
+        (self.last_month + (self.today - self.this_month)).min(self.this_month)
     }
 }
 
@@ -253,9 +302,13 @@ fn each<'a>(pages: &'a [Value], list: &'a str) -> impl Iterator<Item = &'a Value
 /// hears each step. Only the daily costs are needed: a part that fails is noted in
 /// [`Snapshot::missing`] and the rest is kept.
 pub fn read(env: &str, profile: &str, env_aws: &Aws, now: f64, progress: &dyn Fn(&str)) -> aws::Result<Snapshot> {
+    let Some(_reading) = Reading::begin(env) else {
+        return Err(AwsError::Config(format!("the costs of {env} are being read already")));
+    };
+    // Unreadable settings would quietly read with another profile: stop instead.
+    let settings = settings::check().map_err(|e| AwsError::Config(e.to_string()))?;
     progress("finding the account");
     let account = account_of(profile, env_aws)?;
-    let settings = settings::load();
     if let Some(mut recent) = recent_reading(env, &account, &reader_label(&settings), now) {
         // Another environment in the same account was just read: the same figures, for free.
         recent.requests = 0;
@@ -267,7 +320,14 @@ pub fn read(env: &str, profile: &str, env_aws: &Aws, now: f64, progress: &dyn Fn
     let reader_aws = billing(env_aws);
     let r = Reader { aws: &reader_aws, account: account_filter(&account), requests: Cell::new(0) };
     let w = Window::at(now);
-    let mut s = Snapshot { account, read_at: now, currency: "USD".into(), reader: reader_label(&settings), ..Default::default() };
+    let mut s = Snapshot {
+        env: env.to_string(),
+        account,
+        read_at: now,
+        currency: "USD".into(),
+        reader: reader_label(&settings),
+        ..Default::default()
+    };
     let by_org = settings.reader().is_some();
 
     progress("costs by day");
@@ -277,6 +337,7 @@ pub fn read(env: &str, profile: &str, env_aws: &Aws, now: f64, progress: &dyn Fn
     }
     s.services = services_from_daily(&pages, &w);
     s.month_to_date = s.services.iter().map(|x| x.month_to_date).sum();
+    s.month_to_date_complete = s.services.iter().map(|x| x.month_to_date_complete).sum();
     s.last_month = s.services.iter().map(|x| x.last_month).sum();
     s.last_month_to_date = s.services.iter().map(|x| x.last_month_to_date).sum();
 
@@ -320,19 +381,27 @@ pub fn read(env: &str, profile: &str, env_aws: &Aws, now: f64, progress: &dyn Fn
         Err(e) => note(&mut s, "Savings Plans (DescribeSavingsPlans)", e)?,
     }
     progress("reservations");
-    match reserved_share(&r, &w) {
-        Ok(c) => s.coverage.extend(c),
-        Err(e) => note(&mut s, "reservation coverage", e)?,
-    }
-    match reservations(&r, &w, by_org) {
-        Ok(c) => s.commitments.extend(c),
-        Err(e) => note(&mut s, "reservations", e)?,
-    }
+    let reserved = match reserved_share(&r, &w) {
+        Ok(c) => c,
+        Err(e) => {
+            note(&mut s, "reservation coverage", e)?;
+            Vec::new()
+        }
+    };
     progress("purchase recommendation");
     match recommendation(&r, by_org) {
         Ok(rec) => s.recommendation = rec,
         Err(e) => note(&mut s, "Savings Plans recommendation", e)?,
     }
+    // One request per service reservations covered: AWS takes a single service at a time.
+    for c in reserved.iter().filter(|c| c.covered > 0.0) {
+        progress(&format!("reservations of {}", c.service));
+        match reservations(&r, &w, &c.service, by_org) {
+            Ok(list) => s.commitments.extend(list),
+            Err(e) => note(&mut s, &format!("reservations of {}", c.service), e)?,
+        }
+    }
+    s.coverage.extend(reserved);
     s.requests = r.requests.get();
     if let Err(e) = super::save(env, &s) {
         s.missing.push(format!("not kept on disk: {e}"));
@@ -346,24 +415,21 @@ pub fn read(env: &str, profile: &str, env_aws: &Aws, now: f64, progress: &dyn Fn
 fn recent_reading(env: &str, account: &str, reader: &str, now: f64) -> Option<Snapshot> {
     let own = super::cache_path(env)?;
     let dir = own.parent()?;
-    let mut best: Option<(String, Snapshot)> = None;
+    let mut best: Option<Snapshot> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         let name = path.file_name()?.to_string_lossy().into_owned();
-        let Some(other) = name.strip_prefix("costs-").and_then(|n| n.strip_suffix(".json")) else { continue };
-        if path == own {
+        if !name.starts_with("costs-") || !name.ends_with(".json") || path == own {
             continue;
         }
-        let Some(s) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Snapshot>(&t).ok()) else { continue };
+        let Some(s) = std::fs::read_to_string(&path).ok().and_then(|t| super::parse(&t)) else { continue };
         let fresh = now - s.read_at < REUSE_SECS && s.read_at <= now;
-        if s.account == account && s.reader == reader && fresh && best.as_ref().is_none_or(|(_, b)| s.read_at > b.read_at) {
-            best = Some((other.to_string(), s));
+        if !s.env.is_empty() && s.env != env && s.account == account && s.reader == reader && fresh && best.as_ref().is_none_or(|b| s.read_at > b.read_at)
+        {
+            best = Some(s);
         }
     }
-    best.map(|(from, mut s)| {
-        s.copied_from = Some(from);
-        s
-    })
+    best.map(|s| Snapshot { copied_from: Some(s.env.clone()), env: env.to_string(), ..s })
 }
 
 /// How long a reading serves the other environments of its account.
@@ -403,8 +469,9 @@ fn daily(r: &Reader, w: &Window) -> aws::Result<Vec<Value>> {
     r.pages("GetCostAndUsage", r.filtered(input, Some(no_credits())), ("NextPageToken", "NextPageToken"))
 }
 
-/// Per service, from daily costs: this month so far, last month, last month to the same
-/// day, and the series; the most expensive first.
+/// Per service, from daily costs: this month so far (and its complete days), last month,
+/// last month's same complete days, and the series; the most expensive first. A day split
+/// over pages adds up.
 pub fn services_from_daily(pages: &[Value], w: &Window) -> Vec<ServiceCost> {
     let mut by_service: BTreeMap<String, BTreeMap<i64, f64>> = BTreeMap::new();
     for result in each(pages, "ResultsByTime") {
@@ -422,6 +489,7 @@ pub fn services_from_daily(pages: &[Value], w: &Window) -> Vec<ServiceCost> {
             let sum = |from: f64, to: f64| days.iter().filter(|(t, _)| (**t as f64) >= from && (**t as f64) < to).map(|(_, c)| c).sum::<f64>();
             ServiceCost {
                 month_to_date: sum(w.this_month, f64::INFINITY),
+                month_to_date_complete: sum(w.this_month, w.today),
                 last_month: sum(w.last_month, w.this_month),
                 last_month_to_date: sum(w.last_month, to_date_end),
                 daily: days.iter().map(|(t, c)| (*t as f64, *c)).collect(),
@@ -570,28 +638,47 @@ fn plan_commitment(p: &savingsplans::SavingsPlan, utilization: &BTreeMap<String,
     }
 }
 
-/// The share of each reservable service's cost that reservations cover, by purchase type.
+/// The share of each reservable service's instance hours that reservations cover: its
+/// running-hours usage types by purchase type (storage, I/O and backups are never reserved,
+/// and counting them would hide how much of the instances is).
 fn reserved_share(r: &Reader, w: &Window) -> aws::Result<Vec<Coverage>> {
+    let services: Vec<&str> = RESERVED.iter().map(|(s, _)| *s).collect();
     let input = json!({
         "TimePeriod": period(w.since, w.today),
         "Granularity": "MONTHLY",
         "Metrics": ["AmortizedCost"],
-        "GroupBy": [{ "Type": "DIMENSION", "Key": "SERVICE" }, { "Type": "DIMENSION", "Key": "PURCHASE_TYPE" }],
+        "GroupBy": [{ "Type": "DIMENSION", "Key": "USAGE_TYPE" }, { "Type": "DIMENSION", "Key": "PURCHASE_TYPE" }],
     });
-    let pages = r.pages("GetCostAndUsage", r.filtered(input, Some(usage_lines())), ("NextPageToken", "NextPageToken"))?;
+    let reservable = json!({ "And": [usage_lines(), { "Dimensions": { "Key": "SERVICE", "Values": services } }] });
+    let pages = r.pages("GetCostAndUsage", r.filtered(input, Some(reservable)), ("NextPageToken", "NextPageToken"))?;
     Ok(reserved_from(&pages))
+}
+
+/// The reservable service whose instance hours `usage_type` is (`USE1-InstanceUsage:db.r6g.large`,
+/// `Node:ra3.4xlarge`, `NodeUsage:cache.r6g.large`, `ESInstance:r6g.large.search`); `None` for
+/// anything else (storage, I/O, backups).
+fn reserved_usage(usage_type: &str) -> Option<&'static str> {
+    let name = crate::savings::billing::split_region(usage_type).1;
+    if name.starts_with("InstanceUsage:db.") || name.starts_with("Multi-AZUsage:db.") {
+        Some("Amazon Relational Database Service")
+    } else if name.starts_with("Node:") {
+        Some("Amazon Redshift")
+    } else if name.starts_with("NodeUsage:cache.") {
+        Some("Amazon ElastiCache")
+    } else if name.starts_with("ESInstance:") {
+        Some("Amazon OpenSearch Service")
+    } else {
+        None
+    }
 }
 
 pub fn reserved_from(pages: &[Value]) -> Vec<Coverage> {
     let mut by: BTreeMap<String, (f64, f64)> = BTreeMap::new();
     for result in each(pages, "ResultsByTime") {
         for group in result.get("Groups").and_then(Value::as_array).into_iter().flatten() {
-            let service = key(group, 0);
-            if !RESERVED.contains(&service.as_str()) {
-                continue;
-            }
+            let Some(service) = reserved_usage(&key(group, 0)) else { continue };
             let cost = amount(group.get("Metrics").unwrap_or(&Value::Null), "AmortizedCost");
-            let e = by.entry(service).or_default();
+            let e = by.entry(service.to_string()).or_default();
             e.1 += cost;
             if key(group, 1).to_lowercase().contains("reserved") {
                 e.0 += cost;
@@ -609,11 +696,14 @@ pub fn reserved_from(pages: &[Value]) -> Vec<Coverage> {
         .collect()
 }
 
-fn reservations(r: &Reader, w: &Window, by_org: bool) -> aws::Result<Vec<Commitment>> {
+/// The reservations of one service (Cost Explorer's name), reservation by reservation.
+fn reservations(r: &Reader, w: &Window, service: &str, by_org: bool) -> aws::Result<Vec<Commitment>> {
+    let Some((_, name)) = RESERVED.iter().find(|(s, _)| *s == service) else { return Ok(Vec::new()) };
     let input = json!({
         "TimePeriod": period(w.since, w.today),
         "GroupBy": [{ "Type": "DIMENSION", "Key": "SUBSCRIPTION_ID" }],
-        "Filter": { "Dimensions": { "Key": "SERVICE", "Values": RESERVED } },
+        // GetReservationUtilization takes a single SERVICE value.
+        "Filter": { "Dimensions": { "Key": "SERVICE", "Values": [name] } },
     });
     let pages = r.pages("GetReservationUtilization", input, ("NextPageToken", "NextPageToken"))?;
     Ok(reservations_from(&pages, by_org))
@@ -713,8 +803,12 @@ mod tests {
         assert_eq!((date(w.today), date(w.this_month), date(w.last_month)), ("2026-03-31".into(), "2026-03-01".into(), "2026-02-01".into()));
         // The 31st of March compares with the whole of February, no more.
         assert_eq!(date(w.last_month_to_date_end()), "2026-03-01");
+        // On the 23rd, the 22 complete days of each month (today is still being counted).
         let w = Window::at(at("2026-10-23T10:00:00Z"));
-        assert_eq!(date(w.last_month_to_date_end()), "2026-09-24");
+        assert_eq!(date(w.last_month_to_date_end()), "2026-09-23");
+        // On the 1st nothing is complete yet: nothing to compare.
+        let first = Window::at(at("2026-11-01T10:00:00Z"));
+        assert_eq!(first.last_month_to_date_end(), first.last_month);
         assert_eq!(date(w.since), "2026-09-23");
         // On the last day of a month the forecast still covers one day.
         let last = Window::at(at("2026-10-31T22:00:00Z"));
@@ -738,9 +832,18 @@ mod tests {
         let services = services_from_daily(&pages, &w);
         assert_eq!(services[0].service, "AWS Lambda");
         let l = &services[0];
-        assert_eq!((l.month_to_date, l.last_month, l.last_month_to_date), (33.0, 7.0, 3.0));
+        // The 3rd is today: in this month so far, not in what compares with September's 1st–2nd.
+        assert_eq!((l.month_to_date, l.month_to_date_complete, l.last_month, l.last_month_to_date), (33.0, 30.0, 7.0, 3.0));
         assert_eq!(l.daily.len(), 6);
         assert_eq!(services[1].last_month, 15.0);
+        // A day split over two pages adds up.
+        let split = [
+            json!({ "ResultsByTime": [{ "TimePeriod": { "Start": "2026-10-01" }, "Groups": [
+                { "Keys": ["AWS Lambda"], "Metrics": { "AmortizedCost": { "Amount": "4" } } }] }], "NextPageToken": "x" }),
+            json!({ "ResultsByTime": [{ "TimePeriod": { "Start": "2026-10-01" }, "Groups": [
+                { "Keys": ["AWS Lambda"], "Metrics": { "AmortizedCost": { "Amount": "6" } } }] }] }),
+        ];
+        assert_eq!(services_from_daily(&split, &w)[0].daily, [(at("2026-10-01T00:00:00Z"), 10.0)]);
     }
 
     #[test]
@@ -797,18 +900,36 @@ mod tests {
         assert_eq!(ri[0].services, ["Amazon Relational Database Service"]);
         assert_eq!((ri[0].id.as_str(), ri[0].hourly, ri[0].unused_cost), ("2 × db.r6g.xlarge", 1.0, Some(0.0)));
 
+        // Instances fully reserved: storage and I/O (never reserved) do not dilute the share.
         let share = reserved_from(&[json!({ "ResultsByTime": [{ "Groups": [
-            { "Keys": ["Amazon Relational Database Service", "Standard Reserved Instances"], "Metrics": { "AmortizedCost": { "Amount": "60" } } },
-            { "Keys": ["Amazon Relational Database Service", "On Demand Instances"], "Metrics": { "AmortizedCost": { "Amount": "40" } } },
-            { "Keys": ["AWS Lambda", "On Demand Instances"], "Metrics": { "AmortizedCost": { "Amount": "40" } } } ] }] })]);
-        assert_eq!(share.len(), 1);
-        assert_eq!((share[0].covered, share[0].by.as_str()), (0.6, "reservations"));
+            { "Keys": ["InstanceUsage:db.r6g.xlarge", "Standard Reserved Instances"], "Metrics": { "AmortizedCost": { "Amount": "600" } } },
+            { "Keys": ["Aurora:StorageUsage", "On Demand Instances"], "Metrics": { "AmortizedCost": { "Amount": "400" } } },
+            { "Keys": ["USE2-Node:ra3.4xlarge", "Reserved Instances"], "Metrics": { "AmortizedCost": { "Amount": "40" } } },
+            { "Keys": ["USE2-Node:ra3.4xlarge", "On Demand Instances"], "Metrics": { "AmortizedCost": { "Amount": "60" } } },
+            { "Keys": ["Lambda-GB-Second", "On Demand Instances"], "Metrics": { "AmortizedCost": { "Amount": "40" } } } ] }] })]);
+        assert_eq!(share.len(), 2);
+        assert_eq!((share[0].service.as_str(), share[0].covered, share[0].by.as_str()), ("Amazon Redshift", 0.4, "reservations"));
+        assert_eq!((share[1].service.as_str(), share[1].covered), ("Amazon Relational Database Service", 1.0));
 
         assert!(recommendation_from(&json!({ "SavingsPlansPurchaseRecommendation": {} })).is_none());
         let rec = recommendation_from(&json!({ "SavingsPlansPurchaseRecommendation": { "TermInYears": "ONE_YEAR",
             "SavingsPlansPurchaseRecommendationSummary": { "HourlyCommitmentToPurchase": "0.80", "EstimatedMonthlySavingsAmount": "140.25" } } }))
         .unwrap();
         assert_eq!((rec.hourly_commitment, rec.estimated_monthly_savings), (0.8, 140.25));
+    }
+
+    #[test]
+    fn readings_keep_the_account_and_run_once() {
+        // Whoever reads, the environment's account only (a 12-digit id; nothing else).
+        assert_eq!(
+            account_filter("123456789012"),
+            Some(json!({ "Dimensions": { "Key": "LINKED_ACCOUNT", "Values": ["123456789012"] } }))
+        );
+        assert!(account_filter("1234").is_none() && account_filter("12345678901x").is_none());
+        let first = Reading::begin("tests-env").unwrap();
+        assert!(is_reading("tests-env") && Reading::begin("tests-env").is_none(), "a second reading waits for the first");
+        drop(first);
+        assert!(!is_reading("tests-env") && Reading::begin("tests-env").is_some());
     }
 
     #[test]

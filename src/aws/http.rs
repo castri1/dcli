@@ -120,7 +120,7 @@ pub fn api_error(resp: &RawResponse) -> AwsError {
         let text = String::from_utf8_lossy(&resp.body);
         if let Some(code) = crate::util::xml_text(&text, "Code") {
             let message = crate::util::xml_text(&text, "Message").unwrap_or_default();
-            return AwsError::Api { status: resp.status, code, message };
+            return AwsError::Api { status: resp.status, code: crate::util::sanitize(&code), message: crate::util::sanitize(&message) };
         }
     }
     let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or_default();
@@ -148,5 +148,20 @@ pub fn api_error(resp: &RawResponse) -> AwsError {
         let text = String::from_utf8_lossy(&resp.body);
         crate::util::ellipsize(text.trim(), 200)
     });
-    AwsError::Api { status: resp.status, code, message }
+    // Error texts are shown, kept (costs read in part) and put in reports.
+    AwsError::Api { status: resp.status, code: crate::util::sanitize(&code), message: crate::util::sanitize(&message) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_texts_are_sanitized() {
+        let resp = |body: &str| RawResponse { status: 400, headers: Vec::new(), body: body.as_bytes().to_vec(), error_type: None };
+        let e = api_error(&resp(r#"{"__type":"Bad\u001b[2JThing","message":"no\u001b]52;c;aGk=\u0007 way"}"#));
+        assert_eq!(e.short(), "BadThing: no way");
+        let e = api_error(&resp("<Error><Code>X&#x1b;[31mY</Code><Message>m&#x1b;[2Jn</Message></Error>"));
+        assert!(!e.short().chars().any(crate::util::is_unsafe), "{:?}", e.short());
+    }
 }

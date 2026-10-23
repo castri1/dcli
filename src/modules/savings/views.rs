@@ -177,7 +177,7 @@ impl Savings {
             .map(|e| {
                 let status = ledger::status(e, now);
                 let result = match (&e.verified, status) {
-                    (Some(v), _) => format!("{} · {} a month", status.label(), money(v.saved_monthly(), &e.currency)),
+                    (Some(v), _) => format!("{} · {}", status.label(), v.difference(&e.currency)),
                     (None, _) => status.label(),
                 };
                 let expected = e.expected.map(|x| format!("≈ {}/mo", money(x, &e.currency))).unwrap_or_else(|| "—".into());
@@ -227,9 +227,10 @@ impl Savings {
                 ),
                 kw,
             ));
-            let saved = v.saved_monthly();
-            let text = if saved >= 0.0 { format!("≈ {} less a month", money(saved, &e.currency)) } else { format!("≈ {} more a month", money(-saved, &e.currency)) };
-            lines.push(widgets::kv("Difference", Span::styled(text, status_style(status)), kw));
+            lines.push(widgets::kv("Difference", Span::styled(v.difference(&e.currency), status_style(status)), kw));
+            for note in &v.notes {
+                lines.push(Line::styled(format!("! {note}"), theme::muted()));
+            }
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(

@@ -11,7 +11,7 @@ use crate::aws::profile::AwsFiles;
 use crate::cli::{aws_for, confirm, env_and, interactive, paint, print_json};
 use crate::config::Config;
 use crate::costs::analysis::{self, Deploy, Step, change, money, rate};
-use crate::costs::explorer::{self, REQUESTS, date};
+use crate::costs::explorer::{self, date};
 use crate::costs::settings::{self, Refresh};
 use crate::costs::{self, ServiceCost, Snapshot, services};
 use crate::savings::qty;
@@ -70,15 +70,21 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
     let aws = aws_for(config, &env)?;
     let now = now_secs();
     let mut snapshot = costs::cached(&env);
-    let daily = settings::load().refresh == Refresh::Daily && snapshot.as_ref().is_none_or(|s| now - s.read_at >= DAY);
+    // Once a day, and not again soon after an attempt (one that failed is not retried at
+    // every run).
+    let daily = !args.refresh && settings::daily_due(&env, snapshot.as_ref().map(|s| s.read_at), now);
+    if daily {
+        settings::daily_attempted(&env, now);
+    }
     if args.refresh || daily {
         if args.refresh && !args.yes {
             if !interactive() {
                 bail!("reading Cost Explorer makes billed requests: pass --yes to read without being asked");
             }
             let question = format!(
-                "Read the costs of {env} with {}: about {REQUESTS} Cost Explorer requests, each billed by AWS ({} this month so far)?",
+                "Read the costs of {env} with {}: {} to Cost Explorer, each billed by AWS ({} this month so far)?",
                 explorer::reader_label(&settings::load()),
+                explorer::requests_text(&env),
                 settings::requests_this_month()
             );
             if !confirm(&question) {
@@ -94,19 +100,26 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
                 eprintln!("{}", paint(&format!("  {step}"), "90"));
             }
         };
-        let s = explorer::read(&env, &profile, &aws, now, &progress)?;
-        if progress_shown {
-            eprintln!(
-                "{}",
-                paint(&format!("Read: {} ({} requests this month)", analysis::read_note(&s), settings::requests_this_month()), "90")
-            );
+        match explorer::read(&env, &profile, &aws, now, &progress) {
+            Ok(s) => {
+                if progress_shown {
+                    eprintln!(
+                        "{}",
+                        paint(&format!("Read: {} ({} requests this month)", analysis::read_note(&s), settings::requests_this_month()), "90")
+                    );
+                }
+                snapshot = Some(s);
+            }
+            // The once-a-day reading failing leaves what was read before.
+            Err(e) if daily && snapshot.is_some() => eprintln!("{}", paint(&format!("! could not read the costs again: {}", e.short()), "33")),
+            Err(e) => return Err(e.into()),
         }
-        snapshot = Some(s);
     }
     let Some(s) = snapshot else {
         bail!(
-            "the costs of {env} have not been read yet: {} costs {env} --refresh (about {REQUESTS} Cost Explorer requests, each billed by AWS)",
-            program()
+            "the costs of {env} have not been read yet: {} costs {env} --refresh ({} to Cost Explorer, each billed by AWS)",
+            program(),
+            explorer::requests_text(&env)
         );
     };
     let pipelines: Vec<String> = config.env(&env)?.pipelines.iter().map(|p| p.name.clone()).collect();
@@ -131,23 +144,27 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
 }
 
 fn setup(args: &Args) -> Result<ExitCode> {
-    let mut s = settings::load();
-    if let Some(p) = &args.profile {
-        if !AwsFiles::load().profile_names().contains(p) {
-            bail!("no profile named '{p}' in ~/.aws/config");
+    if let Some(p) = &args.profile
+        && !AwsFiles::load().profile_names().contains(p)
+    {
+        bail!("no profile named '{p}' in ~/.aws/config");
+    }
+    let refresh = match args.mode.as_deref().map(str::to_lowercase).as_deref() {
+        None => None,
+        Some("manual") => Some(Refresh::Manual),
+        Some("daily") => Some(Refresh::Daily),
+        Some(other) => bail!("--mode is manual or daily, not '{other}'"),
+    };
+    let s = settings::update(|s| {
+        if let Some(p) = &args.profile {
+            s.profile = Some(p.clone());
+        } else if args.own_profile {
+            s.profile = None;
         }
-        s.profile = Some(p.clone());
-    } else if args.own_profile {
-        s.profile = None;
-    }
-    if let Some(mode) = &args.mode {
-        s.refresh = match mode.to_lowercase().as_str() {
-            "manual" => Refresh::Manual,
-            "daily" => Refresh::Daily,
-            other => bail!("--mode is manual or daily, not '{other}'"),
-        };
-    }
-    settings::save(&s)?;
+        if let Some(r) = refresh {
+            s.refresh = r;
+        }
+    })?;
     println!(
         "Costs are read by {}, {}",
         explorer::reader_label(&s),
@@ -187,8 +204,9 @@ fn summary(config: &Config, env: &str, s: &Snapshot, steps: &[Step], json: bool)
         let verb = if shared.len() == 1 { "uses" } else { "use" };
         println!("{}", paint(&format!("{} {verb} this account too: these are the account's costs", shared.join(", ")), "90"));
     }
-    let vs = change(s.month_to_date, s.last_month_to_date)
-        .map(|ch| format!("   {ch} vs the same days of last month ({})", money(s.last_month_to_date, c)))
+    // Complete days on both sides: today is still being counted (nothing to compare on the 1st).
+    let vs = change(s.month_to_date_complete, s.last_month_to_date)
+        .map(|ch| format!("   {ch} to yesterday vs the same days of last month ({})", money(s.last_month_to_date, c)))
         .unwrap_or_default();
     println!("This month to {}   {}{vs}", date(s.read_at), paint(&money(s.month_to_date, c), "1"));
     println!("Last month               {}", money(s.last_month, c));
@@ -207,7 +225,7 @@ fn summary(config: &Config, env: &str, s: &Snapshot, steps: &[Step], json: bool)
             ellipsize(&x.service, name_w),
             money(x.month_to_date, c),
             money(x.last_month, c),
-            change(x.month_to_date, x.last_month_to_date).unwrap_or_default(),
+            change(x.month_to_date_complete, x.last_month_to_date).unwrap_or_default(),
             paint(&format!("{:<30}", sparkline(&values)), "36"),
             services::module(&x.service).unwrap_or(""),
             if marked { paint(" ▲", "33") } else { String::new() }

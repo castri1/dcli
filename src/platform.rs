@@ -167,12 +167,15 @@ pub fn write_temp_file(label: &str, content: &str) -> std::io::Result<PathBuf> {
 }
 
 /// Replaces the file at `path` with `content`, readable only by the user: written whole to a
-/// new file next to it (never following a link there), then moved over the old one.
+/// new file next to it (never following a link there), flushed to disk, then moved over the
+/// old one. Each write has its own temporary name, so threads writing at once do not meet.
 pub fn write_private(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = path.parent().ok_or_else(|| std::io::Error::other(format!("no folder for {}", path.display())))?;
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.{}", std::process::id()));
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{n}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -181,7 +184,7 @@ pub fn write_private(path: &std::path::Path, content: &[u8]) -> std::io::Result<
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = options.open(&tmp).and_then(|mut f| f.write_all(content));
+    let written = options.open(&tmp).and_then(|mut f| f.write_all(content).and_then(|()| f.sync_all()));
     written.and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })

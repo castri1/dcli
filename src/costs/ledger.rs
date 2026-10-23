@@ -47,12 +47,26 @@ pub struct Verification {
     pub after: f64,
     pub days_before: u32,
     pub days_after: u32,
+    /// The account whose bill was read.
+    pub account: String,
+    /// What the comparison cannot tell (usage that commitments cover, say).
+    pub notes: Vec<String>,
 }
 
 impl Verification {
     /// What the difference comes to in a month (positive: it costs less).
     pub fn saved_monthly(&self) -> f64 {
         (self.before - self.after) * MONTH_DAYS
+    }
+
+    /// `≈ US$ 38 less a month`, `≈ US$ 12 more a month`.
+    pub fn difference(&self, currency: &str) -> String {
+        let saved = self.saved_monthly();
+        if saved >= 0.0 {
+            format!("≈ {} less a month", savings::price::money(saved, currency))
+        } else {
+            format!("≈ {} more a month", savings::price::money(-saved, currency))
+        }
     }
 }
 
@@ -124,7 +138,9 @@ fn day_text(t: f64) -> String {
 
 /// What an entry's verification says.
 pub fn status(e: &Entry, now: f64) -> Status {
-    let ready = day_start(e.at) + f64::from(READY_DAYS + 1) * DAY;
+    // READY_DAYS whole days after the change's own, yesterday (not complete on the bill yet)
+    // left out.
+    let ready = day_start(e.at) + f64::from(READY_DAYS + 2) * DAY;
     let Some(v) = &e.verified else {
         return if now < ready { Status::Waiting(ready) } else { Status::Ready };
     };
@@ -148,15 +164,28 @@ pub fn load() -> Vec<Entry> {
     path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
-fn save(entries: &[Entry]) -> std::io::Result<()> {
+/// Every entry; an error when the file exists but cannot be read or is not valid, so that
+/// it is never replaced by what little dcli would write over it.
+fn load_checked() -> std::io::Result<Vec<Entry>> {
     let path = path().ok_or_else(|| std::io::Error::other("cannot find the home directory"))?;
-    // A file that cannot be read back is left alone rather than replaced.
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && serde_json::from_str::<Vec<Entry>>(&text).is_err()
-    {
-        return Err(std::io::Error::other(format!("{} is not valid JSON: fix or delete it", path.display())));
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| std::io::Error::other(format!("{} is not valid ({e}): fix or delete it", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(std::io::Error::other(format!("cannot read {}: {e}", path.display()))),
     }
-    crate::platform::write_private(&path, (serde_json::to_string_pretty(entries).unwrap_or_default() + "\n").as_bytes())
+}
+
+/// One change to the ledger at a time (the UI and background actions both record).
+static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reads the entries, changes them with `change` and writes them back.
+fn update(change: impl FnOnce(&mut Vec<Entry>)) -> std::io::Result<()> {
+    let _one = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = load_checked()?;
+    change(&mut all);
+    let path = path().ok_or_else(|| std::io::Error::other("cannot find the home directory"))?;
+    crate::platform::write_private(&path, (serde_json::to_string_pretty(&all).unwrap_or_default() + "\n").as_bytes())
 }
 
 /// The entries of `env`, newest first.
@@ -168,18 +197,22 @@ pub fn of_env(env: &str) -> Vec<Entry> {
 
 /// Keeps `entry` (a new one, or the new state of one with its id).
 pub fn put(entry: Entry) -> std::io::Result<()> {
-    let mut all = load();
-    match all.iter_mut().find(|e| e.id == entry.id) {
+    update(|all| match all.iter_mut().find(|e| e.id == entry.id) {
         Some(slot) => *slot = entry,
         None => all.push(entry),
-    }
-    save(&all)
+    })
 }
 
 pub fn remove(id: &str) -> std::io::Result<()> {
-    let mut all = load();
-    all.retain(|e| e.id != id);
-    save(&all)
+    update(|all| all.retain(|e| e.id != id))
+}
+
+/// Notes `v` on `e`, and the account it was read for when `e` did not know it yet.
+pub fn verified(e: &mut Entry, v: Verification) {
+    if !crate::aws::sts::is_account_id(&e.account) && crate::aws::sts::is_account_id(&v.account) {
+        e.account = v.account.clone();
+    }
+    e.verified = Some(v);
 }
 
 fn new_id(at: f64, what: &str) -> String {
@@ -277,6 +310,9 @@ pub fn note_aurora(env: &str, region: &str, inv: &rds::Inventory, action: &rds::
     };
     let note = match action {
         rds::Action::Stop { cluster } => Note::new(env, region, "Aurora", cluster, classes(cluster), format!("Stopped {cluster}")),
+        // A class change left for the maintenance window is not followed: the bill around
+        // today would only show the old class.
+        rds::Action::SetClass { now: false, .. } => return,
         rds::Action::SetClass { instance, class, .. } => {
             let Some(i) = inv.instances.iter().find(|i| i.id == *instance) else { return };
             let usage = usage_of_instance("Aurora", &i.class).into_iter().chain(usage_of_instance("Aurora", class)).collect();
@@ -296,34 +332,52 @@ pub fn note_aurora(env: &str, region: &str, inv: &rds::Inventory, action: &rds::
 }
 
 /// The days compared for a change at `at`, read `now`: (start, end) of the days before and
-/// after, whole UTC days, the change's own day and today left out.
+/// after, whole UTC days; the change's own day, yesterday (not complete on the bill yet) and
+/// today left out.
 pub fn windows(at: f64, now: f64) -> ((f64, f64), (f64, f64)) {
     let day = day_start(at);
     let before = (day - f64::from(WINDOW_DAYS) * DAY, day);
-    let after_end = (day + f64::from(WINDOW_DAYS + 1) * DAY).min(day_start(now));
+    let after_end = (day + f64::from(WINDOW_DAYS + 1) * DAY).min(day_start(now) - DAY);
     ((before.0, before.1), (day + DAY, after_end.max(day + DAY)))
 }
 
-/// Reads the daily cost of the entry's usage types around the change: ONE Cost Explorer
-/// request (more only when it answers in pages), each billed by AWS.
+/// The Cost Explorer requests a verification makes: one, and up to [`VERIFY_PAGES`] when the
+/// answer comes in pages.
+pub const VERIFY_PAGES: usize = 3;
+
+/// The account `e`'s bill is read for: its own, else the one its environment's costs were
+/// read for, else the one the environment's profile signs in to (STS, free).
+fn account_for(env_aws: &Aws, e: &Entry) -> aws::Result<String> {
+    let valid = |a: &str| crate::aws::sts::is_account_id(a);
+    if valid(&e.account) {
+        return Ok(e.account.clone());
+    }
+    if let Some(s) = super::cached(&e.env).filter(|s| valid(&s.account)) {
+        return Ok(s.account);
+    }
+    crate::aws::sts::caller_account(env_aws).and_then(|a| {
+        if valid(&a) { Ok(a) } else { Err(AwsError::Config("the account of this change is not known: read the costs first".into())) }
+    })
+}
+
+/// Reads the daily cost of the entry's usage types around the change, in its account and
+/// region: ONE Cost Explorer request (up to [`VERIFY_PAGES`] when it answers in pages), each
+/// billed by AWS.
 pub fn verify(env_aws: &Aws, e: &Entry, now: f64) -> aws::Result<Verification> {
     if e.service.is_empty() || e.usage.is_empty() {
         return Err(AwsError::Config("this change names no usage type to look for on the bill".into()));
     }
-    let reader = explorer::billing(env_aws);
+    // Unreadable settings would quietly read with another profile: stop instead.
+    super::settings::check().map_err(|err| AwsError::Config(err.to_string()))?;
     let ((b0, b1), (a0, a1)) = windows(e.at, now);
     if a1 <= a0 {
-        return Err(AwsError::Config(format!("no full day since the change yet: verify after {}", day_text(a0 + DAY))));
+        return Err(AwsError::Config(format!("no complete day on the bill since the change yet: verify after {}", day_text(a0 + 2.0 * DAY))));
     }
+    let account = account_for(env_aws, e)?;
+    let reader = explorer::billing(env_aws);
     let service = json!({ "Dimensions": { "Key": "SERVICE", "Values": [e.service] } });
-    let filter = match crate::costs::settings::load().profile.filter(|p| !p.is_empty()) {
-        Some(_) if e.account.is_empty() => {
-            return Err(AwsError::Config("the account of this change is not known: read the costs in the Costs module first".into()));
-        }
-        Some(_) => match explorer::account_filter(&e.account) {
-            Some(account) => json!({ "And": [service, account] }),
-            None => service,
-        },
+    let filter = match explorer::account_filter(&account) {
+        Some(a) => json!({ "And": [service, a] }),
         None => service,
     };
     let mut input = json!({
@@ -333,21 +387,35 @@ pub fn verify(env_aws: &Aws, e: &Entry, now: f64) -> aws::Result<Verification> {
         "Filter": filter,
         "GroupBy": [{ "Type": "DIMENSION", "Key": "USAGE_TYPE" }],
     });
-    let mut days: Vec<(f64, f64)> = Vec::new();
-    for _ in 0..3 {
+    let mut days: std::collections::BTreeMap<i64, f64> = Default::default();
+    for _ in 0..VERIFY_PAGES {
         let out: Value = explorer::call(&reader, "GetCostAndUsage", &input)?;
-        days.extend(daily_costs(&out, &e.usage));
+        // A day split over two pages adds up.
+        for (day, cost) in daily_costs(&out, &e.usage, &e.region) {
+            *days.entry(day as i64).or_default() += cost;
+        }
         match out.get("NextPageToken").and_then(Value::as_str).filter(|t| !t.is_empty()) {
             Some(token) => input["NextPageToken"] = json!(token),
             None => break,
         }
     }
-    Ok(compare(&days, (b0, b1), (a0, a1), now))
+    let days: Vec<(f64, f64)> = days.into_iter().map(|(d, c)| (d as f64, c)).collect();
+    let mut v = compare(&days, (b0, b1), (a0, a1), now);
+    v.account = account;
+    let covered = super::cached(&e.env).map_or(0.0, |s| s.covered(&e.service));
+    if covered > 0.0 && e.usage.iter().any(|u| crate::savings::price::coverable(u)) {
+        v.notes.push(format!(
+            "Savings Plans or reservations cover {} of this service: usage they no longer cover can still be paid for in \
+             their fee until they renew, so the bill may show less of a saving than this compares.",
+            crate::savings::percent(covered)
+        ));
+    }
+    Ok(v)
 }
 
-/// (day start, cost of `usage`'s usage types that day) from a GetCostAndUsage answer
-/// grouped by usage type.
-fn daily_costs(out: &Value, usage: &[String]) -> Vec<(f64, f64)> {
+/// (day start, cost of `usage`'s usage types that day in `region`) from a GetCostAndUsage
+/// answer grouped by usage type.
+fn daily_costs(out: &Value, usage: &[String], region: &str) -> Vec<(f64, f64)> {
     let mut days = Vec::new();
     for r in out.get("ResultsByTime").and_then(Value::as_array).into_iter().flatten() {
         let Some(start) = r.pointer("/TimePeriod/Start").and_then(Value::as_str).and_then(|d| crate::util::parse_rfc3339(&format!("{d}T00:00:00Z")))
@@ -360,9 +428,12 @@ fn daily_costs(out: &Value, usage: &[String]) -> Vec<(f64, f64)> {
             .into_iter()
             .flatten()
             .filter(|g| {
-                g.pointer("/Keys/0").and_then(Value::as_str).is_some_and(|k| usage.iter().any(|u| billing::split_region(k).1 == u))
+                g.pointer("/Keys/0").and_then(Value::as_str).is_some_and(|k| {
+                    usage.iter().any(|u| billing::split_region(k).1 == u) && (region.is_empty() || billing::in_region(k, region))
+                })
             })
             .filter_map(|g| g.pointer("/Metrics/AmortizedCost/Amount").and_then(Value::as_str).and_then(|a| a.parse::<f64>().ok()))
+            .filter(|c| c.is_finite())
             .sum();
         days.push((start, cost));
     }
@@ -377,7 +448,7 @@ fn compare(days: &[(f64, f64)], before: (f64, f64), after: (f64, f64), now: f64)
         (if n == 0 { 0.0 } else { picked.iter().sum::<f64>() / f64::from(n) }, n)
     };
     let ((b, nb), (a, na)) = (side(before), side(after));
-    Verification { at: now, before: b, after: a, days_before: nb, days_after: na }
+    Verification { at: now, before: b, after: a, days_before: nb, days_after: na, ..Default::default() }
 }
 
 #[cfg(test)]
@@ -391,28 +462,41 @@ mod tests {
     }
 
     #[test]
-    fn windows_leave_out_the_change_day_and_today() {
+    fn windows_leave_out_the_change_day_yesterday_and_today() {
         let ((b0, b1), (a0, a1)) = windows(AT, AT + 10.0 * DAY);
         assert_eq!(day_text(b0), "2026-09-07");
         assert_eq!(day_text(b1), "2026-09-21");
         assert_eq!(day_text(a0), "2026-09-22");
-        assert_eq!(day_text(a1), "2026-10-01", "today, 10 days later, is left out");
+        assert_eq!(day_text(a1), "2026-09-30", "today (10-01) and yesterday, still being billed, are left out");
         let (_, (_, a1)) = windows(AT, AT + 40.0 * DAY);
         assert_eq!(day_text(a1), "2026-10-06", "at most 14 days after");
+        let (_, (a0, a1)) = windows(AT, AT + DAY);
+        assert!(a1 <= a0, "nothing complete the day after");
     }
 
     #[test]
-    fn reads_daily_costs_of_the_usage_types() {
+    fn reads_daily_costs_of_the_usage_types_in_the_region() {
         let out = json!({ "ResultsByTime": [
             { "TimePeriod": { "Start": "2026-09-20" }, "Groups": [
                 { "Keys": ["Lambda-GB-Second"], "Metrics": { "AmortizedCost": { "Amount": "10.5" } } },
                 { "Keys": ["USW2-Lambda-GB-Second"], "Metrics": { "AmortizedCost": { "Amount": "1.5" } } },
                 { "Keys": ["Request"], "Metrics": { "AmortizedCost": { "Amount": "99" } } } ] },
             { "TimePeriod": { "Start": "2026-09-22" }, "Groups": [] } ] });
-        let days = daily_costs(&out, &["Lambda-GB-Second".into()]);
+        let days = daily_costs(&out, &["Lambda-GB-Second".into()], "us-east-1");
         assert_eq!(days.len(), 2);
-        assert!((days[0].1 - 12.0).abs() < 1e-9);
+        assert!((days[0].1 - 10.5).abs() < 1e-9, "us-west-2's line is another region");
         assert_eq!(days[1].1, 0.0);
+        assert!((daily_costs(&out, &["Lambda-GB-Second".into()], "us-west-2")[0].1 - 1.5).abs() < 1e-9);
+        assert!((daily_costs(&out, &["Lambda-GB-Second".into()], "")[0].1 - 12.0).abs() < 1e-9, "no region: all of them");
+    }
+
+    #[test]
+    fn verifications_keep_the_account_they_read() {
+        let mut e = entry(None);
+        verified(&mut e, Verification { account: "123456789012".into(), ..Default::default() });
+        assert_eq!(e.account, "123456789012");
+        verified(&mut e, Verification { account: "210987654321".into(), ..Default::default() });
+        assert_eq!(e.account, "123456789012", "an account already known stays");
     }
 
     #[test]
