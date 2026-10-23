@@ -93,8 +93,9 @@ pub fn fmt_ms(v: f64) -> String {
 /// `30m`, `1h`, `24h`, `7d`: the length of a window, for the time axis.
 pub fn fmt_window(secs: f64) -> String {
     let s = secs.round() as i64;
-    if s >= 2 * 86_400 && s % 86_400 == 0 {
-        format!("{}d", s / 86_400)
+    if (s >= 2 * 86_400 && s % 86_400 == 0) || s >= 4 * 86_400 {
+        // Whole days, or long enough that hours would only be noise (636h → 27d).
+        format!("{}d", (s + 43_200) / 86_400)
     } else if s >= 3600 {
         format!("{}h", (s + 1800) / 3600)
     } else {
