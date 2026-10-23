@@ -284,7 +284,7 @@ mod tests {
                 usage("Amazon DynamoDB", "TimedStorage-ByteHrs", 25.0, 100.0, "GB-Mo"),
                 usage("Amazon DynamoDB", "IA-TimedStorage-ByteHrs", 10.0, 100.0, "GB-Mo"),
             ],
-            coverage: vec![Coverage { service: "Amazon Relational Database Service".into(), covered: 0.6, on_demand_cost: 0.0 }],
+            coverage: vec![Coverage { service: "Amazon Relational Database Service".into(), covered: 0.6, ..Default::default() }],
             commitments: vec![Commitment {
                 kind: "RDS reserved instances".into(),
                 services: vec!["Amazon Relational Database Service".into()],

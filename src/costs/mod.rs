@@ -151,7 +151,8 @@ impl Snapshot {
 
     /// The share of `service`'s usage commitments cover (0 when unknown).
     pub fn covered(&self, service: &str) -> f64 {
-        self.coverage.iter().find(|c| c.service == service).map_or(0.0, |c| c.covered)
+        // Savings Plans and reservations cover different parts of a service's usage.
+        self.coverage.iter().filter(|c| c.service == service).map(|c| c.covered).sum::<f64>().min(1.0)
     }
 
     /// When the first commitment that can cover `service` ends.
