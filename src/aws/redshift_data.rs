@@ -98,22 +98,7 @@ pub fn save_identity(env: &str, cluster: &str, identity: &Identity) -> std::io::
         Err(e) => return Err(e),
     };
     all.insert(format!("{env}/{cluster}"), identity.clone());
-    let dir = path.parent().ok_or_else(|| std::io::Error::other("no folder for the identities file"))?;
-    std::fs::create_dir_all(dir)?;
-    // Written whole to a new private file, then moved over the old one.
-    let tmp = dir.join(format!(".redshift.json.{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    std::io::Write::write_all(&mut options.open(&tmp)?, (serde_json::to_string_pretty(&all).unwrap_or_default() + "\n").as_bytes())?;
-    std::fs::rename(&tmp, &path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::platform::write_private(&path, (serde_json::to_string_pretty(&all).unwrap_or_default() + "\n").as_bytes())
 }
 
 /// `prod/analytics/redshift` from its ARN (`…:secret:prod/analytics/redshift-AbCdEf`).

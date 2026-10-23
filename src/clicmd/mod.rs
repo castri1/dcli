@@ -7,6 +7,7 @@ pub mod appconfig;
 pub mod approvals;
 pub mod aurora;
 pub mod cfn;
+pub mod costs;
 pub mod dms;
 pub mod dynamodb;
 pub mod events;

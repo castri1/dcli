@@ -215,6 +215,8 @@ pub enum Command {
     Redshift(crate::clicmd::redshift::Args),
     /// DMS replication tasks: status, tables, CDC latency; resume, reload, stop, scale the instance
     Dms(crate::clicmd::dms::Args),
+    /// What the account costs (Cost Explorer: each request is billed, results are kept)
+    Costs(crate::clicmd::costs::Args),
     /// What could cost less: unused or oversized resources, in the units AWS bills
     Optimize(crate::clicmd::optimize::Args),
     /// Update dcli to the latest release (through npm when installed with npm)
@@ -557,6 +559,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Aurora(args) => crate::clicmd::aurora::run(config, args),
         Command::Redshift(args) => crate::clicmd::redshift::run(config, args),
         Command::Dms(args) => crate::clicmd::dms::run(config, args),
+        Command::Costs(args) => crate::clicmd::costs::run(config, args),
         Command::Optimize(args) => crate::clicmd::optimize::run(config, args),
         Command::Lambda(args) => crate::clicmd::lambda::run(config, args),
     }

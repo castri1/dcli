@@ -10,6 +10,7 @@ mod approvals;
 mod aurora;
 mod cfn;
 mod common;
+mod costs;
 mod cwlogs;
 mod dms;
 mod dynamodb;
@@ -34,6 +35,7 @@ pub fn all() -> Vec<Box<dyn Module>> {
         Box::new(matrix::Matrix::new()),
         Box::new(approvals::Approvals::new()),
         Box::new(alarms::Alarms::new()),
+        Box::new(costs::Costs::new()),
         Box::new(savings::Savings::new()),
         Box::new(parameters::Parameters::new()),
         Box::new(secrets::Secrets::new()),

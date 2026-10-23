@@ -4,6 +4,7 @@ mod catalog;
 mod cli;
 mod clicmd;
 mod config;
+mod costs;
 mod hooks;
 mod matrix;
 mod modules;

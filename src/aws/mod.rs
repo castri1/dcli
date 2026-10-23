@@ -7,6 +7,7 @@
 pub mod alarms;
 pub mod apigateway;
 pub mod appconfig;
+pub mod ce;
 pub mod cloudformation;
 pub mod cloudwatch;
 pub mod codebuild;
@@ -26,12 +27,14 @@ pub mod rds;
 pub mod redshift;
 pub mod redshift_data;
 pub mod s3;
+pub mod savingsplans;
 pub mod secrets;
 pub mod sfn;
 pub mod sigv4;
 pub mod sqs;
 pub mod ssm;
 pub mod sso;
+pub mod sts;
 pub mod xml;
 
 use std::sync::Arc;
