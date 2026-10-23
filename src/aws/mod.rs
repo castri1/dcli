@@ -388,6 +388,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn global_services_answer_on_one_host() {
+        if std::env::var_os("AWS_ENDPOINT_URL").is_some() {
+            return;
+        }
+        let aws = Aws::new("default", "us-east-1");
+        assert_eq!(aws.endpoint(&savingsplans::SERVICE).1, "savingsplans.amazonaws.com");
+        assert_eq!(aws.endpoint(&ce::SERVICE).1, "ce.us-east-1.amazonaws.com");
+        assert_eq!(aws.in_region("eu-west-1").endpoint(&sts::SERVICE).1, "sts.eu-west-1.amazonaws.com");
+        assert!(sts::is_account_id("123456789012") && !sts::is_account_id("12345678901") && !sts::is_account_id("12345678901x"));
+    }
+
+    #[test]
     fn nulls_fall_back_to_defaults() {
         let body = br#"{"Functions":[{"FunctionName":"f","Layers":null,"Environment":null,
             "VpcConfig":{"SubnetIds":null,"VpcId":null},"Architectures":["arm64"]}],"NextMarker":null}"#;
