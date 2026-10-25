@@ -10,7 +10,7 @@
 use serde::Serialize;
 
 use super::{Finding, billing};
-use crate::costs::{self, Snapshot, UsageCost};
+use crate::costs::{Snapshot, UsageCost};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,7 +71,7 @@ pub fn rate(s: &Snapshot, service: &str, name: &str, region: &str) -> Option<(f6
 /// What `f` saves a month with the rates of `s`, the costs of the account it runs in
 /// (`region` its environment's); `None` when the bill has nothing to price it with.
 pub fn price(f: &Finding, s: &Snapshot, region: &str) -> Option<Price> {
-    let service = costs::services::of_check(f.service)?;
+    let service = f.billed_service()?;
     let covered = s.covered(service).clamp(0.0, 1.0);
     let (mut items, mut notes, mut missing) = (Vec::new(), Vec::new(), Vec::new());
     let mut at_most = false;

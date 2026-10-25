@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{explorer, services};
+use super::explorer;
 use crate::aws::{self, Aws, AwsError, rds};
 use crate::savings::{self, Finding, billing};
 use crate::util::now_secs;
@@ -247,7 +247,7 @@ pub fn entry_for(f: &Finding, env: &str, region: &str, source: Source, what: imp
         module: f.module.into(),
         target: f.target.clone(),
         resource: f.resource.clone(),
-        service: services::of_check(f.service).unwrap_or_default().into(),
+        service: f.billed_service().unwrap_or_default().into(),
         usage,
         expected: f.price.as_ref().filter(|p| !p.at_most).map(|p| p.monthly),
         currency: f.price.as_ref().map(|p| p.currency.clone()).or_else(|| costs.map(|c| c.currency)).unwrap_or_default(),

@@ -140,6 +140,13 @@ pub struct Finding {
     /// Its dollars, with the account's costs read ([`price::price_all`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<price::Price>,
+    /// The lever it belongs to, the same for every finding of one kind of change (`arm64`,
+    /// `memory`, `log-retention`…): findings are added up per lever to show its whole saving.
+    pub kind: &'static str,
+    /// Cost Explorer's name of the service billed, when it is not the check's own (each
+    /// Bedrock model is billed as a service of its own).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ce_service: Option<String>,
 }
 
 impl Finding {
@@ -167,6 +174,30 @@ impl Finding {
             fix: None,
             billed: Vec::new(),
             price: None,
+            kind: "",
+            ce_service: None,
+        }
+    }
+
+    /// See [`Finding::kind`].
+    #[allow(dead_code)] // set by the checks as they name their levers
+    pub fn kind(mut self, kind: &'static str) -> Finding {
+        self.kind = kind;
+        self
+    }
+
+    /// See [`Finding::ce_service`].
+    #[allow(dead_code)] // for checks of services billed under several names
+    pub fn ce_service(mut self, service: impl Into<String>) -> Finding {
+        self.ce_service = Some(service.into());
+        self
+    }
+
+    /// Cost Explorer's name of the service its usage is billed under.
+    pub fn billed_service(&self) -> Option<&str> {
+        match &self.ce_service {
+            Some(s) => Some(s),
+            None => crate::costs::services::of_check(self.service),
         }
     }
 
