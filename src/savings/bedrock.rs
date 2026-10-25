@@ -26,14 +26,17 @@ const LOG_GB_HIGH: f64 = 100.0;
 pub fn check(scan: &Scan) -> aws::Result<Vec<Finding>> {
     let costs = costs::cached(scan.env);
     let models = bedrock::invoked_models(scan.aws)?;
-    let mut out: Vec<Finding> = usage(scan.aws, &models, scan.days)?
-        .iter()
-        .filter_map(|u| caching(u, costs.as_ref(), scan.days))
-        .collect();
+    let mut out = caching_findings(&usage(scan.aws, &models, scan.days)?, costs.as_ref(), scan.days);
     if let Some(f) = logging(scan)? {
         out.push(f);
     }
-    let provisioned: Vec<ProvisionedThroughput> = bedrock::provisioned(scan.aws)?.into_iter().filter(|p| p.status == "InService").collect();
+    // Throughput provisioned during the window had no chance to be used over all of it.
+    let since = crate::util::now_secs() - f64::from(scan.days) * 86_400.0;
+    let provisioned: Vec<ProvisionedThroughput> = bedrock::provisioned(scan.aws)?
+        .into_iter()
+        .filter(|p| p.status == "InService")
+        .filter(|p| p.creation_time.as_deref().and_then(crate::util::parse_rfc3339).is_none_or(|t| t < since))
+        .collect();
     if !provisioned.is_empty() {
         let ids: Vec<String> = provisioned.iter().map(|p| p.provisioned_model_arn.clone()).collect();
         for (p, u) in provisioned.iter().zip(usage(scan.aws, &ids, scan.days)?) {
@@ -165,20 +168,69 @@ fn bill_for_model(s: &Snapshot, model: &str) -> Option<(String, String, f64)> {
     Some((service, usage, quantity * 30.4375 / 30.0))
 }
 
-/// A model with long prompts and nothing cached.
-fn caching(u: &ModelUse, costs: Option<&Snapshot>, days: u32) -> Option<Finding> {
-    if !caching_supported(&u.model) || u.invocations <= 0.0 || u.cache_read + u.cache_write > 0.0 {
-        return None;
+/// Whether `u` is a model with long prompts and nothing cached.
+fn uncached(u: &ModelUse, days: u32) -> bool {
+    caching_supported(&u.model)
+        && u.invocations > 0.0
+        && u.cache_read + u.cache_write <= 0.0
+        && u.input * per_month(days) >= TOKENS_MEDIUM
+        && u.input / u.invocations >= MIN_PROMPT
+}
+
+/// Where the bill puts a model's input (`service|usage`, and the service, usage type and monthly
+/// quantity), or without it the model's name.
+type BillKey = (String, Option<(String, String, f64)>);
+
+/// One finding per billed model with long prompts and nothing cached. Model ids billed as one
+/// (an inference profile, `us.anthropic.…`, and its foundation model) make one finding, so they
+/// never claim the same tokens twice; each claims the share of the bill's input its own tokens
+/// are (from CloudWatch), not all of it.
+fn caching_findings(uses: &[ModelUse], costs: Option<&Snapshot>, days: u32) -> Vec<Finding> {
+    let key = |u: &ModelUse| -> BillKey {
+        match costs.and_then(|s| bill_for_model(s, &u.model)) {
+            Some((service, usage, quantity)) => (format!("{service}|{usage}"), Some((service, usage, quantity))),
+            None => (model_words(&u.model).join(" "), None),
+        }
+    };
+    let keyed: Vec<(BillKey, &ModelUse)> = uses.iter().map(|u| (key(u), u)).collect();
+    let mut out = Vec::new();
+    let mut done: Vec<&str> = Vec::new();
+    for ((k, billed), _) in &keyed {
+        if done.contains(&k.as_str()) {
+            continue;
+        }
+        done.push(k);
+        let all: Vec<&ModelUse> = keyed.iter().filter(|((k2, _), _)| k2 == k).map(|(_, u)| *u).collect();
+        let found: Vec<&ModelUse> = all.iter().copied().filter(|u| uncached(u, days)).collect();
+        if found.is_empty() {
+            continue;
+        }
+        // The share of the bill's input these models' tokens are.
+        let input: f64 = found.iter().map(|u| u.input).sum();
+        let every: f64 = all.iter().map(|u| u.input).sum();
+        let share = if every > 0.0 { (input / every).clamp(0.0, 1.0) } else { 0.0 };
+        out.push(caching(&found, billed.as_ref().map(|(svc, usage, q)| (svc.clone(), usage.clone(), q * share)), days));
     }
-    let monthly = u.input * per_month(days);
-    let per_call = u.input / u.invocations;
-    if monthly < TOKENS_MEDIUM || per_call < MIN_PROMPT {
-        return None;
-    }
+    out
+}
+
+/// A finding for `models` (billed as one), with their share of the bill's input when known.
+fn caching(models: &[&ModelUse], billed: Option<(String, String, f64)>, days: u32) -> Finding {
+    let invocations: f64 = models.iter().map(|u| u.invocations).sum();
+    let input: f64 = models.iter().map(|u| u.input).sum();
+    let output: f64 = models.iter().map(|u| u.output).sum();
+    let monthly = input * per_month(days);
+    let per_call = if invocations > 0.0 { input / invocations } else { 0.0 };
+    let names: Vec<&str> = models.iter().map(|u| u.model.as_str()).collect();
+    let resource = match names.as_slice() {
+        [one] => one.to_string(),
+        [first, rest @ ..] => format!("{first} (and {} more billed as it)", rest.len()),
+        [] => String::new(),
+    };
     let mut f = Finding::new(
         MODULE,
         "",
-        u.model.clone(),
+        resource,
         format!("{} input tokens a month ({} a call on average), none from the prompt cache", qty(monthly), qty(per_call)),
         "Cache the prompt's fixed part (system prompt, tools, documents) with cache points: repeated input then bills at a fraction",
         format!("up to {} input tokens a month", qty(monthly)),
@@ -186,15 +238,18 @@ fn caching(u: &ModelUse, costs: Option<&Snapshot>, days: u32) -> Option<Finding>
     )
     .kind("bedrock-caching")
     .score(monthly / TOKENS_HIGH)
-    .evidence(format!("{} invocations, {} output tokens a month", qty(u.invocations * per_month(days)), qty(u.output * per_month(days))))
-    .caveat("Caching saves only on the part of the prompt that repeats from call to call, and writing to the cache costs a little more than input: the figure is all the input the model bills, the most it could save, never reached.");
-    match costs.and_then(|s| bill_for_model(s, &u.model)) {
-        Some((service, usage, quantity)) => {
-            f = f.ce_service(service).billed_at_most(&usage, quantity).evidence(format!("input on the bill as {usage}"));
-        }
-        None => f = f.caveat("The bill does not show this model's input tokens under a name dcli recognises: not priced."),
+    .evidence(format!("{} invocations, {} output tokens a month", qty(invocations * per_month(days)), qty(output * per_month(days))))
+    .caveat("Caching saves only on the part of the prompt that repeats from call to call, and writing to the cache costs a little more than input: the figure is all the input these calls bill, the most it could save, never reached.");
+    if names.len() > 1 {
+        f = f.evidence(format!("model ids billed as one: {}", names.join(", ")));
     }
-    Some(f)
+    match billed {
+        Some((service, usage, quantity)) if quantity > 0.0 => {
+            f = f.ce_service(service).billed_at_most(&usage, quantity).evidence(format!("input on the bill as {usage}, these calls' share of it"));
+        }
+        _ => f = f.caveat("The bill does not show this model's input tokens under a name dcli recognises: not priced."),
+    }
+    f
 }
 
 /// Invocation logging that writes prompts and answers to CloudWatch Logs.
@@ -237,47 +292,80 @@ fn logging(scan: &Scan) -> aws::Result<Option<Finding>> {
     Ok(Some(f))
 }
 
-/// Provisioned throughput no request used over the window.
+/// The model a provisioned throughput serves: `anthropic.claude-…` from its foundation model's
+/// ARN (`arn:aws:bedrock:…::foundation-model/anthropic.claude-…`).
+fn provisioned_model(p: &ProvisionedThroughput) -> String {
+    let arn = if p.foundation_model_arn.is_empty() { &p.model_arn } else { &p.foundation_model_arn };
+    arn.rsplit_once('/').map_or(arn.as_str(), |(_, m)| m).to_string()
+}
+
+/// The usage type the bill uses for provisioned throughput of `model` (hours of model units):
+/// in the model's own service, or under `Amazon Bedrock` naming the model.
+fn provisioned_bill(s: &Snapshot, model: &str) -> Option<(String, String)> {
+    let words = model_words(model);
+    if words.is_empty() {
+        return None;
+    }
+    let compact = words.concat();
+    s.usage
+        .iter()
+        .filter(|u| u.service.contains("Bedrock") && u.unit.to_ascii_lowercase().contains('h'))
+        .filter(|u| {
+            let name = billing::split_region(&u.usage_type).1.to_ascii_lowercase();
+            if !name.contains("provisioned") {
+                return false;
+            }
+            if u.service == "Amazon Bedrock" {
+                name.replace(['-', '_', '.'], "").contains(&compact)
+            } else {
+                let sw = service_words(&u.service);
+                words.iter().all(|w| sw.contains(w)) && sw.len() == words.len()
+            }
+        })
+        .max_by(|a, b| a.cost.total_cmp(&b.cost))
+        .map(|u| (u.service.clone(), billing::split_region(&u.usage_type).1.to_string()))
+}
+
+/// Provisioned throughput no request seems to have used over the window. Bedrock's metrics
+/// for it are read by its ARN as the model id; calls reported under another id would not show,
+/// so the finding says so and is a ceiling, not a firm saving.
 fn idle_provisioned(p: &ProvisionedThroughput, costs: Option<&Snapshot>, days: u32) -> Finding {
     let hours = MONTH / 3600.0 * p.model_units.max(1) as f64;
     let committed = !p.commitment_duration.is_empty();
+    let model = provisioned_model(p);
     let mut f = Finding::new(
         MODULE,
         "",
         p.provisioned_model_name.clone(),
-        format!("{} model unit{} provisioned, no invocation in {}", p.model_units, if p.model_units == 1 { "" } else { "s" }, super::days_label(days)),
+        format!(
+            "{} model unit{} provisioned, no invocation seen in {}",
+            p.model_units,
+            if p.model_units == 1 { "" } else { "s" },
+            super::days_label(days)
+        ),
         if committed {
-            "Do not renew it when the commitment ends (it cannot be deleted for less before then)".to_string()
+            "Check nothing calls it, and do not renew it when the commitment ends (it cannot be deleted for less before then)".to_string()
         } else {
-            "Delete it: it is billed every hour it exists".to_string()
+            "Check nothing calls it (its invocations in the console), then delete it: it is billed every hour it exists".to_string()
         },
         format!("{} model-unit hours a month", qty(hours)),
-        Impact::High,
+        Impact::Medium,
     )
     .kind("bedrock-provisioned")
-    .score(2.0)
-    .evidence(format!("model {}", if p.foundation_model_arn.is_empty() { &p.model_arn } else { &p.foundation_model_arn }));
+    .score(1.0)
+    .evidence(format!("model {model}"))
+    .caveat("Invocations were read by the provisioned model's ARN: calls reported under another id would not show here.");
     if let Some(end) = &p.commitment_expiration_time {
-        f = f.evidence(format!("committed ({}) until {}", p.commitment_duration, &end[..end.len().min(10)]));
+        f = f.evidence(format!("committed ({}) until {}", p.commitment_duration, end.get(..10).unwrap_or(end)));
     }
-    // Provisioned throughput's usage type, when the bill names one (hours of model units).
-    let billed = costs.and_then(|s| {
-        s.usage
-            .iter()
-            .filter(|u| u.service.contains("Bedrock") && u.usage_type.to_ascii_lowercase().contains("provisioned"))
-            .max_by(|a, b| a.cost.total_cmp(&b.cost))
-            .map(|u| (u.service.clone(), billing::split_region(&u.usage_type).1.to_string(), u.unit.to_ascii_lowercase()))
-    });
-    match billed {
-        Some((service, usage, unit)) if unit.contains("h") => {
-            f = f.ce_service(service).billed(&usage, hours);
-            if committed {
-                f = f.caveat("Committed: it saves only from the end of the commitment.");
-            }
-        }
-        _ => f = f.caveat("The bill does not show provisioned throughput under a name dcli recognises: not priced."),
+    if committed {
+        // A commitment is paid to its end whatever happens: nothing saves before then.
+        return f.caveat("Committed: nothing is saved before the commitment ends, so it is not priced.");
     }
-    f
+    match costs.and_then(|s| provisioned_bill(s, &model)) {
+        Some((service, usage)) => f.ce_service(service).billed_at_most(&usage, hours),
+        None => f.caveat("The bill does not show this model's provisioned throughput under a name dcli recognises: not priced."),
+    }
 }
 
 #[cfg(test)]
@@ -330,24 +418,45 @@ mod tests {
             output: 20_000_000.0,
             ..Default::default()
         };
-        let f = caching(&u, Some(&bill()), 14).unwrap();
+        let found = caching_findings(std::slice::from_ref(&u), Some(&bill()), 14);
+        let f = &found[0];
         assert_eq!((f.kind, f.ce_service.as_deref()), ("bedrock-caching", Some("Claude Sonnet 4 (Amazon Bedrock Edition)")));
         assert!(f.billed[0].at_most);
         assert_eq!(f.impact, Impact::High);
-        assert!(caching(&ModelUse { cache_read: 1.0, ..u.clone() }, None, 14).is_none(), "it caches already");
-        assert!(caching(&ModelUse { input: 50_000_000.0, ..u.clone() }, None, 14).is_none(), "short prompts");
-        let unpriced = caching(&u, None, 14).unwrap();
-        assert!(unpriced.billed.is_empty() && unpriced.caveats.iter().any(|c| c.contains("not priced")));
+        assert!(caching_findings(&[ModelUse { cache_read: 1.0, ..u.clone() }], None, 14).is_empty(), "it caches already");
+        assert!(caching_findings(&[ModelUse { input: 50_000_000.0, ..u.clone() }], None, 14).is_empty(), "short prompts");
+        let unpriced = caching_findings(std::slice::from_ref(&u), None, 14);
+        assert!(unpriced[0].billed.is_empty() && unpriced[0].caveats.iter().any(|c| c.contains("not priced")));
+        // An inference profile and its foundation model are billed as one: one finding, and
+        // a cached model on the same bill keeps its share.
+        let base = ModelUse { model: "anthropic.claude-sonnet-4-20250514-v1:0".into(), ..u.clone() };
+        let cached = ModelUse { model: "eu.anthropic.claude-sonnet-4-20250514-v1:0".into(), cache_read: 1.0, ..u.clone() };
+        let found = caching_findings(&[u.clone(), base, cached], Some(&bill()), 14);
+        assert_eq!(found.len(), 1);
+        let bill_q = 900_000.0 * 30.4375 / 30.0;
+        assert!((found[0].billed[0].quantity - bill_q * 2.0 / 3.0).abs() < 1e-6, "{}", found[0].billed[0].quantity);
+        assert!(found[0].evidence.iter().any(|e| e.contains("billed as one")));
     }
 
     #[test]
     fn idle_provisioned_throughput() {
         let p = ProvisionedThroughput { provisioned_model_name: "pt-1".into(), model_units: 2, status: "InService".into(), ..Default::default() };
-        let f = idle_provisioned(&p, None, 14);
+        let p = ProvisionedThroughput { foundation_model_arn: "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0".into(), ..p };
+        let mut s = bill();
+        s.usage.push(UsageCost { unit: "Hrs".into(), ..usage("Claude Sonnet 4 (Amazon Bedrock Edition)", "USE1-ProvisionedThroughput-Units", 720.0, 30_000.0) });
+        s.usage.push(UsageCost { unit: "Hrs".into(), ..usage("Claude Opus 4 (Amazon Bedrock Edition)", "USE1-ProvisionedThroughput-Units", 720.0, 90_000.0) });
+        let f = idle_provisioned(&p, Some(&s), 14);
         assert_eq!(f.kind, "bedrock-provisioned");
-        assert!(f.recommendation.starts_with("Delete it"));
-        let committed = ProvisionedThroughput { commitment_duration: "SixMonths".into(), commitment_expiration_time: Some("2027-01-01T00:00:00Z".into()), ..p };
-        let f = idle_provisioned(&committed, None, 14);
-        assert!(f.recommendation.contains("Do not renew") && f.evidence.iter().any(|e| e.contains("2027-01-01")));
+        assert!(f.recommendation.contains("then delete it"));
+        // Its own model's rate, not the dearest one on the bill, and a ceiling.
+        assert_eq!(f.ce_service.as_deref(), Some("Claude Sonnet 4 (Amazon Bedrock Edition)"));
+        assert!(f.billed[0].at_most && f.caveats.iter().any(|c| c.contains("another id")));
+        let committed = ProvisionedThroughput { commitment_duration: "SixMonths".into(), commitment_expiration_time: Some("2027-01-01T00:00:00Z".into()), ..p.clone() };
+        let f = idle_provisioned(&committed, Some(&s), 14);
+        assert!(f.recommendation.contains("do not renew") && f.evidence.iter().any(|e| e.contains("2027-01-01")));
+        assert!(f.billed.is_empty(), "committed: nothing saves before the end");
+        // Odd text in the date never panics.
+        let odd = ProvisionedThroughput { commitment_duration: "OneMonth".into(), commitment_expiration_time: Some("2027-ñ".into()), ..p };
+        assert!(idle_provisioned(&odd, None, 14).evidence.iter().any(|e| e.contains("2027-ñ")));
     }
 }

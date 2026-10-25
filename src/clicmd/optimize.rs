@@ -137,7 +137,8 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if args.report {
-        print!("{}", savings::report(&env_name, &aws.region, &outcome));
+        // Names and evidence quote AWS (X-Ray rule paths and hosts, say): never terminal escapes.
+        print!("{}", sanitize(&savings::report(&env_name, &aws.region, &outcome)));
         return Ok(ExitCode::SUCCESS);
     }
     print_table(&outcome.findings);
