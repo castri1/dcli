@@ -13,6 +13,7 @@
 #![allow(dead_code)] // used by the MCP server and the Advisor module
 
 pub mod estimate;
+pub mod summary;
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -523,6 +524,8 @@ pub fn decide(store: &Store, env: &str, id: &str, state: State, note: &str) -> R
     r.state_at = now_secs();
     match state {
         State::Done if r.ledger.is_none() => {
+            // What the ledger expects is what the latest costs say, as the user saw it.
+            r.reprice(costs::cached(env).as_ref());
             if let Some(entry) = ledger_entry(&r) {
                 ledger::put(entry.clone()).map_err(|e| format!("cannot record it in the savings ledger: {e}"))?;
                 r.ledger = Some(entry.id);
@@ -802,14 +805,21 @@ pub fn markdown(r: &Recommendation) -> String {
 
 /// `saves ≈ US$ 412 a month (your bill)`.
 pub fn cost_line(c: &Cost) -> String {
-    let source = c.source();
-    let Some(m) = c.monthly() else { return source };
-    let figure = match c.bill.as_ref().filter(|b| b.priced() && c.claude.is_none()) {
+    match cost_figure(c) {
+        Some(figure) => format!("{figure} ({})", c.source()),
+        None => c.source(),
+    }
+}
+
+/// `saves ≈ US$ 412 a month (US$ 90 now, …)`, `costs ≈ US$ 120 more a month`, or `None`
+/// without a figure; [`Cost::source`] says where it comes from.
+pub fn cost_figure(c: &Cost) -> Option<String> {
+    let m = c.monthly()?;
+    Some(match c.bill.as_ref().filter(|b| b.priced() && c.claude.is_none()) {
         Some(b) => b.describe(),
         None if m < 0.0 => format!("costs ≈ {} more a month", price::money(-m, c.currency())),
         None => format!("saves ≈ {} a month", price::money(m, c.currency())),
-    };
-    format!("{figure} ({source})")
+    })
 }
 
 fn capitalize(s: &str) -> String {
