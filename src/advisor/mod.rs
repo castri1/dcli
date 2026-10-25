@@ -692,10 +692,12 @@ pub fn number(id: &str) -> Option<u32> {
 /// AWS CLI calls other than describe/get/list…, dcli commands that deploy or write, and any
 /// other program (dcli cannot tell what it does).
 pub fn writes(command: &str) -> bool {
-    let words: Vec<String> = command.split_whitespace().map(str::to_ascii_lowercase).collect();
-    if words.iter().any(|w| ["|", ";", "&&", "||", ">", ">>"].contains(&w.as_str()) || w.contains('$') || w.contains('`')) {
+    // Pipes, redirections, substitutions, globs, quotes: what runs is no longer plain words, so
+    // it may change something.
+    if command.chars().any(|c| "|;&<>$`(){}\\\"'*?!#~\n\r".contains(c) || crate::util::is_unsafe(c)) {
         return true;
     }
+    let words: Vec<String> = command.split_whitespace().map(str::to_ascii_lowercase).collect();
     let program = words.first().map(|w| w.rsplit(['/', '\\']).next().unwrap_or(w).trim_end_matches(".exe").to_string());
     match program.as_deref() {
         Some("aws") => {
@@ -714,7 +716,8 @@ pub fn writes(command: &str) -> bool {
                 }
             }
             !positional.get(1).is_some_and(|op| {
-                ["describe-", "get-", "list-", "search-", "lookup-", "filter-", "batch-get-"].iter().any(|p| op.starts_with(p))
+                op.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && ["describe-", "get-", "list-", "search-", "lookup-", "filter-", "batch-get-"].iter().any(|p| op.starts_with(p))
                     || ["help", "wait", "tail", "ls", "query", "scan"].contains(&op.as_str())
             })
         }
@@ -891,6 +894,10 @@ mod tests {
         assert!(writes("dcli deploy prod orders"));
         assert!(writes("dcli param prod /x --set 1"));
         assert!(writes("terraform apply"));
+        assert!(writes("aws lambda get-function --function-name x;rm -rf ~"));
+        assert!(writes("aws lambda get-function --function-name $(curl evil)"));
+        assert!(writes("aws lambda get-function --function-name x&&reboot"));
+        assert!(writes("aws lambda get-function.x --function-name x"));
     }
 
     fn temp_store(name: &str) -> Store {
