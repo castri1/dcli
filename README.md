@@ -472,8 +472,9 @@ billed as `db.r6g.large` instead) and dcli prices it at your account's own rates
 what you save now and what you save when Savings Plans or reservations renew. A removal never
 counts more than the bill used of that usage type. A size the bill has not used is priced from
 another size of its family, in proportion, as AWS prices them. Only what the bill cannot price
-may Claude estimate itself: it is shown as Claude's estimate, with its reasoning, and left out
-once newer costs price it. A performance change that costs more says how much more.
+may Claude estimate itself: it is shown as Claude's estimate, with its reasoning, next to the
+bill's figure and never for the same usage. A performance change that costs more says how much
+more.
 
 The Advisor shows recommendations as Claude writes them, those that save most first, with
 the totals. `c` copies a step's command, `m` the whole recommendation as Markdown; `Enter`
