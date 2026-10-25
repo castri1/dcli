@@ -339,11 +339,10 @@ pub(crate) mod tests {
                 "1 not priced yet",
             ]
         );
-        // Claude's figure is for what the bill cannot price: once the bill prices every change,
-        // it is left out instead of counted twice.
-        let both = rec(9, State::Pending, Some((50.0, 50.0, false)), Some(50.0));
-        assert_eq!(both.cost.monthly(), Some(50.0));
-        assert_eq!(totals(std::slice::from_ref(&both)).claude_saves, 0.0);
+        // Claude's figure is for what the changes do not describe: it adds to the bill's.
+        let both = rec(9, State::Pending, Some((50.0, 50.0, false)), Some(20.0));
+        assert_eq!(both.cost.monthly(), Some(70.0));
+        assert_eq!(totals(std::slice::from_ref(&both)).claude_saves, 20.0);
         let mut same = rec(7, State::Pending, None, Some(10.0));
         same.resources[0].name = "fn-1".into();
         assert!(totals(&[list[0].clone(), same]).overlap);

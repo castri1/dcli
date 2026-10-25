@@ -237,7 +237,7 @@ fn recommendation_schema() -> Value {
             "performance": { "type": "string", "maxLength": 500, "description": "The expected effect on performance: `p95 latency −30 %`" },
             "cost": {
                 "type": "object", "additionalProperties": false,
-                "description": "Required: what it saves or costs a month. Prefer `changes` (priced by dcli with the account's own rates; try them with estimate_cost first). Add `claudeEstimate` for what the bill cannot price. A performance change that leaves the bill alone gives `noCostChange`",
+                "description": "Required: what it saves or costs a month. Prefer `changes` (priced by dcli with the account's own rates; try them with estimate_cost first). Add `claudeEstimate` for what the bill cannot price, and leave that part out of `changes`: the two add up, so they never describe the same usage (without costs read, give `claudeEstimate` alone). A performance change that leaves the bill alone gives `noCostChange`",
                 "properties": {
                     "changes": { "type": "array", "maxItems": 20, "items": change_schema() },
                     "claudeEstimate": {
@@ -935,7 +935,7 @@ fn hints(s: &Snapshot, changes: &[estimate::Change], unpriced: &[String]) -> Vec
     }
     if !out.is_empty() {
         out.push(CHANGE_HELP.to_string());
-        out.push("A size of an instance family the bill has not used is priced from another size it has (db.r6g.2xlarge from db.r6g.xlarge); another family is not. When the bill cannot price it, give `claudeEstimate` in the recommendation.".into());
+        out.push("A size of an instance family the bill has not used is priced from another size it has (db.r6g.2xlarge from db.r6g.xlarge); another family is not. When the bill cannot price it, leave it out of `changes` and count it in `claudeEstimate` (the two add up).".into());
     }
     out
 }

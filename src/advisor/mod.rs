@@ -144,11 +144,11 @@ pub struct Cost {
 }
 
 impl Cost {
-    /// Claude's figure when it counts: it is for what the bill cannot price, so once the bill
-    /// prices every change (newer costs read) it is left out rather than counted twice.
+    /// Claude's figure, which adds to the bill's: it is for what is not in `changes` (the
+    /// recommendation is only kept with both when the bill priced every change, so the two never
+    /// describe the same usage).
     pub fn claude_counted(&self) -> Option<&ClaudeEstimate> {
-        let bill_prices_all = !self.changes.is_empty() && self.bill.as_ref().is_some_and(|b| b.priced() && b.unpriced.is_empty());
-        self.claude.as_ref().filter(|_| !bill_prices_all)
+        self.claude.as_ref()
     }
 
     /// A month, from the bill and Claude's figure together: positive saves.
@@ -448,8 +448,26 @@ pub fn submit(store: &Store, draft: &Draft, origin: &Origin, costs: Option<&Snap
             _ => {}
         }
     }
-    if d.cost.claude_estimate.is_some() && bill.as_ref().is_some_and(|b| b.priced() && b.unpriced.is_empty()) {
-        return Err("the bill prices every change: leave out `claudeEstimate`, which is only for what the bill cannot price (it would count twice)".into());
+    // Claude's figure adds to the bill's, so the two must not describe the same usage: with both,
+    // the bill prices every change, and the figure is for the rest.
+    if d.cost.claude_estimate.is_some() && !d.cost.changes.is_empty() {
+        match &bill {
+            None => {
+                return Err(format!(
+                    "the costs of '{}' have not been read, so give `claudeEstimate` alone, without `changes` (once the costs are read the changes \
+                     would be priced too and count twice), or ask the user to run `dcli costs {} --refresh` first",
+                    origin.env, origin.env
+                ));
+            }
+            Some(b) if !b.unpriced.is_empty() => {
+                return Err(format!(
+                    "the bill has no rate for {}: take that out of `changes` and count it in `claudeEstimate`, which is only for what `changes` \
+                     does not describe (they add up)",
+                    b.unpriced.join(", ")
+                ));
+            }
+            _ => {}
+        }
     }
     let now = now_secs();
     let content = |r: &mut Recommendation| {
@@ -1231,6 +1249,15 @@ mod tests {
         other.cost.claude_estimate = Some(ClaudeEstimate { monthly: 10.0, reasoning: "arm64 costs 20 % less".into() });
         assert_eq!(submit(&store, &other, &origin, Some(&costs)).unwrap().id, "R2");
         assert_eq!(store.list("prod.eu").iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["R1", "R2"]);
+        // Claude's figure with `changes` only for what they do not describe: not without costs.
+        let mut extra = draft();
+        extra.title = "Lower orders-api's memory and timeout".into();
+        extra.cost.changes[0].quantity = 1_000.0;
+        extra.cost.changes[0].effect = Effect::Move;
+        extra.cost.changes[0].to = Some("Lambda-GB-Second-ARM".into());
+        extra.cost.claude_estimate = Some(ClaudeEstimate { monthly: 5.0, reasoning: "fewer retries".into() });
+        assert!(submit(&store, &extra, &origin, None).unwrap_err().contains("`claudeEstimate` alone"));
+        assert!(submit(&store, &extra, &origin, Some(&costs)).unwrap_err().contains("take that out of `changes`"));
         // The user's decision stands.
         assert!(decide(&store, "prod.eu", "R1", State::Dismissed, "x", Some(1.0)).unwrap_err().contains("look at it again"));
         decide(&store, "prod.eu", "R1", State::Dismissed, "we need the headroom", None).unwrap();
