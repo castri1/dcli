@@ -642,10 +642,18 @@ fn savings_findings(s: &Server, args: &Value) -> Result<String, String> {
     findings_answer(name, &env.region, &outcome, costs.as_ref(), &ledger::of_env(name), now_secs())
 }
 
-/// What the findings answer may take, leaving room under [`MAX_TEXT`] for the rest.
-const FINDINGS_BUDGET: usize = 17_000;
-/// Resources named per lever.
+/// What the whole answer of savings_findings may take: under [`MAX_TEXT`] (never cut in the
+/// middle of a value), with room for the note [`aws_data`] adds.
+const ANSWER_BUDGET: usize = MAX_TEXT - 1_000;
+/// What the levers may take of it; the findings get what is left.
+const LEVERS_BUDGET: usize = 9_000;
+/// Resources named per lever at most (fewer when there are many levers).
 const LEVER_TOP: usize = 8;
+/// Characters of a resource's name in a lever.
+const LEVER_NAME: usize = 80;
+/// Changes of the savings ledger listed at most, the newest, and what they may take.
+const LEDGER_MAX: usize = 30;
+const LEDGER_BUDGET: usize = 3_000;
 
 fn finding_json(f: &savings::Finding) -> Value {
     json!({
@@ -677,17 +685,17 @@ fn finding_json(f: &savings::Finding) -> Value {
     })
 }
 
-/// A lever: its findings added up, and the resources that weigh most in it.
-fn lever_json(l: &savings::Lever, findings: &[savings::Finding]) -> Value {
-    let top: Vec<Value> = l
+/// A lever: its findings added up, and the `top` resources that weigh most in it.
+fn lever_json(l: &savings::Lever, findings: &[savings::Finding], top: usize) -> Value {
+    let named: Vec<Value> = l
         .findings
         .iter()
-        .take(LEVER_TOP)
+        .take(top)
         .map(|&i| {
             let f = &findings[i];
             json!({
                 "id": finding_id(f),
-                "resource": f.resource,
+                "resource": ellipsize(&f.resource, LEVER_NAME),
                 "monthly": f.price.as_ref().map(|p| money(p.monthly)),
                 "atMost": f.price.as_ref().is_some_and(|p| p.at_most),
             })
@@ -702,13 +710,55 @@ fn lever_json(l: &savings::Lever, findings: &[savings::Finding]) -> Value {
         "later": l.total.as_ref().map(|t| money((t.monthly - t.now).max(0.0))),
         "upTo": (l.at_most_count > 0).then(|| json!({ "monthly": money(l.at_most), "findings": l.at_most_count })),
         "unpriced": l.unpriced,
-        "top": top,
-        "more": l.findings.len().saturating_sub(LEVER_TOP),
+        "top": named,
+        "more": l.findings.len().saturating_sub(top),
     })
 }
 
-/// The answer of savings_findings: the levers first (each kind of change added up over its
-/// resources), then as many findings as fit, the largest first.
+/// The levers within [`LEVERS_BUDGET`]: every lever, with its resources added a level at a time
+/// (one each, then two…, up to [`LEVER_TOP`]), the largest levers first, while they fit; if
+/// even the bare levers do not fit, the largest ones. Also the number of levers left out.
+fn levers_json(levers: &[savings::Lever], findings: &[savings::Finding]) -> (Vec<Value>, usize) {
+    let size = |v: &Value| v.to_string().len() + 1;
+    let mut list: Vec<Value> = levers.iter().map(|l| lever_json(l, findings, 0)).collect();
+    let used: usize = list.iter().map(size).sum();
+    if used <= LEVERS_BUDGET {
+        let mut room = LEVERS_BUDGET - used;
+        let mut tops = vec![0; levers.len()];
+        'levels: for level in 1..=LEVER_TOP {
+            for (i, l) in levers.iter().enumerate() {
+                if l.findings.len() < level || tops[i] != level - 1 {
+                    continue;
+                }
+                let more = lever_json(l, findings, level);
+                let (now, then) = (size(&list[i]), size(&more));
+                if then.saturating_sub(now) > room {
+                    break 'levels;
+                }
+                room -= then.saturating_sub(now);
+                list[i] = more;
+                tops[i] = level;
+            }
+        }
+        return (list, 0);
+    }
+    let (mut list, mut room) = (Vec::new(), LEVERS_BUDGET);
+    for l in levers {
+        let v = lever_json(l, findings, 0);
+        let n = v.to_string().len() + 1;
+        if n > room {
+            break;
+        }
+        room -= n;
+        list.push(v);
+    }
+    let left = levers.len() - list.len();
+    (list, left)
+}
+
+/// The answer of savings_findings: what could not be checked and the changes followed, then the
+/// levers (each kind of change added up over its resources), then as many findings as fit, the
+/// largest first. Lists lose items, never values, to stay under [`ANSWER_BUDGET`].
 fn findings_answer(
     name: &str,
     region: &str,
@@ -718,40 +768,63 @@ fn findings_answer(
     now: f64,
 ) -> Result<String, String> {
     let levers = savings::levers(&outcome.findings);
-    let ledger: Vec<Value> = entries
-        .iter()
-        .map(|e| {
-            json!({
-                "what": e.what,
-                "resource": e.resource,
-                "at": date(e.at),
-                "source": e.source,
-                "expectedMonthly": e.expected.map(money),
-                "status": ledger::status(e, now).label(),
-                "verified": e.verified.as_ref().map(|v| v.difference(&e.currency)),
-            })
-        })
-        .collect();
+    let (mut ledger, mut room) = (Vec::new(), LEDGER_BUDGET);
+    for e in entries.iter().take(LEDGER_MAX) {
+        let v = json!({
+            "what": ellipsize(&e.what, 120),
+            "resource": ellipsize(&e.resource, LEVER_NAME),
+            "at": date(e.at),
+            "source": e.source,
+            "expectedMonthly": e.expected.map(money),
+            "status": ledger::status(e, now).label(),
+            "verified": e.verified.as_ref().map(|v| v.difference(&e.currency)),
+        });
+        let n = v.to_string().len() + 1;
+        if n > room {
+            break;
+        }
+        room -= n;
+        ledger.push(v);
+    }
+    let ledger_left = entries.len() - ledger.len();
     let total = price::total(&outcome.findings);
+    let (lever_list, levers_left) = levers_json(&levers, &outcome.findings);
     let mut answer = json!({
         "env": name,
         "region": region,
         "days": outcome.days,
         "pricedWith": costs.map(|c| json!({ "readAt": date(c.read_at), "age": fmt_ago(c.read_at) })),
-        "total": total.map(|t| json!({ "monthly": money(t.monthly), "now": money(t.now), "priced": t.priced, "atMost": t.at_most, "currency": t.currency })),
+        "total": total.map(|t| json!({
+            "monthly": money(t.monthly),
+            "now": money(t.now),
+            "priced": t.priced,
+            "atMost": t.at_most,
+            "currency": t.currency,
+            "how": "firm figures only, each resource's usage counted once across every lever; ceilings (`upTo`) are left out",
+        })),
         "notes": [
             "`levers` add up the findings of one kind of change (`kind`) over every resource: many small findings (a function each on arm64) can make a large lever. Recommend a lever as one change with the summed quantity.",
+            "Lever figures do not add up: two levers can act on the same usage (arm64 and memory on the same functions), and the `upTo` ceilings of different levers can overlap (invocation logs counted by Bedrock and by Logs, say). For a total use `total`, which counts each resource's usage once.",
             "Each finding's `billed` items are usage the change removes, as the bill names it: the same form estimate_cost and recommend take (a `billed` item with `instead` is a move to that usage type).",
             "`dcliCanApply`: the user can apply it from dcli's Savings module. Lambda memory against memory used: lambda_memory (Logs Insights, within the user's budget); its findings, and those of analyses the user ran in dcli, come here with kind `memory`.",
             if costs.is_none() { "No dollars: the costs of this environment were never read (dcli costs <env> --refresh)." } else { "Dollars come from the account's own bill." },
         ],
-        "levers": levers.iter().map(|l| lever_json(l, &outcome.findings)).collect::<Vec<_>>(),
-        "notChecked": outcome.errors.iter().map(|(svc, e)| json!({ "service": svc, "error": aws_error(name, e) })).collect::<Vec<_>>(),
+        "notChecked": outcome.errors.iter().map(|(svc, e)| json!({ "service": svc, "error": ellipsize(&aws_error(name, e), 160) })).collect::<Vec<_>>(),
         "ledger": ledger,
+        "levers": lever_list,
         "findings": [],
     });
-    // The findings, the largest first, while they fit.
-    let mut room = FINDINGS_BUDGET.saturating_sub(answer.to_string().len());
+    if ledger_left > 0 {
+        answer["ledgerOmitted"] = json!({ "count": ledger_left, "how": "the oldest changes were left out: dcli optimize <env> --ledger lists them all" });
+    }
+    if levers_left > 0 {
+        answer["omittedLevers"] = json!({
+            "count": levers_left,
+            "how": "the smallest levers were left out; ask for fewer `services` to see them",
+        });
+    }
+    // Room for the note on what was left out, then the findings, the largest first, while they fit.
+    let mut room = ANSWER_BUDGET.saturating_sub(answer.to_string().len() + 200);
     let mut shown = Vec::new();
     for f in &outcome.findings {
         let v = finding_json(f);
@@ -1393,6 +1466,49 @@ mod tests {
         assert!(shown > 0 && shown < 120);
         assert_eq!(v["omittedFindings"]["count"].as_u64(), Some(120 - shown as u64));
         assert_eq!(v["findings"][0]["kind"], "arm64");
+    }
+
+    #[test]
+    fn many_levers_never_cut_the_answer() {
+        // 60 levers of 8 resources each, with long names, and a long ledger.
+        let mut findings = Vec::new();
+        for lever in 0..60 {
+            let kind: &'static str = Box::leak(format!("lever-{lever:02}").into_boxed_str());
+            for r in 0..8 {
+                let name = format!("{}-{lever}-{r}", "a-very-long-resource-name".repeat(6));
+                findings.push(savings::Finding {
+                    service: "Lambda",
+                    ..savings::Finding::new("Lambda", &name, &name, "s", "r", "x", savings::Impact::Low).kind(kind).evidence("e".repeat(200))
+                });
+            }
+        }
+        let entries: Vec<ledger::Entry> =
+            (0..80).map(|i| ledger::Entry { id: format!("e{i}"), what: "w".repeat(400), resource: "r".repeat(300), ..Default::default() }).collect();
+        let outcome = savings::Outcome {
+            findings,
+            days: 14,
+            errors: vec![("DynamoDB", crate::aws::AwsError::Api { status: 400, code: "AccessDenied".into(), message: "m".repeat(2000) })],
+            ..Default::default()
+        };
+        let text = findings_answer("prod", "us-east-1", &outcome, None, &entries, 1_790_000_000.0).unwrap();
+        assert!(text.len() <= MAX_TEXT, "{}", text.len());
+        let v: Value = serde_json::from_str(&text).expect("whole JSON, never cut");
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+        assert!(at("notChecked") < at("levers") && at("ledger") < at("levers") && at("levers") < at("findings"), "{keys:?}");
+        let listed = v["ledger"].as_array().unwrap().len();
+        assert!(listed > 0 && listed <= LEDGER_MAX);
+        assert_eq!(v["ledgerOmitted"]["count"].as_u64(), Some(80 - listed as u64));
+        let levers = v["levers"].as_array().unwrap();
+        let left = v["omittedLevers"]["count"].as_u64().unwrap_or(0) as usize;
+        assert_eq!(levers.len() + left, 60);
+        assert!(levers[0]["top"].as_array().unwrap().len() < 8, "fewer resources per lever when there are many");
+        for l in levers {
+            for t in l["top"].as_array().unwrap() {
+                assert!(t["resource"].as_str().unwrap().chars().count() <= LEVER_NAME);
+            }
+        }
+        assert!(v["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("do not add up")));
     }
 
     #[test]

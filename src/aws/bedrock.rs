@@ -45,6 +45,8 @@ pub struct ProvisionedThroughput {
     /// `OneMonth`, `SixMonths`, or empty for no commitment.
     pub commitment_duration: String,
     pub commitment_expiration_time: Option<String>,
+    /// When it was created (RFC 3339).
+    pub creation_time: Option<String>,
 }
 
 /// How model invocations are logged (`None`: they are not).

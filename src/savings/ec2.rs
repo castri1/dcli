@@ -214,14 +214,21 @@ fn gp3(v: &Volume) -> Option<Finding> {
     .billed_instead(&billing::ebs_volume("gp2"), &billing::ebs_volume("gp3"), v.size);
     // gp2 gives 3 IOPS per GiB (at least 100), up to 16,000.
     let gp2_iops = (3.0 * v.size).clamp(100.0, 16_000.0);
-    if gp2_iops > GP3_IOPS {
+    let needs_iops = gp2_iops > GP3_IOPS;
+    let needs_throughput = v.size >= 170.0;
+    if needs_iops {
         f = f.caveat(format!(
             "As gp2 it has {gp2_iops:.0} IOPS; gp3 includes 3000: matching it means provisioning {:.0} more, billed apart.",
             gp2_iops - GP3_IOPS
         ));
     }
-    if v.size >= 170.0 {
+    if needs_throughput {
         f = f.caveat("gp2 of this size can reach 250 MiB/s; gp3 includes 125 MiB/s and bills throughput above it.");
+    }
+    // Matching the performance it has costs IOPS or throughput the figure leaves out: it is the
+    // most the change saves (none of it when the volume needs every IOPS and MiB/s it has).
+    if needs_iops || needs_throughput {
+        f = f.at_most();
     }
     Some(f.caveat("Volumes changed in the last 6 hours cannot be changed again until then."))
 }
@@ -321,6 +328,11 @@ mod tests {
         let f = gp3(&used).unwrap();
         assert_eq!(f.billed[0].instead.as_deref(), Some("EBS:VolumeUsage.gp3"));
         assert!(f.caveats.iter().any(|c| c.contains("6000 IOPS") && c.contains("3000 more")), "{:?}", f.caveats);
+        // Matching its IOPS and throughput costs extra: the figure is a ceiling.
+        assert!(f.billed[0].at_most);
+        // A small volume gets the same performance from gp3's baseline: a firm figure.
+        let small = gp3(&Volume { size: 100.0, ..used.clone() }).unwrap();
+        assert!(!small.billed[0].at_most && small.caveats.len() == 1, "{:?}", small.caveats);
         assert!(gp3(&Volume { kind: "gp3".into(), ..used.clone() }).is_none());
         assert!(gp3(&Volume { attached: false, state: "available".into(), ..used }).is_none(), "unattached: delete it instead");
     }

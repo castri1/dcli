@@ -87,9 +87,12 @@ pub struct Metric {
 /// metrics, outside the `AWS/` namespaces), at most about `max`; the bool says whether there
 /// were more. ListMetrics is free.
 pub fn list_recent_metrics(aws: &Aws, max: usize) -> Result<(Vec<Metric>, bool)> {
+    // ListMetrics gives up to 500 a page, and may give empty pages with a token: a page cap
+    // ends it whatever the answers.
+    const MAX_PAGES: usize = 200;
     let mut out = Vec::new();
     let mut token: Option<String> = None;
-    loop {
+    for _ in 0..MAX_PAGES {
         let mut page: Vec<(&str, &str)> = vec![("RecentlyActive", "PT3H")];
         if let Some(t) = &token {
             page.push(("NextToken", t));
@@ -102,6 +105,7 @@ pub fn list_recent_metrics(aws: &Aws, max: usize) -> Result<(Vec<Metric>, bool)>
             more => return Ok((out, more.is_some())),
         }
     }
+    Ok((out, true))
 }
 
 fn parse_metrics(xml: &str) -> Vec<Metric> {
