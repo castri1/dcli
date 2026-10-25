@@ -461,7 +461,8 @@ claude mcp add dcli -- dcli mcp --env prod --insights-gb 1000 --insights-gb-mont
 
 The last one also lets Claude read how much memory Lambda functions use, with Logs Insights
 (billed by the data it scans): at most 1,000 GB an analysis and 3,000 GB a month. Claude asks
-for the estimate first (GB and cost at your bill's rate), and dcli refuses what goes over.
+for the estimate first (GB and cost at your bill's rate) and runs it once you agree; dcli
+refuses what would go over and stops a query that reaches its share.
 
 Then ask for an audit, naming the environment: `/mcp__dcli__audit prod` (the `audit` prompt;
 its focus can be `cost`, `performance` or `both`), or in your own words ("analyze prod with
