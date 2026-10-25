@@ -716,29 +716,10 @@ impl Store {
     }
 
     /// One writer at a time for `env`, across processes (the MCP server, the UI, `dcli
-    /// advisor`): a lock file made exclusively, removed when the returned guard goes. A lock
-    /// left by a writer that died is taken over after 10 s.
+    /// advisor`): an operating-system lock, released when the returned guard goes.
     pub fn lock(&self, env: &str) -> std::io::Result<Lock> {
-        use std::time::{Duration, Instant};
-        let path = self.make_dir(env)?.join(".lock");
-        let start = Instant::now();
-        loop {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Lock { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let age = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-                    if age.is_some_and(|a| a > Duration::from_secs(10)) {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    if start.elapsed() > Duration::from_secs(5) {
-                        return Err(std::io::Error::other("another dcli is writing recommendations: try again"));
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let dir = self.make_dir(env)?;
+        crate::platform::lock(&dir.join("recommendations")).map(Lock)
     }
 
     /// Keeps `r` as a new recommendation, giving it the next free number of its environment.
@@ -870,15 +851,7 @@ fn cleaned(mut r: Recommendation) -> Recommendation {
 }
 
 /// Held while recommendations of an environment are written ([`Store::lock`]).
-pub struct Lock {
-    path: PathBuf,
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
+pub struct Lock(#[allow(dead_code)] crate::platform::FileLock);
 
 /// `7` for `R7` (or `r7`); `None` for anything else.
 pub fn number(id: &str) -> Option<u32> {

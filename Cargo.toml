@@ -3,7 +3,7 @@ name = "dcli"
 # 2.x follows the Node.js deploy-cli 1.x (git tag node-v1.0.1).
 version = "2.10.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Terminal UI to deploy and explore AWS: CodePipeline, Parameter Store, Lambda"
 license = "MIT"
 repository = "https://github.com/castri1/dcli"

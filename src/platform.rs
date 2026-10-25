@@ -166,40 +166,42 @@ pub fn write_temp_file(label: &str, content: &str) -> std::io::Result<PathBuf> {
     Err(last_error.unwrap_or_else(|| std::io::Error::other("no free file name")))
 }
 
-/// Held while this process changes a file other dcli processes change too ([`lock`]).
-pub struct FileLock(PathBuf);
+/// Held while one dcli changes a file ([`lock`]): an operating-system lock on a file next to
+/// it, released when this goes, or by the system when the process dies (so none is ever
+/// left behind or taken over).
+#[derive(Debug)]
+pub struct FileLock(#[allow(dead_code)] std::fs::File);
 
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// Waits (up to 5 s) to be the only dcli changing `path`: an exclusive lock on the file
+/// `.<name>.lock` next to it, which stays in place between uses.
+pub fn lock(path: &std::path::Path) -> std::io::Result<FileLock> {
+    lock_within(path, std::time::Duration::from_secs(5))
 }
 
-/// Waits (up to 5 s) to be the only dcli changing `path`: a `.<name>.lock` file next to it,
-/// made exclusively and removed when the returned guard goes. One left by a process that died
-/// is taken over after 10 s.
-pub fn lock(path: &std::path::Path) -> std::io::Result<FileLock> {
+fn lock_within(path: &std::path::Path, wait: std::time::Duration) -> std::io::Result<FileLock> {
     use std::time::{Duration, Instant};
     let dir = path.parent().ok_or_else(|| std::io::Error::other(format!("no folder for {}", path.display())))?;
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let lock = dir.join(format!(".{name}.lock"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(dir.join(format!(".{name}.lock")))?;
     let start = Instant::now();
     loop {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
-            Ok(_) => return Ok(FileLock(lock)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let age = std::fs::metadata(&lock).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-                if age.is_some_and(|a| a > Duration::from_secs(10)) {
-                    let _ = std::fs::remove_file(&lock);
-                    continue;
-                }
-                if start.elapsed() > Duration::from_secs(5) {
-                    return Err(std::io::Error::other(format!("another dcli is changing {}: try again", path.display())));
-                }
+        match file.try_lock() {
+            Ok(()) => return Ok(FileLock(file)),
+            Err(std::fs::TryLockError::WouldBlock) if start.elapsed() < wait => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => return Err(e),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::other(format!("another dcli is changing {}: try again", path.display())));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
     }
 }
@@ -239,6 +241,18 @@ mod tests {
         for bad in ["file:///etc/passwd", "/Applications/Calculator.app", "smb://host/share", "https://", "javascript:alert(1)", "https://a b"] {
             assert!(!is_web_url(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn locks_exclude_each_other_and_free_when_dropped() {
+        let dir = std::env::temp_dir().join(format!("dcli-lock-{}", std::process::id()));
+        let path = dir.join("usage.json");
+        let held = lock(&path).unwrap();
+        let wait = std::time::Duration::from_millis(100);
+        assert!(lock_within(&path, wait).unwrap_err().to_string().contains("another dcli"));
+        drop(held);
+        assert!(lock_within(&path, wait).is_ok(), "free again once the guard goes");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

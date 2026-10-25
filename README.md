@@ -54,7 +54,7 @@ With Node.js on any system: `npm install -g @castri1/dcli` (the same command upd
 You can also download the archive for your platform from
 [Releases](https://github.com/castri1/dcli/releases) and put `dcli` on your `PATH`.
 
-From source (Rust 1.88+): `cargo install --git https://github.com/castri1/dcli`
+From source (Rust 1.89+): `cargo install --git https://github.com/castri1/dcli`
 
 You also need:
 
