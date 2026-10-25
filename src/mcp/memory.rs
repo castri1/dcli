@@ -17,11 +17,12 @@ use crate::util::{now_secs, sanitize};
 const DEFAULT_DAYS: u32 = 7;
 const MAX_DAYS: u32 = 14;
 
-pub const DESCRIPTION: &str = "The memory Lambda functions use against what they have, from their REPORT lines over the last days, \
-with the findings of functions that could have less (priced with the bill). It runs Logs Insights, which bills the data it scans: \
-it measures first and stays within the GB the user allows per analysis and per month (`dcli mcp --insights-gb`). Without \
-`functions` it reads the most expensive functions (by GB-seconds) that fit. `estimateOnly` only measures (no Insights charge). \
-The analysis is kept: savings_findings and dcli's Savings module show its findings for 30 days.";
+pub const DESCRIPTION: &str = "The memory Lambda functions use against what they have, from their reports over the last days (text or \
+JSON logs), with the findings of functions that could have less (priced with the bill). It runs Logs Insights, which bills the data \
+it scans: every run is billed. Call it with `estimateOnly` first (no Insights charge), tell the user the GB and what they cost, and \
+run it only once the user agrees (or already said to go ahead within a budget). It stays within the GB the user allows per analysis \
+and per month (`dcli mcp --insights-gb`), and stops a query that reaches them. Without `functions` it reads the most expensive \
+functions (by GB-seconds) that fit. The analysis is kept: savings_findings and dcli's Savings module show its findings for 30 days.";
 
 pub fn schema() -> Value {
     object(&["env"], json!({
@@ -37,15 +38,15 @@ pub fn schema() -> Value {
 
 /// The functions to read, by name: those asked, or the most expensive (`ranked` is name,
 /// GB-seconds, bytes of logs, most expensive first) whose logs fit in `room` bytes. Functions
-/// that ran nothing are left out (their logs say nothing about memory). The second list is
-/// what did not fit.
+/// that ran nothing, or whose groups received no logs over the window, are left out: there is
+/// nothing to read. The second list is what did not fit.
 fn choose(ranked: &[(String, f64, f64)], asked: bool, room: f64) -> (Vec<String>, Vec<String>) {
     if asked {
-        return (ranked.iter().map(|r| r.0.clone()).collect(), Vec::new());
+        return (ranked.iter().filter(|r| r.2 > 0.0).map(|r| r.0.clone()).collect(), Vec::new());
     }
     let (mut chosen, mut left, mut bytes) = (Vec::new(), Vec::new(), 0.0);
     for (name, gbs, b) in ranked {
-        if *gbs <= 0.0 {
+        if *gbs <= 0.0 || *b <= 0.0 {
             continue;
         }
         if bytes + b <= room {
@@ -67,12 +68,15 @@ fn scan_cost(costs: Option<&Snapshot>, region: &str, bytes: f64) -> Option<(f64,
     Some((bytes / GB * rate, price::rate_text(rate, &unit, currency)))
 }
 
-fn off(env: &str) -> String {
+/// Why the tool does not run, and how the user turns it on; `rate` is the bill's Logs Insights
+/// rate, when the costs read have it.
+fn off(env: &str, rate: Option<String>) -> String {
+    let rate = rate.map(|r| format!(" (Logs Insights costs {r} on this account's bill)")).unwrap_or_default();
     format!(
         "Logs Insights is off for this server, so it cannot read the memory functions use: the user allows it by registering dcli \
          with how many GB one analysis may scan, e.g. `claude mcp remove dcli` and then `claude mcp add dcli -- dcli mcp --env {env} \
-         --insights-gb 1000` (US$ 0.005 a GB at the usual rate). Meanwhile `estimateOnly` says what an analysis would scan, and \
-         resource_report kind lambda shows a function's memory over 24 h."
+         --insights-gb 1000`{rate}. Meanwhile `estimateOnly` says what an analysis would scan, and resource_report kind lambda shows a \
+         function's memory over 24 h."
     )
 }
 
@@ -85,8 +89,15 @@ pub fn lambda_memory(s: &Server, args: &Value) -> Result<String, String> {
     let days = args.get("days").and_then(Value::as_u64).unwrap_or(u64::from(DEFAULT_DAYS)).clamp(1, u64::from(MAX_DAYS)) as u32;
     let estimate_only = args.get("estimateOnly").and_then(Value::as_bool).unwrap_or(false);
     let caps = &s.insights;
+    let costs = (s.costs)(name);
     if caps.per_run <= 0.0 && !estimate_only {
-        return Err(off(name));
+        return Err(off(name, scan_cost(costs.as_ref(), &env.region, GB).map(|(_, rate)| rate)));
+    }
+    if !estimate_only && caps.per_month <= 0.0 {
+        return Err("the GB Logs Insights may scan a month is 0 (--insights-gb-month): nothing may be scanned".into());
+    }
+    if !estimate_only && caps.usage.is_none() {
+        return Err("cannot find the home directory, where dcli counts what Logs Insights scans a month: it does not scan without counting".into());
     }
     let mut asked: Vec<String> = Vec::new();
     for v in args.get("functions").and_then(Value::as_array).into_iter().flatten() {
@@ -121,7 +132,8 @@ pub fn lambda_memory(s: &Server, args: &Value) -> Result<String, String> {
     let room = if caps.per_run <= 0.0 { f64::INFINITY } else { caps.per_run.min(left_this_month) };
     let (chosen, over) = choose(&ranked, !asked.is_empty(), room);
     let picked = estimate.only(&chosen);
-    let costs = (s.costs)(name);
+    // Asked for, but their groups received nothing over the window: nothing to read.
+    let no_logs: Vec<String> = ranked.iter().filter(|r| r.2 <= 0.0 && asked.contains(&r.0)).map(|r| r.0.clone()).collect();
     let cost_of = |bytes: f64| scan_cost(costs.as_ref(), &env.region, bytes).map(|(c, rate)| json!({ "cost": money(c), "rate": rate }));
     let listed = |names: &[String]| -> Vec<Value> {
         names
@@ -148,11 +160,13 @@ pub fn lambda_memory(s: &Server, args: &Value) -> Result<String, String> {
             "month": month,
             "functions": listed(&chosen),
             "notFitting": listed(&over),
+            "noLogs": no_logs,
             "sharedLogGroups": estimate.shared,
             "notFound": not_found,
             "notes": [
-                "Measured from the log groups' IncomingBytes: what Logs Insights would scan, and bill.",
-                "Functions that share a log group cannot be told apart in their REPORT lines and are left out.",
+                "Measured from the log groups' IncomingBytes over the same window the analysis reads: what Logs Insights would scan, and bill.",
+                "Functions that share a log group cannot be told apart in their reports and are left out.",
+                "Running it is billed: tell the user the GB and the cost, and run it once they agree.",
             ],
         }));
     }
@@ -179,32 +193,34 @@ pub fn lambda_memory(s: &Server, args: &Value) -> Result<String, String> {
             sanitize(&ranked.iter().take(5).map(|r| r.0.as_str()).collect::<Vec<_>>().join(", "))
         ));
     }
-    // Counted before it runs, so two analyses at once cannot pass the month's cap together.
-    let reserved = picked.bytes;
-    if let Some(path) = &caps.usage {
-        match usage::reserve(path, now, reserved, caps.per_month) {
-            Ok(Ok(_)) => {}
-            Ok(Err(left)) => {
-                return Err(format!(
-                    "this analysis would scan {}, but only {} is left this month of the {} allowed (--insights-gb-month): ask for fewer \
-                     `functions` or `days`, or wait for next month",
-                    size(reserved),
-                    size(left),
-                    size(caps.per_month)
-                ));
-            }
-            Err(e) => return Err(format!("cannot count what Logs Insights scans: {e}")),
+    // Counted before it runs, so two analyses at once cannot pass the month's cap together; a
+    // twentieth more than the estimate, as logs can grow a little, within both caps. The
+    // analysis stops any query that reaches it.
+    let Some(path) = &caps.usage else { return Err("cannot count what Logs Insights scans".into()) };
+    let budget = (picked.bytes * 1.05).min(caps.per_run).min(left_this_month).max(picked.bytes);
+    let reserved = match usage::reserve(path, now, budget, caps.per_month) {
+        Ok(Ok(r)) => r,
+        Ok(Err(left)) => {
+            return Err(format!(
+                "this analysis would scan {}, but only {} is left this month of the {} allowed (--insights-gb-month): ask for fewer \
+                 `functions` or `days`, or wait for next month",
+                size(picked.bytes),
+                size(left),
+                size(caps.per_month)
+            ));
         }
-    }
-    let run = match memory::memory_analysis(&aws, name, &picked, &|_, _| {}) {
+        Err(e) => return Err(format!("cannot count what Logs Insights scans: {e}")),
+    };
+    let run = match memory::memory_analysis_within(&aws, name, &picked, Some(reserved.bytes), &|_, _| {}) {
         Ok(run) => run,
         Err(e) => {
-            // What it scanned before failing is unknown: the estimate stays counted.
+            // Nothing was scanned: the reservation is given back.
+            let _ = usage::settle(path, &reserved, 0.0);
             return Err(aws_error(name, &e));
         }
     };
-    if let Some(path) = &caps.usage {
-        let _ = usage::settle(path, now, reserved, run.bytes_scanned);
+    if let Err(e) = usage::settle(path, &reserved, run.bytes_scanned) {
+        eprintln!("dcli mcp: cannot update what Logs Insights scanned this month: {e}");
     }
     let mut found: Vec<Finding> = run.uses.iter().filter_map(memory::memory_finding).map(|f| Finding { service: "Lambda", ..f }).collect();
     price::price_all(&mut found, costs.as_ref(), &env.region);
@@ -214,6 +230,12 @@ pub fn lambda_memory(s: &Server, args: &Value) -> Result<String, String> {
         "Memory also sets CPU: a function that computes may get slower with less, and save less. Try the size in dev first.".to_string(),
         "Kept for 30 days: savings_findings and dcli's Savings module include these findings without scanning again.".to_string(),
     ];
+    if let Some(why) = &run.stopped {
+        notes.push(format!(
+            "The analysis {}: the functions above are those read until then, possibly from part of their logs.",
+            sanitize(why)
+        ));
+    }
     if let Some(e) = &run.keep_error {
         notes.push(format!("Could not keep the analysis for later: {}", sanitize(e)));
     }
@@ -240,8 +262,10 @@ pub fn lambda_memory(s: &Server, args: &Value) -> Result<String, String> {
             "reportLines": u.samples,
             "avgBilledMs": u.avg_billed_ms.round(),
         })).collect::<Vec<_>>(),
+        "stopped": run.stopped,
         "withoutInvocations": run.silent,
         "notFitting": listed(&over),
+        "noLogs": no_logs,
         "sharedLogGroups": estimate.shared,
         "notFound": not_found,
         "findings": found.iter().map(|f| json!({
@@ -291,8 +315,12 @@ mod tests {
         let (chosen, left) = choose(&ranked, false, 1000.0);
         assert_eq!(chosen, ["big", "small"]);
         assert_eq!(left, ["huge-logs"]);
-        // Asked by name, all of them (the cap is checked on their total).
+        // Asked by name, all of them (the cap is checked on their total)…
         assert_eq!(choose(&ranked, true, 1.0).0.len(), 4);
+        // …but those whose groups received nothing: there is nothing to read.
+        let quiet = vec![("quiet".to_string(), 50.0, 0.0), ("busy".to_string(), 50.0, 10.0)];
+        assert_eq!(choose(&quiet, true, 1.0).0, ["busy"]);
+        assert_eq!(choose(&quiet, false, 100.0).0, ["busy"]);
     }
 
     #[test]
@@ -324,5 +352,43 @@ mod tests {
         assert!(error && text.contains("unknown field `function`"), "{text}");
         let s = server(None, None).with_insights(1000.0, 3000.0, None);
         assert!((s.insights.per_run - 1000.0 * GB).abs() < 1.0 && (s.insights.per_month - 3000.0 * GB).abs() < 1.0);
+    }
+
+    #[test]
+    fn no_price_of_its_own_and_billed_runs_are_not_read_only() {
+        // Off: the rate is the bill's when the costs were read, none of dcli's own otherwise.
+        let (_, text) = call(&server(None, None), json!({ "env": "dev" }));
+        assert!(!text.contains("US$"), "{text}");
+        let bill = Snapshot {
+            usage: vec![crate::costs::UsageCost {
+                service: "AmazonCloudWatch".into(),
+                usage_type: "USE1-DataScanned-Bytes".into(),
+                cost: 5.0,
+                quantity: 1000.0,
+                unit: "GB".into(),
+            }],
+            ..Default::default()
+        };
+        let (_, text) = call(&server(None, Some(bill)), json!({ "env": "dev" }));
+        assert!(text.contains("costs US$ 0.005 per GB on this account's bill"), "{text}");
+        let listed = super::super::tools::list();
+        let tool = listed.iter().find(|t| t["name"] == "lambda_memory").unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(tool["annotations"]["idempotentHint"], false);
+        assert_eq!(tool["annotations"]["destructiveHint"], false);
+        assert!(tool["description"].as_str().unwrap().contains("only once the user agrees"));
+    }
+
+    #[test]
+    fn nothing_is_scanned_without_a_count_or_a_month_cap() {
+        // A month of 0 GB holds nothing.
+        let path = std::env::temp_dir().join(format!("dcli-mcp-memory-{}", std::process::id())).join("mcp-usage.json");
+        let s = server(None, None).with_insights(1000.0, 0.0, Some(path));
+        let (error, text) = call(&s, json!({ "env": "dev" }));
+        assert!(error && text.contains("a month is 0"), "{text}");
+        // Without a home directory to count in, it does not scan.
+        let s = server(None, None).with_insights(1000.0, 3000.0, None);
+        let (error, text) = call(&s, json!({ "env": "dev" }));
+        assert!(error && text.contains("does not scan without counting"), "{text}");
     }
 }
