@@ -112,8 +112,8 @@ fn decide(store: &Store, env: &str, id: &str, state: State, reason: &str, json: 
                     paint(
                         &format!(
                             "Recorded in the savings ledger ({}: {}). After 7 complete days `{} optimize {env} --verify` (or Savings › Verified) compares the bill before and after.",
-                            e.service,
-                            e.usage.join(", "),
+                            sanitize(&e.service),
+                            sanitize(&e.usage.join(", ")),
                             program()
                         ),
                         "90"

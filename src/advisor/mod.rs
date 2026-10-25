@@ -608,7 +608,7 @@ impl Store {
                 // `R7.json` holds R7: a file under another name is not one.
                 let n = e.file_name().to_string_lossy().strip_suffix(".json").and_then(number)?;
                 let r: Recommendation = serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
-                (r.env == env && number(&r.id) == Some(n)).then_some(r)
+                (r.env == env && number(&r.id) == Some(n)).then(|| cleaned(r))
             })
             .collect();
         out.sort_by_key(Recommendation::number);
@@ -617,7 +617,7 @@ impl Store {
 
     pub fn get(&self, env: &str, id: &str) -> Option<Recommendation> {
         let text = std::fs::read_to_string(self.path(env, id)?).ok()?;
-        serde_json::from_str::<Recommendation>(&text).ok().filter(|r| r.env == env && number(&r.id) == number(id))
+        serde_json::from_str::<Recommendation>(&text).ok().filter(|r| r.env == env && number(&r.id) == number(id)).map(cleaned)
     }
 
     /// Replaces the file of `r` (which has its id).
@@ -678,6 +678,75 @@ impl Store {
         }
         hash
     }
+}
+
+/// A recommendation as read from disk, where anyone could have edited it: its text without
+/// escape sequences or hidden characters (as [`submit`] keeps it), and a command that spans
+/// lines shown as a snippet instead, so copying a "command" never pastes several.
+fn cleaned(mut r: Recommendation) -> Recommendation {
+    let one_line = |t: &mut String| *t = sanitize(t).replace(['\n', '\t'], " ");
+    let text = |t: &mut String| *t = sanitize(t);
+    for t in [&mut r.title, &mut r.author, &mut r.region, &mut r.account, &mut r.performance, &mut r.state_note] {
+        one_line(t);
+    }
+    for t in [&mut r.finding, &mut r.risk_note, &mut r.rollback, &mut r.verify] {
+        text(t);
+    }
+    r.evidence.iter_mut().for_each(one_line);
+    for x in &mut r.resources {
+        [&mut x.module, &mut x.target, &mut x.name].into_iter().for_each(one_line);
+    }
+    for step in &mut r.steps {
+        text(&mut step.text);
+        if let Some(code) = &mut step.code {
+            text(code);
+        }
+        if let Some(language) = &mut step.language {
+            one_line(language);
+        }
+        if let Some(command) = step.command.take() {
+            if command.contains(['\n', '\r']) || command.chars().any(crate::util::is_unsafe) {
+                let shown = sanitize(&command);
+                step.code = Some(match step.code.take() {
+                    Some(code) => format!("{shown}\n{code}"),
+                    None => shown,
+                });
+            } else {
+                step.command = Some(command);
+            }
+        }
+    }
+    let c = &mut r.cost;
+    for change in &mut c.changes {
+        one_line(&mut change.service);
+        one_line(&mut change.usage_type);
+        if let Some(to) = &mut change.to {
+            one_line(to);
+        }
+    }
+    if let Some(b) = &mut c.bill {
+        one_line(&mut b.currency);
+        b.notes.iter_mut().for_each(one_line);
+        b.unpriced.iter_mut().for_each(one_line);
+        for l in &mut b.lines {
+            for t in [&mut l.unit, &mut l.change.service, &mut l.change.usage_type] {
+                one_line(t);
+            }
+            for t in [&mut l.change.to, &mut l.scaled_from, &mut l.to_scaled_from].into_iter().flatten() {
+                one_line(t);
+            }
+        }
+    }
+    if let Some(claude) = &mut c.claude {
+        text(&mut claude.reasoning);
+    }
+    if let Some(none) = &mut c.none {
+        one_line(none);
+    }
+    if let Some(ledger) = &mut r.ledger {
+        one_line(ledger);
+    }
+    r
 }
 
 /// `7` for `R7` (or `r7`); `None` for anything else.
@@ -786,13 +855,21 @@ pub fn markdown(r: &Recommendation) -> String {
     md.push_str("**Steps:**\n\n");
     for (i, s) in r.steps.iter().enumerate() {
         let _ = writeln!(md, "{}. {}", i + 1, s.text);
-        if let Some(c) = &s.command {
+        // Indented under the step, so the numbered list goes on after the block.
+        let indent = " ".repeat(format!("{}. ", i + 1).len());
+        let mut block = |lang: &str, text: &str| {
+            let mut fenced = String::new();
+            md_block(&mut fenced, lang, text);
             md.push('\n');
-            md_block(&mut md, "sh", c);
+            for l in fenced.lines() {
+                let _ = writeln!(md, "{}{l}", if l.is_empty() { "" } else { indent.as_str() });
+            }
+        };
+        if let Some(c) = &s.command {
+            block("sh", c);
         }
         if let Some(c) = &s.code {
-            md.push('\n');
-            md_block(&mut md, s.language.as_deref().unwrap_or("text"), c);
+            block(s.language.as_deref().unwrap_or("text"), c);
         }
     }
     md.push('\n');
@@ -956,6 +1033,41 @@ mod tests {
         std::fs::copy(store.dir("prod.eu").join("R2.json"), store.dir("prod.eu").join("R9.json")).unwrap();
         assert_eq!(store.list("prod.eu").len(), 2);
         let _ = std::fs::remove_dir_all(store.dir("prod.eu"));
+    }
+
+    #[test]
+    fn markdown_keeps_commands_inside_their_step() {
+        let d = draft().checked().unwrap();
+        let mut steps = d.steps.clone();
+        steps.push(Step { text: "Check".into(), code: Some("a: 1\n\nb: 2".into()), language: Some("yaml".into()), ..Default::default() });
+        let r = Recommendation { id: "R1".into(), env: "dev".into(), title: d.title.clone(), steps, ..Default::default() };
+        let md = markdown(&r);
+        assert!(md.contains("1. Set the memory\n\n   ```sh\n   aws lambda update-function-configuration"), "{md}");
+        assert!(md.contains("2. Check\n\n   ```yaml\n   a: 1\n\n   b: 2\n   ```"), "{md}");
+    }
+
+    #[test]
+    fn files_edited_by_hand_are_cleaned_when_read() {
+        let store = temp_store("cleaned");
+        let mut r = Recommendation { id: "R1".into(), env: "dev".into(), title: "x\u{1b}]52;c;AAAA\u{7}y".into(), ..Default::default() };
+        r.steps = vec![Step { text: "go".into(), command: Some("aws s3 ls\nrm -rf ~".into()), ..Default::default() }];
+        r.cost.changes = vec![estimate::Change {
+            service: "AWS\u{1b}[2J Lambda".into(),
+            usage_type: "x".into(),
+            effect: Effect::Remove,
+            quantity: 1.0,
+            to: None,
+            at_most: false,
+        }];
+        std::fs::create_dir_all(store.dir("dev")).unwrap();
+        std::fs::write(store.dir("dev").join("R1.json"), serde_json::to_string(&r).unwrap()).unwrap();
+        let read = store.get("dev", "R1").unwrap();
+        assert_eq!(read.title, "xy");
+        assert_eq!(read.steps[0].command, None, "a command over two lines is not a command");
+        assert_eq!(read.steps[0].code.as_deref(), Some("aws s3 ls\nrm -rf ~"));
+        assert_eq!(read.cost.changes[0].service, "AWS Lambda");
+        assert_eq!(store.list("dev")[0], read);
+        let _ = std::fs::remove_dir_all(store.dir("dev"));
     }
 
     #[test]

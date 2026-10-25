@@ -135,15 +135,21 @@ impl Estimate {
                         rate(r2, &l.unit),
                         scaled(&l.to_scaled_from)
                     ),
-                    _ => format!(
-                        "{} {} {} of {} at {}{}",
-                        if c.effect == Effect::Add { "+" } else { "−" },
-                        crate::savings::qty(c.quantity),
-                        l.unit,
-                        c.usage_type,
-                        rate(l.rate, &l.unit),
-                        scaled(&l.scaled_from)
-                    ),
+                    _ => {
+                        // `3.4 M Lambda-GB-Second`, not `… Lambda-GB-Second of Lambda-GB-Second`.
+                        let what = if l.unit.eq_ignore_ascii_case(&c.usage_type) {
+                            c.usage_type.clone()
+                        } else {
+                            format!("{} of {}", l.unit, c.usage_type)
+                        };
+                        format!(
+                            "{} {} {what} at {}{}",
+                            if c.effect == Effect::Add { "+" } else { "−" },
+                            crate::savings::qty(c.quantity),
+                            rate(l.rate, &l.unit),
+                            scaled(&l.scaled_from)
+                        )
+                    }
                 }
             })
             .collect()
@@ -415,6 +421,7 @@ mod tests {
         let e = estimate(&[change("AWS Lambda", "Lambda-GB-Second", Effect::Remove, 3_000_000.0, None)], &s, "us-east-1");
         assert!((e.monthly - 50.0).abs() < 1e-9 && e.now == e.monthly && e.later == 0.0);
         assert_eq!(e.describe(), "saves ≈ US$ 50 a month");
+        assert_eq!(e.rate_lines(), ["− 3 M Lambda-GB-Second at US$ 0.0000167 per Lambda-GB-Second"]);
         let e = estimate(&[change("AWS Lambda", "Request", Effect::Add, 50_000_000.0, None)], &s, "us-east-1");
         assert!((e.monthly + 10.0).abs() < 1e-9);
         assert_eq!(e.describe(), "costs ≈ US$ 10 more a month");
