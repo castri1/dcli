@@ -401,8 +401,10 @@ with the measurements behind it and what the estimate assumes; its impact (●�
 medium, ●○○ low) comes from that volume. Once the Costs module has read the bill, findings
 also say what they save in dollars, at the rate your account actually pays for that usage
 type (its cost divided by what was used, discounts and commitments included), and are
-sorted by it. Usage that Savings Plans or reservations cover only saves when the commitment
-renews: the amount is split into what you save now and what you save then, with the date.
+sorted by it. Savings Plans and reservations go on covering the usage that is left, so a
+saving comes off what runs outside them first and shows on the bill right away; only what goes
+beyond that waits for the commitment to renew. The amount is split into what you save now and
+what you save then, with the date.
 
 Log retention and SQS long polling can be applied from the module (`a`); `d` marks a finding
 done when you changed it elsewhere (a function's memory in your code). Either way the change
