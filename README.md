@@ -8,7 +8,10 @@ Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**
 **DMS** (tasks, tables, CDC latency), **EventBridge** and **AppConfig** feature flags, plus
 **Costs** from Cost Explorer and a **Savings** scan of what could cost less, priced with your
 bill's own rates. Failures (pipelines, executions, functions, stacks,
-routes, migration tasks) and slow databases can be copied as Markdown reports for an AI agent.
+routes, migration tasks) and slow databases can be copied as Markdown reports for an AI agent,
+and `dcli mcp` lets **Claude** explore an environment (read-only) and leave cost and
+performance recommendations in the **Advisor**, each priced at your bill's rates, with the
+steps to copy.
 A single ~5 MB binary (about 2.5 MB to download) for macOS, Linux and Windows. No Node.js, no AWS
 SDK, no runtime.
 
@@ -174,6 +177,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Approvals | `↑↓` move · `a` approve / reject (with a comment) · `Enter` open the pipeline (or sign in) · `o` open the approval's link · `r` refresh |
 | Alarms | `Enter` open the alarm's resource (Lambda, SQS, DynamoDB, Step Functions; switches environment) · `/` filter · `a` every environment / this one · `y` copy a Markdown summary · `o` console · `r` refresh · `PgUp/PgDn` scroll the detail |
 | Costs | `←→` services / commitments · `↑↓` service · `Enter` its usage types (cost, quantity, effective rate) · `o` open the service's dcli module · `g` Savings for that service · `r` read again (says how many requests first) · `s` settings: reader profile, manual or daily · `c` copy the report for AI · `PgUp/PgDn` scroll |
+| Advisor | `↑↓` recommendation · `Tab` pending / done / dismissed · `Enter` open the resource · `→` the steps, `↑↓` between them · `c` copy the step's command (all of them from the list) · `m` copy as Markdown · `d` mark done (the bill is compared a week later) · `x` dismiss with a reason · `u` back to pending · `r` reload · `PgUp/PgDn` scroll |
 | Savings | `←→` findings / by cost / verified · `Enter`/`g` open the resource (By cost: its finding) · `a` apply the fix (log retention, SQS long polling) · `d` mark done (the bill is compared a week later) · `m` Lambda memory analysis (tells the GB to scan first) · `s` filter by service · `i` filter by impact · `/` search · `c` copy the plan for AI · `y` copy the finding · `r` scan again (By cost: split again) · `v` verify on the bill (1 Cost Explorer request each) · `x` stop following a change · `PgUp/PgDn` scroll |
 | Pipelines (logs) | `l` build log · `z` full screen · `g` compare the commits since the last success |
 | Full-screen logs | `/` search · `n`/`N` next/previous match · `e`/`E` next/previous error · `y` copy every line · `Esc` back. The mouse is left to the terminal: drag to select and copy |
@@ -433,6 +437,51 @@ account once (`s`, or `dcli costs --setup --profile NAME`): it reads every accou
 environment shows its own account's costs. `--mode daily` reads again when the module opens or
 the command runs and what was read is more than a day old.
 
+### Claude and the Advisor
+
+`dcli mcp` is an [MCP](https://modelcontextprotocol.io) server: Claude Code (or any MCP client)
+uses it to look at an environment and leave recommendations in the Advisor module. Add it once:
+
+```sh
+claude mcp add dcli -- dcli mcp                # this project; --scope user for every project
+claude mcp add dcli -- dcli mcp --env dev,qa   # only these environments
+```
+
+Then ask for an audit, naming the environment: `/mcp__dcli__audit prod` (the `audit` prompt;
+its focus can be `cost`, `performance` or `both`), or in your own words ("analyze prod with
+dcli and leave recommendations").
+
+What Claude can and cannot do through it:
+
+- **It reads**: the environment's resources, their configuration and metrics, the reports dcli
+  writes for AI agents (Lambda, Aurora, Redshift, DMS, API Gateway), the alarms, what the
+  Savings scan finds, the bill split over resources, and the costs last read. It never calls
+  Cost Explorer (each request is billed): when the reading is missing or old, it asks you to
+  run `dcli costs <env> --refresh`. No Logs Insights either (billed by the data it scans).
+- **It changes nothing** in AWS and runs nothing. The one thing it writes is recommendations,
+  kept in `~/.deployment-cli/advisor/<env>/`.
+- **You choose the environment**: every tool takes it, and `--env` limits which ones exist.
+
+Each recommendation says what was found and the evidence; the steps, as commands to copy
+(flagged when they change something) or the infrastructure-as-code change; the risk, how to
+undo it and how to check it worked; and what it saves or costs a month. Claude describes the
+change as usage the bill knows (so many GB-seconds less; so many hours of `db.r6g.xlarge`
+billed as `db.r6g.large` instead) and dcli prices it at your account's own rates, split into
+what you save now and what you save when Savings Plans or reservations renew. A size the bill
+has not used is priced from another size of its family, in proportion, as AWS prices them.
+What the bill cannot price, Claude may estimate itself: it is shown as Claude's estimate, with
+its reasoning. A performance change that costs more says how much more.
+
+The Advisor shows recommendations as Claude writes them, those that save most first, with
+the totals. `c` copies a step's command, `m` the whole recommendation as Markdown; `Enter`
+opens the resource in its module. `d` marks one done: it joins the changes Savings follows,
+so a week later the bill says whether it saved what was expected. `x` dismisses it with a
+reason, which Claude reads before proposing anything again. `dcli advisor <env>` lists them,
+`--md` writes them as one document to share.
+
+Names, tags and log lines from AWS can hold text written to mislead an AI. The server hands
+them to Claude as data, Claude cannot change the account, and every step goes through you.
+
 ### Updates
 
 `dcli update` downloads the latest release and replaces the binary (checksum verified); when
@@ -492,15 +541,18 @@ src/
     chart.rs      terminal charts (metrics of Lambda, Alarms, API Gateway, Aurora)
     canvas.rs     box-drawing canvas for diagrams (Step Functions graph, Aurora topology)
   modules/        one file (or folder) per module: pipelines, matrix, approvals, alarms,
-                  costs, savings, parameters, secrets, lambda, apigateway, cwlogs, cfn, s3, sfn,
+                  costs, savings, advisor, parameters, secrets, lambda, apigateway, cwlogs, cfn, s3, sfn,
                   sqs, dynamodb, aurora, redshift, dms, events, appconfig
   clicmd/         the commands of the newer modules (dcli s3, sfn, ddb, events, flags, lambda,
                   alarms, approvals, promote, rollback, sqs, insights, cfn, apigw, aurora,
-                  redshift, dms, costs, optimize)
+                  redshift, dms, costs, optimize, advisor)
   savings/        one check per service for the Savings module and `dcli optimize`, and their
                   pricing with the bill's rates
   costs/          Cost Explorer: reading (counted), settings, the cache, cost after deploys,
                   costs split over resources, the changes followed and their verification
+  advisor/        recommendations written through `dcli mcp`: their store, and their cost
+                  estimates at the bill's rates
+  mcp/            the MCP server: JSON-RPC on stdio, its read-only tools and the audit prompt
   catalog.rs      every resource of an environment by name, for the `:` search
   asl.rs          Amazon States Language: a state machine's definition arranged for its graph
   pipeline.rs     CodePipeline domain logic shared by the UI and the CLI

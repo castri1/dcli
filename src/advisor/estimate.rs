@@ -163,6 +163,10 @@ pub fn validate(changes: &[Change]) -> Result<(), String> {
     }
     for (i, c) in changes.iter().enumerate() {
         let n = i + 1;
+        // Names end up on screen and in Markdown: no escape sequences or hidden characters.
+        if [Some(&c.service), Some(&c.usage_type), c.to.as_ref()].into_iter().flatten().any(|t| t.chars().any(crate::util::is_unsafe)) {
+            return Err(format!("change {n}: names have control or invisible characters"));
+        }
         let usage = billing::split_region(c.usage_type.trim()).1;
         if c.service.trim().is_empty() || c.service.len() > 120 {
             return Err(format!("change {n}: give the service as Cost Explorer names it (`AWS Lambda`)"));
@@ -495,6 +499,8 @@ mod tests {
         assert!(bad(Change { to: Some("x".into()), ..ok.clone() }).contains("only a move"));
         assert!(bad(Change { at_most: true, effect: Effect::Add, ..ok.clone() }).contains("only a removal"));
         assert!(bad(Change { service: " ".into(), ..ok.clone() }).contains("service"));
+        assert!(bad(Change { usage_type: "Lambda\u{1b}[2J".into(), ..ok.clone() }).contains("control"));
+        assert!(bad(Change { effect: Effect::Move, to: Some("x\u{202e}".into()), ..ok.clone() }).contains("control"));
         assert!(validate(&vec![ok; MAX_CHANGES + 1]).is_err());
     }
 
