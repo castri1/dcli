@@ -1,5 +1,6 @@
 //! CloudWatch metrics (GetMetricData) through [`super::cloudwatch`]: a metric's values over
-//! time, for the Lambda charts and the alarms' graphs.
+//! time, for the Lambda charts and the alarms' graphs; and the metrics that exist
+//! (ListMetrics), for what custom metrics cost.
 
 use super::cloudwatch::{SERVICE, VERSION};
 use super::{Aws, Result};
@@ -74,6 +75,47 @@ pub fn get_metric_data(aws: &Aws, queries: &[Query], start: f64, end: f64) -> Re
     Ok(series)
 }
 
+/// A metric that exists, as ListMetrics lists it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Metric {
+    pub namespace: String,
+    pub name: String,
+    pub dimensions: Vec<(String, String)>,
+}
+
+/// The metrics that received data in the last three hours (those the bill counts as custom
+/// metrics, outside the `AWS/` namespaces), at most about `max`; the bool says whether there
+/// were more. ListMetrics is free.
+pub fn list_recent_metrics(aws: &Aws, max: usize) -> Result<(Vec<Metric>, bool)> {
+    let mut out = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut page: Vec<(&str, &str)> = vec![("RecentlyActive", "PT3H")];
+        if let Some(t) = &token {
+            page.push(("NextToken", t));
+        }
+        let xml = aws.query(&SERVICE, "ListMetrics", VERSION, &page)?;
+        out.extend(parse_metrics(&xml));
+        token = xml_text(&xml, "NextToken").filter(|t| !t.is_empty());
+        match token {
+            Some(_) if out.len() < max => {}
+            more => return Ok((out, more.is_some())),
+        }
+    }
+}
+
+fn parse_metrics(xml: &str) -> Vec<Metric> {
+    super::xml::result_of(xml, "ListMetrics")
+        .list("Metrics")
+        .iter()
+        .map(|m| Metric {
+            namespace: m.string("Namespace"),
+            name: m.string("MetricName"),
+            dimensions: m.list("Dimensions").iter().map(|d| (d.string("Name"), d.string("Value"))).collect(),
+        })
+        .collect()
+}
+
 fn parse(xml: &str) -> Vec<Series> {
     let results = xml_blocks(xml, "MetricDataResults").into_iter().next().unwrap_or("");
     members(results)
@@ -132,5 +174,18 @@ mod tests {
         assert_eq!(series[0].id, "inv");
         assert_eq!(series[0].points, [(parse_rfc3339("2026-10-21T10:00:00Z").unwrap(), 3.0), (parse_rfc3339("2026-10-21T10:05:00Z").unwrap(), 7.5)]);
         assert_eq!((series[1].label.as_str(), series[1].points.len()), ("Errors", 0));
+    }
+
+    #[test]
+    fn reads_listed_metrics() {
+        let xml = "<ListMetricsResponse><ListMetricsResult><Metrics>\
+            <member><Namespace>LambdaInsights</Namespace><MetricName>memory_utilization</MetricName>\
+            <Dimensions><member><Name>function_name</Name><Value>orders &amp; co</Value></member></Dimensions></member>\
+            <member><Namespace>Orders/App</Namespace><MetricName>OrderCreated</MetricName><Dimensions/></member>\
+            </Metrics><NextToken>abc</NextToken></ListMetricsResult></ListMetricsResponse>";
+        let m = parse_metrics(xml);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].dimensions, [("function_name".to_string(), "orders & co".to_string())]);
+        assert_eq!((m[1].namespace.as_str(), m[1].name.as_str(), m[1].dimensions.len()), ("Orders/App", "OrderCreated", 0));
     }
 }

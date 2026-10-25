@@ -42,6 +42,7 @@ fn without_data(a: &Alarm, silent_days: f64, now: f64) -> Option<Finding> {
         reduction,
         Impact::Low,
     )
+    .kind("alarms-no-data")
     .score(days / 3650.0)
     .billed(billing::ALARMS, metric_count(a).max(1) as f64)
     .evidence(format!("INSUFFICIENT_DATA since {}", fmt_utc(since)))

@@ -51,6 +51,7 @@ fn unused(s: &Secret, idle_days: f64, now: f64) -> Option<Finding> {
         "1 secret a month",
         Impact::Low,
     )
+    .kind("secrets-unused")
     .score(days / 3650.0)
     .billed(billing::SECRETS, 1.0)
     .caveat("Secrets Manager keeps the last read to the day: a secret read once a year looks unused.");

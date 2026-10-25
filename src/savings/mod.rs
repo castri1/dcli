@@ -14,6 +14,7 @@ pub mod alarms;
 pub mod apigateway;
 pub mod aurora;
 pub mod billing;
+pub mod custom_metrics;
 pub mod dms;
 pub mod dynamodb;
 pub mod lambda;
@@ -272,6 +273,7 @@ pub const CHECKS: &[(&str, Check)] = &[
     ("Step Functions", sfn::check),
     ("Secrets Manager", secrets::check),
     ("CloudWatch alarms", alarms::check),
+    ("CloudWatch metrics", custom_metrics::check),
     ("API Gateway", apigateway::check),
     ("Aurora", aurora::check),
     ("Redshift", redshift::check),
@@ -289,6 +291,7 @@ pub fn find_service(name: &str) -> Option<&'static str> {
         "sfn" | "states" | "stepfunctions" => "Step Functions",
         "secrets" | "secretsmanager" => "Secrets Manager",
         "alarms" | "cloudwatchalarms" => "CloudWatch alarms",
+        "metrics" | "custommetrics" | "cloudwatchmetrics" => "CloudWatch metrics",
         "apigw" | "apigateway" | "api" => "API Gateway",
         _ => "",
     };
@@ -306,6 +309,7 @@ pub fn short_name(service: &str) -> &str {
         "Step Functions" => "StepFn",
         "Secrets Manager" => "Secrets",
         "CloudWatch alarms" => "Alarms",
+        "CloudWatch metrics" => "Metrics",
         "API Gateway" => "API GW",
         s => s,
     }
@@ -380,6 +384,65 @@ pub fn sort(findings: &mut [Finding]) {
             .then_with(|| a.service.cmp(b.service))
             .then_with(|| a.resource.cmp(&b.resource))
     });
+}
+
+// ---- levers ---------------------------------------------------------------------------------
+
+/// One kind of change ([`Finding::kind`]) of one service, its findings added up: many small
+/// findings of one kind (a function each on arm64) make one large lever.
+#[derive(Debug, Clone, Default)]
+pub struct Lever {
+    pub service: &'static str,
+    pub kind: &'static str,
+    /// Indexes of its findings in the list given, the largest figure first.
+    pub findings: Vec<usize>,
+    /// The firm figures together, each resource's usage counted once ([`price::total`]).
+    pub total: Option<price::Total>,
+    /// The "at most" figures added up (ceilings, which may overlap), and how many.
+    pub at_most: f64,
+    pub at_most_count: usize,
+    /// Findings without dollars.
+    pub unpriced: usize,
+}
+
+impl Lever {
+    pub fn monthly(&self) -> f64 {
+        self.total.as_ref().map_or(0.0, |t| t.monthly)
+    }
+}
+
+/// The findings grouped by service and kind, the levers that save most first (firm figures,
+/// then ceilings, then how many findings).
+pub fn levers(findings: &[Finding]) -> Vec<Lever> {
+    let mut out: Vec<Lever> = Vec::new();
+    for (i, f) in findings.iter().enumerate() {
+        let slot = match out.iter().position(|l| l.service == f.service && l.kind == f.kind) {
+            Some(slot) => slot,
+            None => {
+                out.push(Lever { service: f.service, kind: f.kind, ..Default::default() });
+                out.len() - 1
+            }
+        };
+        let lever = &mut out[slot];
+        lever.findings.push(i);
+        match &f.price {
+            Some(p) if p.at_most => {
+                lever.at_most += p.monthly;
+                lever.at_most_count += 1;
+            }
+            Some(_) => {}
+            None => lever.unpriced += 1,
+        }
+    }
+    let figure = |f: &Finding| f.price.as_ref().map_or(0.0, |p| p.monthly);
+    for lever in &mut out {
+        lever.total = price::total(lever.findings.iter().map(|&i| &findings[i]).filter(|f| f.price.as_ref().is_some_and(|p| !p.at_most)));
+        lever.findings.sort_by(|&a, &b| figure(&findings[b]).total_cmp(&figure(&findings[a])).then(a.cmp(&b)));
+    }
+    out.sort_by(|a, b| {
+        b.monthly().total_cmp(&a.monthly()).then(b.at_most.total_cmp(&a.at_most)).then(b.findings.len().cmp(&a.findings.len()))
+    });
+    out
 }
 
 // ---- helpers for the checks -----------------------------------------------------------------
@@ -636,8 +699,63 @@ mod tests {
         assert_eq!(find_service("apigw"), Some("API Gateway"));
         assert_eq!(find_service("aur"), Some("Aurora"));
         assert_eq!(find_service("s3"), Some("S3"));
+        assert_eq!(find_service("metrics"), Some("CloudWatch metrics"));
         assert_eq!(find_service("ec2"), None);
         assert_eq!(find_service(""), None);
+    }
+
+    #[test]
+    fn levers_add_up_small_findings_of_one_kind() {
+        let costs = crate::costs::Snapshot {
+            usage: vec![
+                crate::costs::UsageCost {
+                    service: "AWS Lambda".into(),
+                    usage_type: "Lambda-GB-Second".into(),
+                    cost: 1000.0,
+                    quantity: 60_000_000.0,
+                    unit: "Lambda-GB-Second".into(),
+                },
+                crate::costs::UsageCost {
+                    service: "AWS Lambda".into(),
+                    usage_type: "Lambda-GB-Second-ARM".into(),
+                    cost: 80.0,
+                    quantity: 6_000_000.0,
+                    unit: "Lambda-GB-Second".into(),
+                },
+                crate::costs::UsageCost {
+                    service: "AmazonCloudWatch".into(),
+                    usage_type: "DataProcessing-Bytes".into(),
+                    cost: 50.0,
+                    quantity: 100.0,
+                    unit: "GB".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let lambda = |name: &str, gbs: f64| Finding {
+            service: "Lambda",
+            ..Finding::new("Lambda", name, name, "x86", "arm64", "", Impact::Low)
+                .kind("arm64")
+                .billed_instead(billing::LAMBDA_GBS, billing::LAMBDA_GBS_ARM, gbs)
+        };
+        let mut findings: Vec<Finding> = (0..30).map(|i| lambda(&format!("fn-{i}"), 300_000.0 + f64::from(i) * 1000.0)).collect();
+        findings.push(Finding { service: "Lambda", ..Finding::new("Lambda", "big", "big", "t", "timeout", "", Impact::Low).kind("timeout") });
+        findings.push(Finding {
+            service: "CloudWatch Logs",
+            ..Finding::new("Logs", "g", "g", "s", "log less", "", Impact::High).kind("log-ingestion").billed_at_most(billing::LOGS_INGESTED, 10.0)
+        });
+        price::price_all(&mut findings, Some(&costs), "us-east-1");
+        let levers = levers(&findings);
+        assert_eq!(levers.len(), 3);
+        let arm = &levers[0];
+        assert_eq!((arm.service, arm.kind, arm.findings.len()), ("Lambda", "arm64", 30));
+        let rate = 1000.0 / 60_000_000.0 - 80.0 / 6_000_000.0;
+        let gbs: f64 = (0..30).map(|i| 300_000.0 + f64::from(i) * 1000.0).sum();
+        assert!((arm.monthly() - gbs * rate).abs() < 1e-6, "{}", arm.monthly());
+        assert_eq!(findings[arm.findings[0]].resource, "fn-29", "the largest first");
+        // A lever of ceilings, or of no dollars, comes after.
+        assert_eq!(levers[1].kind, "log-ingestion");
+        assert_eq!((levers[2].kind, levers[2].unpriced), ("timeout", 1));
     }
 
     #[test]

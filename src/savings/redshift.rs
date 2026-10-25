@@ -147,6 +147,7 @@ fn idle(c: &Cluster, m: &Metrics, days: u32) -> Option<(f64, Finding)> {
             format!("{} node-hours a month of {}", qty(hours), c.node_type),
             by_node_hours(hours).max(Impact::Medium),
         )
+        .kind("redshift-idle")
         .score(hours)
         .billed(&billing::redshift_node(&c.node_type), hours)
     } else {
@@ -160,6 +161,7 @@ fn idle(c: &Cluster, m: &Metrics, days: u32) -> Option<(f64, Finding)> {
             format!("up to {} node-hours a month of {}", qty(hours), c.node_type),
             by_node_hours(hours),
         )
+        .kind("redshift-pause")
         .score(hours)
         .billed(&billing::redshift_node(&c.node_type), hours)
     };
@@ -232,6 +234,7 @@ fn spare_nodes(c: &Cluster, hourly: &Metrics, daily: &Metrics) -> Option<Finding
         format!("{} node-hours a month of {} ({} → {needed:.0} nodes)", qty(hours), c.node_type, c.nodes_count),
         by_node_hours(hours),
     )
+    .kind("redshift-nodes")
     .score(hours)
     .billed(&billing::redshift_node(&c.node_type), hours)
     .evidence(format!("highest hourly CPU in the window: {cpu:.0}%"))
@@ -266,6 +269,7 @@ fn scaling(c: &Cluster, daily: &Metrics, days: u32) -> Option<Finding> {
             format!("about {} hours a month of concurrency scaling beyond the free credits", qty(beyond)),
             impact,
         )
+        .kind("redshift-concurrency")
         .score(beyond)
         .evidence(format!("{} seconds of ConcurrencyScalingSeconds in {days} days", qty(daily.sum(&c.id, "scaling"))))
         .caveat("Each cluster earns an hour of free concurrency scaling a day (credits accrue up to 30 hours); beyond that it is billed per second.")
@@ -289,6 +293,7 @@ fn previous_generation(c: &Cluster) -> Option<Finding> {
             format!("{} node-hours a month on {} instead of RA3", qty(hours), c.node_type),
             if c.nodes_count >= 4 { Impact::Medium } else { Impact::Low },
         )
+        .kind("redshift-ra3")
         .score(hours)
         .caveat("RA3 bills its managed storage apart from the nodes: compare the whole configuration before moving.")
         .caveat("A resize between node families can take hours; test the workload on RA3 first."),
@@ -306,6 +311,7 @@ fn old_snapshots(cluster: &str, mb: f64, count: usize, oldest: f64) -> Finding {
         format!("{} GB of snapshot storage a month", qty(gb)),
         by_gb(gb),
     )
+    .kind("redshift-snapshots")
     .score(gb)
     .caveat("A manual snapshot may be the only copy someone counts on: check before deleting it.")
 }

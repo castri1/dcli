@@ -113,6 +113,7 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                     format!("−{rcu} RCU and −{wcu} WCU ({} capacity-unit hours a month)", qty(hours)),
                     Impact::of(hours, UNIT_HOURS_MEDIUM, UNIT_HOURS_HIGH),
                 )
+                .kind("ddb-unused")
                 .score(hours / UNIT_HOURS_HIGH)
                 .billed(billing::DDB_RCU_HOURS, unit_hours(rcu))
                 .billed(billing::DDB_WCU_HOURS, unit_hours(wcu))
@@ -129,6 +130,7 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                     format!("{} stored", size(stored)),
                     Impact::of(stored, IA_MEDIUM, IA_HIGH),
                 )
+                .kind("ddb-unused")
                 .score(stored / IA_HIGH)
                 .billed(storage_usage(t), stored / GB)
                 .evidence(format!("ConsumedRead/WriteCapacityUnits: none in {days} days"))
@@ -155,6 +157,7 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                     format!("−{} RCU and −{} WCU ({} capacity-unit hours a month)", rcu - new_rcu, wcu - new_wcu, qty(hours)),
                     Impact::of(hours, UNIT_HOURS_MEDIUM, UNIT_HOURS_HIGH),
                 )
+                .kind("ddb-capacity")
                 .score(hours / UNIT_HOURS_HIGH)
                 .billed(billing::DDB_RCU_HOURS, unit_hours(rcu - new_rcu))
                 .billed(billing::DDB_WCU_HOURS, unit_hours(wcu - new_wcu))
@@ -177,6 +180,7 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                     format!("{} request units a month billed per request", qty(monthly)),
                     Impact::of(monthly, REQUESTS_MEDIUM, REQUESTS_HIGH),
                 )
+                .kind("ddb-provisioned")
                 .score(monthly / REQUESTS_HIGH)
                 .evidence(traffic.clone())
                 .caveat("On-demand requests and provisioned capacity are billed differently: compare both with your prices before switching.")
@@ -192,6 +196,7 @@ fn table_findings(t: &TableDescription, read: &Traffic, write: &Traffic, days: u
                 format!("{} stored in the Standard class", size(stored)),
                 Impact::of(stored, IA_MEDIUM, IA_HIGH),
             )
+            .kind("ddb-standard-ia")
             .score(stored / IA_HIGH)
             .billed_instead(billing::DDB_STORAGE, billing::DDB_STORAGE_IA, stored / GB)
             .evidence(traffic)

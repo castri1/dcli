@@ -277,7 +277,7 @@ fn schema(name: &str) -> Value {
         })),
         "savings_findings" => object(&["env"], json!({
             "env": env_prop(),
-            "services": { "type": "array", "items": { "type": "string" }, "description": "Only these: lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, apigw, aurora, redshift, dms (default: all)" },
+            "services": { "type": "array", "items": { "type": "string" }, "description": "Only these: lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms (default: all)" },
             "days": { "type": "integer", "minimum": 1, "maximum": 90, "description": "Days of usage looked at (default 14)" }
         })),
         "resource_report" => object(&["env", "kind", "name"], json!({
@@ -332,7 +332,7 @@ fn description(name: &str) -> &'static str {
         "inventory" => "What an environment has, by dcli module: Lambda functions, APIs, log groups, queues, tables, buckets, state machines, Aurora and Redshift clusters, DMS tasks, stacks, alarms… with each one's `module` and `target` for recommendations.",
         "costs" => "Where the environment's money goes, from the reading the user last made with dcli (never Cost Explorer itself, which bills each request): totals, services, usage types with the account's effective rate, Savings Plans and reservations with coverage and utilization, AWS's purchase recommendation, and services that cost clearly more after a deploy. Markdown.",
         "cost_by_resource" => "A usage type's cost of the last 30 days split over the resources behind it, by what each used (CloudWatch metrics and configuration): which functions, log groups, tables, clusters… cost most. An allocation, not a line of the bill.",
-        "savings_findings" => "What dcli's own checks find could cost less (unused or oversized resources), each with its evidence and, with the costs read, its dollars at the account's rates; plus the changes already recorded in the savings ledger and what the bill did after them. Lambda memory against memory used needs Logs Insights, which this server does not run.",
+        "savings_findings" => "What dcli's own checks find could cost less (unused or oversized resources), each with its evidence and, with the costs read, its dollars at the account's rates; plus the changes already recorded in the savings ledger and what the bill did after them. Starts with `levers`: each kind of change added up over its resources (all functions that could run on arm64, say). Lambda memory against memory used comes from lambda_memory.",
         "resource_report" => "A Markdown report of one resource for analysis: a Lambda function (configuration, 24 h of metrics, memory used from its REPORT lines, problems in its logs), an Aurora cluster (topology, per-instance metrics, top SQL), a Redshift cluster (nodes, metrics), a DMS task (tables, CDC latency) or an API Gateway stage (routes, metrics, errors).",
         "metrics" => "Any CloudWatch metrics over the last days, summarized per series: points, min, average, max, p95 of the points, total, last value, and the trend between the window's halves.",
         "alarms" => "The environment's CloudWatch alarms that are firing or lack data, with what makes them fire and the resource they watch.",
@@ -626,7 +626,7 @@ fn savings_findings(s: &Server, args: &Value) -> Result<String, String> {
             Some(svc) => services.push(svc),
             None => {
                 return Err(format!(
-                    "unknown service '{}': lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, apigw, aurora, redshift, dms",
+                    "unknown service '{}': lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms",
                     sanitize(asked)
                 ));
             }
@@ -639,40 +639,86 @@ fn savings_findings(s: &Server, args: &Value) -> Result<String, String> {
     let costs = (s.costs)(name);
     price::price_all(&mut outcome.findings, costs.as_ref(), &env.region);
     savings::sort(&mut outcome.findings);
-    let findings: Vec<Value> = outcome
+    findings_answer(name, &env.region, &outcome, costs.as_ref(), &ledger::of_env(name), now_secs())
+}
+
+/// What the findings answer may take, leaving room under [`MAX_TEXT`] for the rest.
+const FINDINGS_BUDGET: usize = 17_000;
+/// Resources named per lever.
+const LEVER_TOP: usize = 8;
+
+fn finding_json(f: &savings::Finding) -> Value {
+    json!({
+        "id": finding_id(f),
+        "service": f.service,
+        "kind": f.kind,
+        "module": f.module,
+        "target": f.target,
+        "resource": f.resource,
+        "summary": f.summary,
+        "recommendation": f.recommendation,
+        "reduction": f.reduction,
+        "impact": f.impact.label(),
+        "evidence": f.evidence,
+        "caveats": f.caveats,
+        "dcliCanApply": f.fix.is_some(),
+        "billed": f.billed,
+        "price": f.price.as_ref().map(|p| json!({
+            "text": p.describe(),
+            "monthly": money(p.monthly),
+            "now": money(p.now),
+            "later": money(p.later),
+            "renewal": p.renewal.map(date),
+            "atMost": p.at_most,
+            "currency": p.currency,
+            "rates": p.rate_lines(),
+            "notes": p.notes,
+        })),
+    })
+}
+
+/// A lever: its findings added up, and the resources that weigh most in it.
+fn lever_json(l: &savings::Lever, findings: &[savings::Finding]) -> Value {
+    let top: Vec<Value> = l
         .findings
         .iter()
-        .map(|f| {
+        .take(LEVER_TOP)
+        .map(|&i| {
+            let f = &findings[i];
             json!({
                 "id": finding_id(f),
-                "service": f.service,
-                "module": f.module,
-                "target": f.target,
                 "resource": f.resource,
-                "summary": f.summary,
-                "recommendation": f.recommendation,
-                "reduction": f.reduction,
-                "impact": f.impact.label(),
-                "evidence": f.evidence,
-                "caveats": f.caveats,
-                "dcliCanApply": f.fix.is_some(),
-                "billed": f.billed,
-                "price": f.price.as_ref().map(|p| json!({
-                    "text": p.describe(),
-                    "monthly": money(p.monthly),
-                    "now": money(p.now),
-                    "later": money(p.later),
-                    "renewal": p.renewal.map(date),
-                    "atMost": p.at_most,
-                    "currency": p.currency,
-                    "rates": p.rate_lines(),
-                    "notes": p.notes,
-                })),
+                "monthly": f.price.as_ref().map(|p| money(p.monthly)),
+                "atMost": f.price.as_ref().is_some_and(|p| p.at_most),
             })
         })
         .collect();
-    let now = now_secs();
-    let ledger: Vec<Value> = ledger::of_env(name)
+    json!({
+        "service": l.service,
+        "kind": if l.kind.is_empty() { "other" } else { l.kind },
+        "findings": l.findings.len(),
+        "monthly": l.total.as_ref().map(|t| money(t.monthly)),
+        "now": l.total.as_ref().map(|t| money(t.now)),
+        "later": l.total.as_ref().map(|t| money((t.monthly - t.now).max(0.0))),
+        "upTo": (l.at_most_count > 0).then(|| json!({ "monthly": money(l.at_most), "findings": l.at_most_count })),
+        "unpriced": l.unpriced,
+        "top": top,
+        "more": l.findings.len().saturating_sub(LEVER_TOP),
+    })
+}
+
+/// The answer of savings_findings: the levers first (each kind of change added up over its
+/// resources), then as many findings as fit, the largest first.
+fn findings_answer(
+    name: &str,
+    region: &str,
+    outcome: &savings::Outcome,
+    costs: Option<&Snapshot>,
+    entries: &[ledger::Entry],
+    now: f64,
+) -> Result<String, String> {
+    let levers = savings::levers(&outcome.findings);
+    let ledger: Vec<Value> = entries
         .iter()
         .map(|e| {
             json!({
@@ -687,21 +733,44 @@ fn savings_findings(s: &Server, args: &Value) -> Result<String, String> {
         })
         .collect();
     let total = price::total(&outcome.findings);
-    aws_data(json!({
+    let mut answer = json!({
         "env": name,
-        "region": env.region,
-        "days": days,
-        "pricedWith": costs.as_ref().map(|c| json!({ "readAt": date(c.read_at), "age": fmt_ago(c.read_at) })),
+        "region": region,
+        "days": outcome.days,
+        "pricedWith": costs.map(|c| json!({ "readAt": date(c.read_at), "age": fmt_ago(c.read_at) })),
         "total": total.map(|t| json!({ "monthly": money(t.monthly), "now": money(t.now), "priced": t.priced, "atMost": t.at_most, "currency": t.currency })),
         "notes": [
+            "`levers` add up the findings of one kind of change (`kind`) over every resource: many small findings (a function each on arm64) can make a large lever. Recommend a lever as one change with the summed quantity.",
             "Each finding's `billed` items are usage the change removes, as the bill names it: the same form estimate_cost and recommend take (a `billed` item with `instead` is a move to that usage type).",
-            "`dcliCanApply`: the user can apply it from dcli's Savings module. Lambda memory against memory used needs Logs Insights, which this server does not run: resource_report kind lambda shows the memory used over 24 h, or the user can run `dcli optimize <env> --lambda-memory`.",
+            "`dcliCanApply`: the user can apply it from dcli's Savings module. Lambda memory against memory used: lambda_memory (Logs Insights, within the user's budget); its findings, and those of analyses the user ran in dcli, come here with kind `memory`.",
             if costs.is_none() { "No dollars: the costs of this environment were never read (dcli costs <env> --refresh)." } else { "Dollars come from the account's own bill." },
         ],
-        "findings": findings,
+        "levers": levers.iter().map(|l| lever_json(l, &outcome.findings)).collect::<Vec<_>>(),
         "notChecked": outcome.errors.iter().map(|(svc, e)| json!({ "service": svc, "error": aws_error(name, e) })).collect::<Vec<_>>(),
         "ledger": ledger,
-    }))
+        "findings": [],
+    });
+    // The findings, the largest first, while they fit.
+    let mut room = FINDINGS_BUDGET.saturating_sub(answer.to_string().len());
+    let mut shown = Vec::new();
+    for f in &outcome.findings {
+        let v = finding_json(f);
+        let size = v.to_string().len() + 1;
+        if size > room {
+            break;
+        }
+        room -= size;
+        shown.push(v);
+    }
+    let omitted = outcome.findings.len() - shown.len();
+    answer["findings"] = Value::Array(shown);
+    if omitted > 0 {
+        answer["omittedFindings"] = json!({
+            "count": omitted,
+            "how": "every lever above counts them; ask for fewer `services` to read the rest in full",
+        });
+    }
+    aws_data(answer)
 }
 
 // ---- reports, metrics, alarms -------------------------------------------------------------------
@@ -1270,6 +1339,60 @@ mod tests {
     fn long_answers_are_cut_with_a_hint() {
         let text = cap("é".repeat(MAX_TEXT), "pass `module`");
         assert!(text.len() < MAX_TEXT + 100 && text.ends_with("pass `module`"));
+    }
+
+    #[test]
+    fn findings_start_with_levers_and_fit() {
+        let costs = Snapshot {
+            read_at: 1_790_000_000.0,
+            usage: vec![
+                crate::costs::UsageCost {
+                    service: "AWS Lambda".into(),
+                    usage_type: "Lambda-GB-Second".into(),
+                    cost: 1162.6,
+                    quantity: 70_100_000.0,
+                    unit: "Lambda-GB-Second".into(),
+                },
+                crate::costs::UsageCost {
+                    service: "AWS Lambda".into(),
+                    usage_type: "Lambda-GB-Second-ARM".into(),
+                    cost: 65.84,
+                    quantity: 4_940_000.0,
+                    unit: "Lambda-GB-Second".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        // 120 functions on x86, each a small finding with long evidence.
+        let mut findings: Vec<savings::Finding> = (0..120)
+            .map(|i| {
+                let name = format!("function-{i:03}");
+                savings::Finding {
+                    service: "Lambda",
+                    ..savings::Finding::new("Lambda", &name, &name, "runs on x86_64", "Move it to arm64", "", savings::Impact::Low)
+                        .kind("arm64")
+                        .billed_instead(billing::LAMBDA_GBS, billing::LAMBDA_GBS_ARM, 500_000.0)
+                        .evidence("x".repeat(300))
+                }
+            })
+            .collect();
+        price::price_all(&mut findings, Some(&costs), "us-east-1");
+        let outcome = savings::Outcome { findings, days: 14, ..Default::default() };
+        let text = findings_answer("prod", "us-east-1", &outcome, Some(&costs), &[], 1_790_000_000.0).unwrap();
+        assert!(text.len() < MAX_TEXT, "{}", text.len());
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert!(keys.iter().position(|k| *k == "levers") < keys.iter().position(|k| *k == "findings"), "{keys:?}");
+        let lever = &v["levers"][0];
+        assert_eq!((lever["kind"].as_str(), lever["findings"].as_u64()), (Some("arm64"), Some(120)));
+        // 120 × 500 k GB-s at the difference of the bill's two rates: about US$ 200 a month.
+        let expected = 120.0 * 500_000.0 * (1162.6 / 70_100_000.0 - 65.84 / 4_940_000.0);
+        assert!((lever["monthly"].as_f64().unwrap() - expected).abs() < 0.01, "{lever}");
+        assert_eq!((lever["top"].as_array().unwrap().len(), lever["more"].as_u64()), (8, Some(112)));
+        let shown = v["findings"].as_array().unwrap().len();
+        assert!(shown > 0 && shown < 120);
+        assert_eq!(v["omittedFindings"]["count"].as_u64(), Some(120 - shown as u64));
+        assert_eq!(v["findings"][0]["kind"], "arm64");
     }
 
     #[test]

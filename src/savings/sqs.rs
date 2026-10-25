@@ -48,6 +48,7 @@ fn finding(q: &Queue, empty: &Series, received: &Series, days: u32) -> Option<Fi
             format!("up to −{} requests a month", qty(monthly)),
             Impact::of(monthly, EMPTY_MEDIUM, EMPTY_HIGH),
         )
+        .kind("long-polling")
         .score(monthly / EMPTY_HIGH)
         .billed(if q.name.ends_with(".fifo") { billing::SQS_FIFO_REQUESTS } else { billing::SQS_REQUESTS }, monthly)
         .evidence(format!("{} empty receives and {} messages received in {days} days", qty(empty), qty(received)))

@@ -148,6 +148,7 @@ fn arm64(f: &FunctionConfiguration, u: &Usage, days: u32) -> Option<Finding> {
         format!("{} GB-s a month on x86_64", qty(gbs)),
         Impact::of(gbs, GBS_MEDIUM, GBS_HIGH),
     )
+    .kind("arm64")
     .score(gbs / GBS_HIGH)
     .billed_instead(billing::LAMBDA_GBS, billing::LAMBDA_GBS_ARM, gbs)
     .evidence(format!("{} invocations in {days} days (≈ {} a month)", qty(u.invocations), qty(monthly)))
@@ -188,6 +189,7 @@ fn timeout(f: &FunctionConfiguration, u: &Usage) -> Option<Finding> {
             format!("a stuck invocation bills up to {suggested} s instead of {timeout_s} s"),
             Impact::Low,
         )
+        .kind("timeout")
         .score(timeout_ms / u.p99_ms / 1000.0)
         .evidence(format!("p99 duration of the slowest day {}, average {}", fmt_ms(u.p99_ms), fmt_ms(u.mean_ms)))
         .evidence(format!("timeout {timeout_s} s"))
@@ -246,6 +248,7 @@ fn provisioned_finding(f: &FunctionConfiguration, qualifier: &str, allocated: i6
             format!("−{} provisioned GB-s a month ({removed} of {allocated})", qty(gbs)),
             Impact::of(gbs, PROVISIONED_MEDIUM, PROVISIONED_HIGH),
         )
+        .kind("provisioned-concurrency")
         .score(gbs / PROVISIONED_HIGH)
         .billed(if on_x86(f) { billing::LAMBDA_PROVISIONED } else { billing::LAMBDA_PROVISIONED_ARM }, gbs)
         .evidence(format!("highest hourly ProvisionedConcurrencyUtilization in {days} days: {}", percent(peak_use)))

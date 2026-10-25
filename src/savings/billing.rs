@@ -19,10 +19,15 @@ pub const LAMBDA_PROVISIONED: &str = "Lambda-Provisioned-Concurrency";
 pub const LAMBDA_PROVISIONED_ARM: &str = "Lambda-Provisioned-Concurrency-ARM";
 /// CloudWatch Logs ingestion (GB).
 pub const LOGS_INGESTED: &str = "DataProcessing-Bytes";
+/// Vended logs ingestion (GB), in tiers: what AWS services write for you, Lambda's logs among
+/// them (see [`crate::savings::logs::vended`]).
+pub const LOGS_VENDED: &str = "VendedLog-Bytes";
 /// CloudWatch Logs storage (GB-Mo).
 pub const LOGS_STORED: &str = "TimedStorage-ByteHrs";
 /// CloudWatch alarms (alarm-months).
 pub const ALARMS: &str = "CW:AlarmMonitorUsage";
+/// CloudWatch custom metrics (metric-months, in tiers).
+pub const METRICS: &str = "CW:MetricMonitorUsage";
 /// SQS requests, standard and FIFO queues (requests).
 pub const SQS_REQUESTS: &str = "Requests-Tier1";
 pub const SQS_FIFO_REQUESTS: &str = "Requests-FIFO-Tier1";
@@ -78,7 +83,7 @@ pub fn dms_standby(class: &str) -> String {
 /// Usage types whose price falls in tiers as usage grows: an average rate prices the last
 /// units a little differently.
 pub fn tiered(usage: &str) -> bool {
-    [LOGS_INGESTED, LOGS_STORED, S3_STANDARD, S3_STANDARD_IA, SQS_REQUESTS, APIGW_REST, APIGW_HTTP].contains(&usage)
+    [LOGS_INGESTED, LOGS_VENDED, LOGS_STORED, METRICS, S3_STANDARD, S3_STANDARD_IA, SQS_REQUESTS, APIGW_REST, APIGW_HTTP].contains(&usage)
 }
 
 /// The prefix Cost Explorer gives a region's usage types (`USW2`), for those dcli knows;

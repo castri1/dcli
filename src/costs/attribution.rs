@@ -78,6 +78,7 @@ const SPLITS: &[(&str, &str, &str, Measure)] = &[
     ("AWS Lambda", billing::LAMBDA_REQUESTS, "invocations, per x86_64 function", lambda_requests),
     ("AWS Lambda", billing::LAMBDA_REQUESTS_ARM, "invocations, per arm64 function", lambda_requests),
     ("AmazonCloudWatch", billing::LOGS_INGESTED, "bytes received, per log group (IncomingBytes)", logs_ingested),
+    ("AmazonCloudWatch", billing::LOGS_VENDED, "bytes received, per Lambda (or vended) log group (IncomingBytes)", logs_ingested),
     ("AmazonCloudWatch", billing::LOGS_STORED, "bytes stored, per log group", logs_stored),
     ("Amazon DynamoDB", billing::DDB_RCU_HOURS, "provisioned read capacity × hours, per table", ddb_capacity),
     ("Amazon DynamoDB", billing::DDB_WCU_HOURS, "provisioned write capacity × hours, per table", ddb_capacity),
@@ -200,8 +201,11 @@ fn lambda_requests(aws: &Aws, usage: &str) -> aws::Result<Vec<Used>> {
     Ok(functions.iter().zip(calls).map(|(f, n)| Used::new("Lambda", &f.function_name, &f.function_name, n)).collect())
 }
 
-fn logs_ingested(aws: &Aws, _usage: &str) -> aws::Result<Vec<Used>> {
-    let groups = savings::logs::all_groups(aws)?;
+/// Vended logs (Lambda's) are split over the groups that receive them, plain ingestion over the
+/// rest.
+fn logs_ingested(aws: &Aws, usage: &str) -> aws::Result<Vec<Used>> {
+    let vended = usage == billing::LOGS_VENDED;
+    let groups: Vec<_> = savings::logs::all_groups(aws)?.into_iter().filter(|g| savings::logs::vended(&g.log_group_name) == vended).collect();
     let queries = groups
         .iter()
         .enumerate()

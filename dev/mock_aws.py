@@ -4950,6 +4950,55 @@ def savings_cost_history(op, body):
 CE_HOOKS.append(savings_cost_history)
 
 
+# ---- CloudWatch ListMetrics and custom metrics on the bill -------------------------------------
+# Lambda Insights on every function (8 metrics, by function and by function and version), an
+# application's embedded metrics with a dimension of many values, and the CloudWatch agent on two
+# hosts; AWS/ namespaces too, which are not billed. The bill shows Lambda's logs as vended logs.
+_LI_NAMES = ["memory_utilization", "cpu_total_time", "init_duration", "rx_bytes", "tx_bytes",
+             "used_memory_max", "total_network", "tmp_used"]
+
+
+def _listed_metrics():
+    out = []
+    for f in FUNCS:
+        n = f["FunctionName"]
+        out += [("AWS/Lambda", m, [("FunctionName", n)]) for m in ("Invocations", "Duration", "Errors")]
+        out += [("LambdaInsights", m, [("function_name", n)]) for m in _LI_NAMES]
+        out += [("LambdaInsights", m, [("function_name", n), ("version", "$LATEST")]) for m in _LI_NAMES]
+    out += [("Orders/App", "OrderCreated", [("Service", "orders"), ("CustomerId", f"c-{i:03d}")]) for i in range(60)]
+    out += [("Orders/App", "PaymentLatency", [("Service", "payments")])]
+    out += [("CWAgent", m, [("InstanceId", h)]) for h in ("i-0a1", "i-0b2") for m in ("mem_used_percent", "disk_used_percent")]
+    return out
+
+
+_LIST_PAGE = 500
+_cw_metrics_before_list = cw_metrics
+
+
+def cw_metrics(action, params):  # noqa: F811
+    if action != "ListMetrics":
+        return _cw_metrics_before_list(action, params)
+    start = int(params.get("NextToken", ["0"])[0] or 0)
+    every = _listed_metrics()
+    page = every[start:start + _LIST_PAGE]
+    members = "".join(
+        f"<member><Namespace>{ns}</Namespace><MetricName>{name}</MetricName><Dimensions>"
+        + "".join(f"<member><Name>{k}</Name><Value>{v}</Value></member>" for k, v in dims)
+        + "</Dimensions></member>"
+        for ns, name, dims in page)
+    token = f"<NextToken>{start + _LIST_PAGE}</NextToken>" if start + _LIST_PAGE < len(every) else ""
+    return 200, (f'<ListMetricsResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/"><ListMetricsResult>'
+                 f"<Metrics>{members}</Metrics>{token}</ListMetricsResult>"
+                 f"<ResponseMetadata><RequestId>mock</RequestId></ResponseMetadata></ListMetricsResponse>")
+
+
+# Daily quantities, as the rest of CE_SERVICES: ≈ 255 GB of Lambda logs a month, and the custom
+# metrics above (metric-months accrue by the day).
+_custom = sum(1 for ns, _, _ in _listed_metrics() if not ns.startswith("AWS/"))
+CE_SERVICES["AmazonCloudWatch"] += [("USE1-VendedLog-Bytes", "GB", 8.5, 0.50),
+                                    ("CW:MetricMonitorUsage", "Metrics", round(_custom / 30, 2), 0.30)]
+
+
 if __name__ == "__main__":
     port = int(sys.argv[1])
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()

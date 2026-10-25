@@ -149,6 +149,7 @@ fn idle(i: &Instance, mine: &[&Replication], now: f64) -> Option<Finding> {
         reduction,
         by_vcpu_hours(vcpu_hours),
     )
+    .kind("dms-idle")
     .score(vcpu_hours)
     .billed(&billing::dms_instance(&i.class), MONTH_HOURS)
     .evidence(format!("{} · {}", dms::class_label(&i.class), if i.multi_az { "Multi-AZ" } else { "single AZ" }));
@@ -190,6 +191,7 @@ fn oversized(i: &Instance, u: &Usage, days: u32) -> Option<Finding> {
         format!("{} vCPU-hours a month ({vcpus} → {new_vcpus} vCPUs, {gib:.0} → {new_gib:.0} GiB)", num(vcpu_hours)),
         by_vcpu_hours(vcpu_hours),
     )
+    .kind("dms-class")
     .score(vcpu_hours)
     .evidence(format!("highest hourly CPU in {days} days: {cpu:.0}% (about {projected_cpu:.0}% on {smaller})"))
     .evidence(format!("least freeable memory: {:.1} GiB of {gib:.0} (about {:.1} GiB in use)", free / gib_bytes, used / gib_bytes))
@@ -222,6 +224,7 @@ fn multi_az(i: &Instance, (env, profile): (&str, &str)) -> Option<Finding> {
             format!("{} standby instance-hours a month of {} ({} vCPU-hours)", num(MONTH_HOURS), i.class, num(vcpu_hours)),
             by_vcpu_hours(vcpu_hours),
         )
+        .kind("dms-multi-az")
         .score(vcpu_hours)
         .billed(&billing::dms_standby(&i.class), MONTH_HOURS)
         .evidence(format!("{name} reads as non-production ({word})"))
