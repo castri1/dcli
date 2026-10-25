@@ -15,7 +15,7 @@ use super::{
 };
 use crate::aws::lambda::{self, FunctionConfiguration};
 use crate::aws::metrics::Series;
-use crate::aws::{self, Aws, AwsError, logs};
+use crate::aws::{self, Aws, logs};
 use crate::tui::chart::fmt_ms;
 use crate::util::now_secs;
 
@@ -53,7 +53,8 @@ pub fn check(scan: &Scan) -> aws::Result<Vec<Finding>> {
         found.extend(timeout(f, &u));
     }
     found.extend(provisioned(scan.aws, &functions, scan.days)?);
-    let kept = fresh_kept(&kept(scan.env), &functions, now_secs());
+    let account = costs_account(scan.env);
+    let kept = fresh_kept(&kept(scan.env, Place::of(scan.aws, account.as_deref())), &functions, now_secs());
     remember(scan.aws, &kept);
     found.extend(kept_findings(&kept));
     Ok(found)
@@ -260,10 +261,25 @@ fn provisioned_finding(f: &FunctionConfiguration, qualifier: &str, allocated: i6
 
 // ---- memory used (Logs Insights) -------------------------------------------------------------
 
-/// Reads the REPORT line of every invocation: the memory each one used and its billed time.
-const MEMORY_QUERY: &str = "filter @type = \"REPORT\"\n\
-| stats count(*) as invocations, max(@memorySize) as memorySize, max(@maxMemoryUsed) as maxUsed, \
-pct(@maxMemoryUsed, 99) as p99Used, avg(@billedDuration) as avgBilledMs by @log";
+/// Reads the report of every invocation: the share of its memory each one used and its billed
+/// time. Text logs have a REPORT line (`@maxMemoryUsed`, `@memorySize`, `@billedDuration`); JSON
+/// logs (LoggingConfig.LogFormat JSON) a `platform.report` event with the same figures in MB
+/// under `record.metrics`. A share of the size each invocation had keeps the units out.
+const MEMORY_QUERY: &str = "filter @type = \"REPORT\" or type = \"platform.report\"\n\
+| fields coalesce(@maxMemoryUsed / @memorySize, record.metrics.maxMemoryUsedMB / record.metrics.memorySizeMB) as usedShare, \
+coalesce(@billedDuration, record.metrics.billedDurationMs) as billedMs\n\
+| stats count(*) as invocations, max(usedShare) as maxShare, pct(usedShare, 99) as p99Share, avg(billedMs) as avgBilledMs by @log";
+
+/// Seconds the window of an analysis ends before now: CloudWatch's IncomingBytes lags, and the
+/// estimate and the query must read the same logs.
+const LAG_SECS: i64 = 600;
+
+/// The window an analysis of `days` days reads, as of `now`: whole hours (CloudWatch rounds a
+/// daily metric's start to the hour), ending a little before now.
+pub fn window(days: u32, now: f64) -> (i64, i64) {
+    let end = (now as i64 - LAG_SECS).div_euclid(3600) * 3600;
+    (end - i64::from(days.max(1)) * 86_400, end)
+}
 
 /// Log groups per Insights query, at most.
 const GROUPS_PER_QUERY: usize = 50;
@@ -283,6 +299,8 @@ pub struct Estimate {
     pub daily: Vec<f64>,
     /// Bytes each function's group received over the window, in the order of `functions`.
     pub per_function: Vec<f64>,
+    /// The window measured, (start, end) in Unix seconds: the analysis reads exactly this.
+    pub window: (i64, i64),
 }
 
 impl Estimate {
@@ -290,13 +308,17 @@ impl Estimate {
     pub fn with_days(&self, days: u32) -> Estimate {
         let days = days.min(self.days).max(1);
         let bytes = self.daily.iter().rev().take(days as usize).sum();
-        Estimate { bytes, days, ..self.clone() }
+        // The daily figures are every group's together: each function gets the same share.
+        let share = if self.bytes > 0.0 { bytes / self.bytes } else { 0.0 };
+        let per_function = self.per_function.iter().map(|b| b * share).collect();
+        let end = self.window.1;
+        Estimate { bytes, days, per_function, window: (end - i64::from(days) * 86_400, end), ..self.clone() }
     }
 
     /// Only the functions named in `names` (in the order given), with what their groups
     /// received; the days measured are scaled to their share.
     pub fn only(&self, names: &[String]) -> Estimate {
-        let mut out = Estimate { shared: self.shared.clone(), days: self.days, ..Default::default() };
+        let mut out = Estimate { shared: self.shared.clone(), days: self.days, window: self.window, ..Default::default() };
         for name in names {
             if let Some(i) = self.functions.iter().position(|f| f.function_name == *name) {
                 out.functions.push(self.functions[i].clone());
@@ -334,7 +356,13 @@ pub fn memory_estimate(aws: &Aws, functions: Option<Vec<FunctionConfiguration>>,
         .collect();
     let mut by_day: std::collections::BTreeMap<i64, f64> = Default::default();
     let mut per_function = Vec::with_capacity(functions.len());
-    for series in metric_data(aws, &queries, days)? {
+    // The window the analysis then reads.
+    let (start, end) = window(days, now_secs());
+    let mut measured = Vec::with_capacity(queries.len());
+    for chunk in queries.chunks(500) {
+        measured.extend(crate::aws::metrics::get_metric_data(aws, chunk, start as f64, end as f64)?);
+    }
+    for series in measured {
         per_function.push(total(&series));
         for (t, bytes) in series.points {
             *by_day.entry(t as i64).or_default() += bytes;
@@ -343,7 +371,8 @@ pub fn memory_estimate(aws: &Aws, functions: Option<Vec<FunctionConfiguration>>,
     per_function.resize(functions.len(), 0.0);
     let daily: Vec<f64> = by_day.into_values().collect();
     let bytes = daily.iter().sum();
-    Ok(Estimate { functions, shared: shared.into_iter().map(|f| f.function_name).collect(), bytes, days, daily, per_function })
+    let shared = shared.into_iter().map(|f| f.function_name).collect();
+    Ok(Estimate { functions, shared, bytes, days, daily, per_function, window: (start, end) })
 }
 
 /// The GB-seconds each of `functions` used over the last `days` days (duration × memory, from
@@ -380,6 +409,10 @@ pub struct MemoryUse {
     pub days: u32,
     /// When it was read (Unix seconds).
     pub at: f64,
+    /// The AWS account and region it was read in (empty when unknown): an environment that now
+    /// points elsewhere does not reuse it.
+    pub account: String,
+    pub region: String,
 }
 
 impl MemoryUse {
@@ -419,52 +452,92 @@ impl MemoryUse {
 pub struct MemoryRun {
     pub uses: Vec<MemoryUse>,
     pub bytes_scanned: f64,
-    /// Functions analysed without any REPORT line in the window.
+    /// Functions analysed without any report in the window.
     pub silent: Vec<String>,
     /// Why the analysis could not be kept for later scans, if it could not.
     pub keep_error: Option<String>,
+    /// Why it stopped before reading every function (the GB allowed reached, a query that
+    /// failed): what it found until then is in `uses`, possibly partly.
+    pub stopped: Option<String>,
 }
 
 /// Runs the memory analysis of an estimate in environment `env`: Insights queries of up to 50
 /// groups, one after the other. `progress` hears how many groups are done. The result is kept
 /// for later scans ([`keep`]).
 pub fn memory_analysis(aws: &Aws, env: &str, estimate: &Estimate, progress: &dyn Fn(usize, usize)) -> aws::Result<MemoryRun> {
-    let end = now_secs() as i64;
-    let start = end - i64::from(estimate.days) * 86_400;
+    memory_analysis_within(aws, env, estimate, None, progress)
+}
+
+/// [`memory_analysis`] that scans at most `budget` bytes: a query is stopped as soon as the
+/// analysis reaches it, and no other starts. An error means nothing was scanned; once a query
+/// has scanned, a failure ends the analysis with what it found ([`MemoryRun::stopped`]) and the
+/// bytes it scanned (a query whose figures never came counts its whole estimate).
+pub fn memory_analysis_within(
+    aws: &Aws,
+    env: &str,
+    estimate: &Estimate,
+    budget: Option<f64>,
+    progress: &dyn Fn(usize, usize),
+) -> aws::Result<MemoryRun> {
+    let (start, end) = if estimate.window.1 > 0 { estimate.window } else { window(estimate.days, now_secs()) };
     let by_group: HashMap<String, &FunctionConfiguration> = estimate.functions.iter().map(|f| (f.log_group(), f)).collect();
     let invocations = invocations(aws, &estimate.functions, estimate.days)?;
+    let (account, region) = (account_of(aws, env), aws.region.clone());
     let groups: Vec<String> = estimate.functions.iter().map(FunctionConfiguration::log_group).collect();
     let mut run = MemoryRun::default();
     let mut seen = HashSet::new();
     for (n, batch) in groups.chunks(GROUPS_PER_QUERY).enumerate() {
+        if budget.is_some_and(|b| run.bytes_scanned >= b * STOP_AT) {
+            run.stopped = Some(format!("stopped at the GB allowed ({} scanned)", size(run.bytes_scanned)));
+            break;
+        }
         progress(n * GROUPS_PER_QUERY, groups.len());
-        let id = logs::start_query(aws, batch, (start, end), MEMORY_QUERY, None, Some(10_000))?;
-        let results = wait(aws, &id)?;
-        run.bytes_scanned += results.statistics.bytes_scanned;
-        for row in &results.results {
+        // What this batch should scan, from the estimate: what a query counts when its own
+        // figures never come.
+        let expected: f64 = batch
+            .iter()
+            .filter_map(|g| estimate.functions.iter().position(|f| f.log_group() == *g))
+            .map(|i| estimate.per_function.get(i).copied().unwrap_or(0.0))
+            .sum::<f64>()
+            * 1.05;
+        let id = match logs::start_query(aws, batch, (start, end), MEMORY_QUERY, None, Some(10_000)) {
+            Ok(id) => id,
+            Err(e) if n == 0 => return Err(e),
+            Err(e) => {
+                run.stopped = Some(format!("a Logs Insights query could not start: {}", e.short()));
+                break;
+            }
+        };
+        let waited = wait_within(aws, &id, run.bytes_scanned, budget, expected);
+        run.bytes_scanned += waited.bytes;
+        for row in waited.results.iter().flat_map(|r| &r.results) {
             let field = |name: &str| row.iter().find(|f| f.field == name).map(|f| f.value.as_str()).unwrap_or_default();
-            let number = |name: &str| field(name).trim().parse::<f64>().unwrap_or(0.0);
+            let number = |name: &str| field(name).trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
             let group = field("@log").split_once(':').map_or(field("@log"), |(_, g)| g);
             let Some(f) = by_group.get(group) else { continue };
             seen.insert(f.function_name.clone());
             let assigned = memory_mb(f);
-            // Insights reports memory in bytes; scaling by the size it reports keeps the
-            // figures in the MB Lambda uses whatever the unit.
-            let reported = number("memorySize");
-            let mb = |v: f64| if reported > 0.0 { v / reported * assigned as f64 } else { v / 1e6 };
+            // Shares of the size each invocation had, in the MB assigned now.
+            let mb = |share: f64| share.min(1.0) * assigned as f64;
             let samples = number("invocations");
             run.uses.push(MemoryUse {
                 function: f.function_name.clone(),
                 arm64: !on_x86(f),
                 memory_mb: assigned,
-                p99_mb: mb(number("p99Used")),
-                max_mb: mb(number("maxUsed")),
+                p99_mb: mb(number("p99Share")),
+                max_mb: mb(number("maxShare")),
                 samples,
                 invocations: invocations.get(&f.function_name).copied().filter(|n| *n > 0.0).unwrap_or(samples),
                 avg_billed_ms: number("avgBilledMs"),
                 days: estimate.days,
                 at: now_secs(),
+                account: account.clone(),
+                region: region.clone(),
             });
+        }
+        if let Some(why) = waited.stopped {
+            run.stopped = Some(why);
+            break;
         }
     }
     progress(groups.len(), groups.len());
@@ -473,6 +546,19 @@ pub fn memory_analysis(aws: &Aws, env: &str, estimate: &Estimate, progress: &dyn
     remember(aws, &run.uses);
     run.keep_error = keep(env, &run.uses).err().map(|e| e.to_string());
     Ok(run)
+}
+
+/// Share of the budget at which a running query is stopped: Insights may scan a little more
+/// before it stops.
+const STOP_AT: f64 = 0.97;
+
+/// The account `env` reads (the costs read for it, else STS); empty when neither says.
+fn account_of(aws: &Aws, env: &str) -> String {
+    crate::costs::cached(env)
+        .map(|c| c.account)
+        .filter(|a| crate::aws::sts::is_account_id(a))
+        .or_else(|| crate::aws::sts::caller_account(aws).ok())
+        .unwrap_or_default()
 }
 
 fn invocations(aws: &Aws, functions: &[FunctionConfiguration], days: u32) -> aws::Result<HashMap<String, f64>> {
@@ -485,20 +571,73 @@ fn invocations(aws: &Aws, functions: &[FunctionConfiguration], days: u32) -> aws
     Ok(functions.iter().zip(&series).map(|(f, s)| (f.function_name.clone(), total(s))).collect())
 }
 
-/// Polls a query until it ends (Insights queries time out after an hour at most).
-fn wait(aws: &Aws, id: &str) -> aws::Result<logs::QueryResults> {
-    for _ in 0..3600 {
-        let results = logs::get_query_results(aws, id)?;
+/// How a query ended: its results (when complete, or partial when it was stopped), the bytes
+/// it scanned, and why it stopped early.
+#[derive(Debug, Default)]
+struct Waited {
+    results: Option<logs::QueryResults>,
+    bytes: f64,
+    stopped: Option<String>,
+}
+
+/// Polls a query until it ends, stopping it once the analysis (`prior` bytes before it) reaches
+/// `budget`, when its results cannot be read, or after an hour: a query is never left running.
+/// A query whose figures never came counts `expected` bytes.
+fn wait_within(aws: &Aws, id: &str, prior: f64, budget: Option<f64>, expected: f64) -> Waited {
+    poll(id, prior, budget, expected, |id| logs::get_query_results(aws, id), |id| logs::stop_query(aws, id).is_ok(), std::thread::sleep)
+}
+
+/// [`wait_within`] with the calls given (tests).
+fn poll(
+    id: &str,
+    prior: f64,
+    budget: Option<f64>,
+    expected: f64,
+    get: impl Fn(&str) -> aws::Result<logs::QueryResults>,
+    stop: impl Fn(&str) -> bool,
+    sleep: impl Fn(Duration),
+) -> Waited {
+    let mut seen: f64 = 0.0;
+    let mut last: Option<logs::QueryResults> = None;
+    for _ in 0..7200 {
+        let results = match get(id) {
+            Ok(r) => r,
+            Err(e) => {
+                stop(id);
+                let bytes = if last.is_some() { seen } else { seen.max(expected) };
+                return Waited { results: last, bytes, stopped: Some(format!("the Logs Insights query could not be read: {}", e.short())) };
+            }
+        };
+        let scanned = results.statistics.bytes_scanned;
+        seen = seen.max(if scanned.is_finite() { scanned } else { 0.0 });
         if !results.running() {
             return match results.status.as_str() {
-                "Complete" => Ok(results),
-                status => Err(AwsError::Network(format!("the Logs Insights query ended {}", status.to_lowercase()))),
+                "Complete" => Waited { results: Some(results), bytes: seen, stopped: None },
+                status => Waited {
+                    stopped: Some(format!("the Logs Insights query ended {}", status.to_lowercase())),
+                    results: Some(results),
+                    bytes: seen,
+                },
             };
         }
-        std::thread::sleep(Duration::from_secs(1));
+        if let Some(b) = budget.filter(|b| prior + seen >= b * STOP_AT) {
+            stop(id);
+            // The figures once stopped: what it scanned in the end, and its partial results.
+            let last_figures = get(id).ok();
+            let bytes = last_figures.as_ref().map_or(seen, |r| seen.max(r.statistics.bytes_scanned));
+            return Waited {
+                results: last_figures.or(Some(results)),
+                bytes,
+                stopped: Some(format!("stopped at the GB allowed ({} of {})", size(prior + bytes), size(b))),
+            };
+        }
+        // Closer to the budget, a closer look.
+        let near = budget.is_some_and(|b| prior + seen >= b * 0.75);
+        last = Some(results);
+        sleep(if near { Duration::from_millis(250) } else { Duration::from_millis(500) });
     }
-    let _ = logs::stop_query(aws, id);
-    Err(AwsError::Network("the Logs Insights query took too long".into()))
+    stop(id);
+    Waited { results: last, bytes: seen.max(expected), stopped: Some("the Logs Insights query took too long".into()) }
 }
 
 /// The finding for a function that could use less memory.
@@ -592,14 +731,24 @@ fn keep_at(path: &std::path::Path, env: &str, uses: &[MemoryUse], now: f64) -> s
     }
     let _one = crate::platform::lock(path)?;
     // A file that exists but cannot be read is left for the user, never written over.
-    let mut all = match std::fs::read_to_string(path) {
+    let file = match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str::<Kept>(&text)
-            .map_err(|e| std::io::Error::other(format!("{} is not valid ({e}): fix or delete it", path.display())))?
-            .uses,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            .map_err(|e| std::io::Error::other(format!("{} is not valid ({e}): fix or delete it", path.display())))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Kept::default(),
         Err(e) => return Err(e),
     };
-    all.retain(|old| !uses.iter().any(|u| u.function == old.function) && now - old.at <= KEPT_AT_MOST_DAYS * 86_400.0);
+    // Another environment's (`Prod` and `prod` share a file where names ignore case), or read
+    // in another account or region than these: not this environment's any more.
+    let mut all = if file.env == env { file.uses } else { Vec::new() };
+    let elsewhere = |old: &MemoryUse| {
+        uses.iter().any(|u| {
+            (!u.account.is_empty() && !old.account.is_empty() && u.account != old.account)
+                || (!u.region.is_empty() && !old.region.is_empty() && u.region != old.region)
+        })
+    };
+    all.retain(|old| {
+        !uses.iter().any(|u| u.function == old.function) && now - old.at <= KEPT_AT_MOST_DAYS * 86_400.0 && !elsewhere(old)
+    });
     all.extend(uses.iter().cloned());
     all.sort_by(|a, b| b.at.total_cmp(&a.at));
     all.truncate(KEPT_MAX);
@@ -608,12 +757,37 @@ fn keep_at(path: &std::path::Path, env: &str, uses: &[MemoryUse], now: f64) -> s
     crate::platform::write_private(path, serde_json::to_string(&kept).unwrap_or_default().as_bytes())
 }
 
-/// The memory analyses kept for `env`, checked: the file could have been edited.
-pub fn kept(env: &str) -> Vec<MemoryUse> {
-    kept_path(env).map(|p| kept_at(&p, env, now_secs())).unwrap_or_default()
+/// Where an environment reads now: its region, and its account when known.
+#[derive(Debug, Clone, Copy)]
+pub struct Place<'a> {
+    pub region: &'a str,
+    pub account: Option<&'a str>,
 }
 
-fn kept_at(path: &std::path::Path, env: &str, now: f64) -> Vec<MemoryUse> {
+impl<'a> Place<'a> {
+    /// `aws`'s region, and the account of the costs read for `env` when they were.
+    pub fn of(aws: &'a Aws, account: Option<&'a str>) -> Place<'a> {
+        Place { region: &aws.region, account }
+    }
+
+    /// Whether an analysis was read here (an unknown account or region does not rule it out).
+    fn holds(&self, u: &MemoryUse) -> bool {
+        (u.region.is_empty() || u.region == self.region) && (u.account.is_empty() || self.account.is_none_or(|a| a == u.account))
+    }
+}
+
+/// The account of the costs read for `env`, if they were.
+pub fn costs_account(env: &str) -> Option<String> {
+    crate::costs::cached(env).map(|c| c.account).filter(|a| crate::aws::sts::is_account_id(a))
+}
+
+/// The memory analyses kept for `env` and read where it reads now, checked: the file could
+/// have been edited.
+pub fn kept(env: &str, place: Place) -> Vec<MemoryUse> {
+    kept_path(env).map(|p| kept_at(&p, env, place, now_secs())).unwrap_or_default()
+}
+
+fn kept_at(path: &std::path::Path, env: &str, place: Place, now: f64) -> Vec<MemoryUse> {
     let Some(file) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Kept>(&t).ok()) else {
         return Vec::new();
     };
@@ -637,6 +811,7 @@ fn kept_at(path: &std::path::Path, env: &str, now: f64) -> Vec<MemoryUse> {
                 && !u.function.is_empty()
                 && u.function.len() <= 170
                 && !u.function.chars().any(crate::util::is_unsafe)
+                && place.holds(u)
         })
         .map(|u| MemoryUse {
             // What Lambda reports never exceeds the memory assigned.
@@ -672,7 +847,8 @@ fn kept_findings(kept: &[MemoryUse]) -> Vec<Finding> {
 /// Makes the analyses kept for `env` known to [`remembered`] (the Lambda module's hints).
 pub fn preload(aws: &Aws, env: &str) {
     let now = now_secs();
-    let fresh: Vec<MemoryUse> = kept(env).into_iter().filter(|u| now - u.at <= KEPT_DAYS * 86_400.0).collect();
+    let account = costs_account(env);
+    let fresh: Vec<MemoryUse> = kept(env, Place::of(aws, account.as_deref())).into_iter().filter(|u| now - u.at <= KEPT_DAYS * 86_400.0).collect();
     let mut map = memory().lock().unwrap();
     for u in fresh {
         // An analysis of this run, newer, stays.
@@ -763,6 +939,7 @@ mod tests {
             avg_billed_ms: 1000.0,
             days: 14,
             at: 0.0,
+            ..Default::default()
         }
     }
 
@@ -785,10 +962,79 @@ mod tests {
 
     #[test]
     fn estimates_shorter_windows_from_the_last_days() {
-        let e = Estimate { bytes: 10.0, days: 4, daily: vec![1.0, 2.0, 3.0, 4.0], ..Default::default() };
-        assert_eq!((e.with_days(2).bytes, e.with_days(2).days), (7.0, 2));
+        let end = 1_793_000_000 / 3600 * 3600;
+        let e = Estimate {
+            bytes: 10.0,
+            days: 4,
+            daily: vec![1.0, 2.0, 3.0, 4.0],
+            per_function: vec![6.0, 4.0],
+            window: (end - 4 * 86_400, end),
+            ..Default::default()
+        };
+        let two = e.with_days(2);
+        assert_eq!((two.bytes, two.days), (7.0, 2));
+        // The window the analysis reads is the one measured, and each function scales with it.
+        assert_eq!(two.window, (end - 2 * 86_400, end));
+        assert!((two.per_function[0] - 4.2).abs() < 1e-9 && (two.per_function[1] - 2.8).abs() < 1e-9, "{:?}", two.per_function);
         assert_eq!((e.with_days(14).bytes, e.with_days(14).days), (10.0, 4));
         assert_eq!(e.with_days(1).describe(), "0 functions · ≈ 0 MB of logs over 1 day");
+    }
+
+    #[test]
+    fn windows_end_on_a_whole_hour_before_now() {
+        let now = 1_793_001_234.0;
+        let (start, end) = window(7, now);
+        assert_eq!(end % 3600, 0);
+        assert!(f64::from(end as i32) <= now - LAG_SECS as f64 && now - end as f64 <= 3600.0 + LAG_SECS as f64);
+        assert_eq!(end - start, 7 * 86_400);
+        // Text REPORT lines and JSON platform.report events are both read.
+        assert!(MEMORY_QUERY.contains("@type = \"REPORT\"") && MEMORY_QUERY.contains("type = \"platform.report\""));
+        assert!(MEMORY_QUERY.contains("record.metrics.maxMemoryUsedMB"));
+    }
+
+    fn results(status: &str, bytes: f64) -> logs::QueryResults {
+        logs::QueryResults { status: status.into(), statistics: logs::QueryStatistics { bytes_scanned: bytes, ..Default::default() }, ..Default::default() }
+    }
+
+    /// Polls a query whose figures come from `seq` (one per call), counting the stops.
+    fn polled(seq: Vec<aws::Result<logs::QueryResults>>, prior: f64, budget: Option<f64>, expected: f64) -> (Waited, usize) {
+        let seq = std::cell::RefCell::new(seq.into_iter());
+        let stops = std::cell::Cell::new(0);
+        let waited = poll(
+            "q",
+            prior,
+            budget,
+            expected,
+            |_| seq.borrow_mut().next().unwrap_or_else(|| Ok(results("Cancelled", 0.0))),
+            |_| {
+                stops.set(stops.get() + 1);
+                true
+            },
+            |_| {},
+        );
+        (waited, stops.get())
+    }
+
+    #[test]
+    fn queries_stop_at_the_budget_and_on_errors() {
+        // Complete within the budget: what it scanned, not stopped.
+        let (w, stops) = polled(vec![Ok(results("Running", 10.0)), Ok(results("Complete", 50.0))], 0.0, Some(100.0), 60.0);
+        assert_eq!((w.bytes, stops, w.stopped.is_none()), (50.0, 0, true));
+        // Reaching the budget (with what earlier queries scanned) stops it, and its last figures count.
+        let (w, stops) =
+            polled(vec![Ok(results("Running", 30.0)), Ok(results("Running", 70.0)), Ok(results("Cancelled", 72.0))], 30.0, Some(100.0), 60.0);
+        assert_eq!((w.bytes, stops), (72.0, 1));
+        assert!(w.stopped.unwrap().contains("GB allowed"));
+        // Figures that cannot be read: stopped, and the estimate counts when none came.
+        let (w, stops) = polled(vec![Err(aws::AwsError::Network("timeout".into()))], 0.0, Some(100.0), 60.0);
+        assert_eq!((w.bytes, stops), (60.0, 1));
+        assert!(w.stopped.unwrap().contains("could not be read"));
+        let (w, _) = polled(vec![Ok(results("Running", 20.0)), Err(aws::AwsError::Network("x".into()))], 0.0, None, 60.0);
+        assert_eq!(w.bytes, 20.0, "what it had scanned when last seen");
+        // A query that failed on its own says so.
+        let (w, stops) = polled(vec![Ok(results("Failed", 5.0))], 0.0, Some(100.0), 60.0);
+        assert_eq!((w.bytes, stops), (5.0, 0));
+        assert!(w.stopped.unwrap().contains("ended failed"));
     }
 
     #[test]
@@ -808,14 +1054,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("lambda-memory-prod.json");
         let now = 1_793_000_000.0;
-        let a = MemoryUse { function: "a".into(), at: now - 86_400.0, ..used(3008, 410.0, 420.0) };
-        let b = MemoryUse { function: "b".into(), at: now - 86_400.0, ..used(1024, 200.0, 220.0) };
+        let here = Place { region: "us-east-1", account: Some("111111111111") };
+        let at = |u: MemoryUse| MemoryUse { account: "111111111111".into(), region: "us-east-1".into(), ..u };
+        let a = at(MemoryUse { function: "a".into(), at: now - 86_400.0, ..used(3008, 410.0, 420.0) });
+        let b = at(MemoryUse { function: "b".into(), at: now - 86_400.0, ..used(1024, 200.0, 220.0) });
         keep_at(&path, "prod", &[a.clone(), b.clone()], now).unwrap();
         // A later analysis of `a` replaces it; `b` stays.
         let a2 = MemoryUse { p99_mb: 500.0, at: now, ..a.clone() };
         keep_at(&path, "prod", std::slice::from_ref(&a2), now).unwrap();
-        assert_eq!(kept_at(&path, "prod", now), [a2.clone(), b.clone()]);
-        assert!(kept_at(&path, "dev", now).is_empty(), "another environment's file is not read");
+        assert_eq!(kept_at(&path, "prod", here, now), [a2.clone(), b.clone()]);
+        assert!(kept_at(&path, "dev", here, now).is_empty(), "another environment's file is not read");
+        // Read in another account or region: not this environment's any more.
+        assert!(kept_at(&path, "prod", Place { region: "us-east-1", account: Some("222222222222") }, now).is_empty());
+        assert!(kept_at(&path, "prod", Place { region: "eu-west-1", account: None }, now).is_empty());
+        assert_eq!(kept_at(&path, "prod", Place { region: "us-east-1", account: None }, now).len(), 2, "an unknown account rules nothing out");
+        // `Prod` and `prod` share a file where names ignore case: one's analyses never become the other's.
+        keep_at(&path, "Prod", &[at(MemoryUse { function: "c".into(), at: now, ..used(1024, 200.0, 220.0) })], now).unwrap();
+        assert!(kept_at(&path, "prod", here, now).is_empty());
+        assert_eq!(kept_at(&path, "Prod", here, now).iter().map(|u| u.function.as_str()).collect::<Vec<_>>(), ["c"]);
+        // The environment now reads another account: what was read before goes.
+        keep_at(&path, "Prod", &[at(a.clone())], now).unwrap();
+        let moved = MemoryUse { account: "222222222222".into(), ..a.clone() };
+        keep_at(&path, "Prod", &[MemoryUse { function: "d".into(), ..moved }], now).unwrap();
+        assert_eq!(kept_at(&path, "Prod", Place { region: "us-east-1", account: None }, now).len(), 1);
+        keep_at(&path, "prod", &[a2.clone(), b.clone()], now).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -830,7 +1092,7 @@ mod tests {
             { "function": "g", "memoryMb": 1024, "days": 7, "at": now + 9e9 },
         ]});
         std::fs::write(&path, edited.to_string()).unwrap();
-        let read = kept_at(&path, "prod", now);
+        let read = kept_at(&path, "prod", here, now);
         assert_eq!(read.iter().map(|u| u.function.as_str()).collect::<Vec<_>>(), ["c"]);
         assert_eq!((read[0].p99_mb, read[0].max_mb), (1024.0, 1024.0));
         // A file that cannot be read is never written over.

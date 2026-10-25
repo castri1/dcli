@@ -62,6 +62,9 @@ pub fn list() -> Vec<Value> {
     TOOLS
         .iter()
         .map(|&(name, title, reads_aws, _)| {
+            // lambda_memory only reads, but every run is billed: clients that let read-only
+            // tools run unasked still ask for it.
+            let billed = name == "lambda_memory";
             let writes = matches!(name, "recommend" | "withdraw_recommendation");
             json!({
                 "name": name,
@@ -70,9 +73,9 @@ pub fn list() -> Vec<Value> {
                 "inputSchema": schema(name),
                 "annotations": {
                     "title": title,
-                    "readOnlyHint": !writes,
+                    "readOnlyHint": !writes && !billed,
                     "destructiveHint": false,
-                    "idempotentHint": name != "recommend",
+                    "idempotentHint": name != "recommend" && !billed,
                     "openWorldHint": reads_aws,
                 },
             })

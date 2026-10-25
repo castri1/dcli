@@ -812,7 +812,15 @@ PAYMENTS_LINES = [
     "END RequestId: {uuid}",
     "REPORT RequestId: {uuid}\tDuration: 3012.88 ms\tBilled Duration: 3013 ms\tMemory Size: 512 MB\tMax Memory Used: 101 MB\tInit Duration: 233.10 ms",
 ]
-LINES_BY_GROUP = {"/aws/lambda/orders-sync": ORDERS_SYNC_LINES, "/aws/lambda/payments-webhook": PAYMENTS_LINES}
+# users-auth logs in JSON (LoggingConfig.LogFormat JSON): its reports are platform.report events.
+USERS_AUTH_JSON_LINES = [
+    '{{"time":"2026-10-21T10:00:00.000Z","type":"platform.start","record":{{"requestId":"{uuid}","version":"$LATEST"}}}}',
+    '{{"timestamp":"2026-10-21T10:00:00.010Z","level":"INFO","requestId":"{uuid}","message":"user {n} signed in"}}',
+    '{{"time":"2026-10-21T10:00:00.050Z","type":"platform.report","record":{{"requestId":"{uuid}","metrics":{{"durationMs":45.2,'
+    '"billedDurationMs":46,"memorySizeMB":{mem},"maxMemoryUsedMB":{used}}},"status":"success"}}}}',
+]
+LINES_BY_GROUP = {"/aws/lambda/orders-sync": ORDERS_SYNC_LINES, "/aws/lambda/payments-webhook": PAYMENTS_LINES,
+                  "/aws/lambda/users-auth": USERS_AUTH_JSON_LINES}
 
 
 def synthetic_events(group, start_ms, pattern):
@@ -871,6 +879,26 @@ def insights_record(group, e):
             value = re.search(label + r": ([\d.]+)", message)
             if value:
                 record[field] = value[1]
+        # Insights gives the memory in bytes (MB × 1,000,000).
+        for field in ("@memorySize", "@maxMemoryUsed"):
+            if field in record:
+                record[field] = str(float(record[field]) * 1_000_000)
+    elif message.startswith("{"):
+        try:
+            doc = json.loads(message)
+        except ValueError:
+            doc = {}
+        if doc.get("type") == "platform.report":
+            record["type"] = "platform.report"
+            for k, v in doc.get("record", {}).get("metrics", {}).items():
+                record[f"record.metrics.{k}"] = str(v)
+    # What the memory query's `fields coalesce(...)` computes, for either format.
+    if "@maxMemoryUsed" in record and "@memorySize" in record:
+        record["usedShare"] = str(float(record["@maxMemoryUsed"]) / float(record["@memorySize"]))
+        record["billedMs"] = record.get("@billedDuration", "0")
+    elif "record.metrics.maxMemoryUsedMB" in record:
+        record["usedShare"] = str(float(record["record.metrics.maxMemoryUsedMB"]) / float(record["record.metrics.memorySizeMB"]))
+        record["billedMs"] = record.get("record.metrics.billedDurationMs", "0")
     return record
 
 
@@ -886,7 +914,8 @@ def insights_run(q):
     for pattern in re.findall(r"filter\s+@message\s+like\s+/([^/]*)/", query):
         records = [r for r in records if re.search(pattern, r[2]["@message"], re.I)]
     if re.search(r'filter\s+@type\s*=\s*"REPORT"', query):
-        records = [r for r in records if r[2].get("@type") == "REPORT"]
+        json_too = "platform.report" in query
+        records = [r for r in records if r[2].get("@type") == "REPORT" or (json_too and r[2].get("type") == "platform.report")]
     by_log = re.search(r"stats\s+(.+?)\s+by\s+@log", query, re.S)
     if by_log:
         groups = {}
@@ -895,7 +924,7 @@ def insights_run(q):
         rows = []
         for g, recs in sorted(groups.items()):
             row = [{"field": "@log", "value": f"123456789012:{g}"}]
-            for fn, field, arg, alias in re.findall(r"(count|max|min|avg|sum|pct)\((\*|@\w+)(?:,\s*(\d+))?\)\s+as\s+(\w+)", by_log[1]):
+            for fn, field, arg, alias in re.findall(r"(count|max|min|avg|sum|pct)\((\*|@?[\w.]+)(?:,\s*(\d+))?\)\s+as\s+(\w+)", by_log[1]):
                 values = sorted(float(r[field]) for r in recs if field in r) if field != "*" else []
                 if fn == "count":
                     v = len(recs)
@@ -1131,6 +1160,9 @@ FUNCS = [{"FunctionName": n, "FunctionArn": f"arn:aws:lambda:us-east-1:123456789
 
 
 FUNCS[0]["DeadLetterConfig"] = {"TargetArn": "arn:aws:sqs:us-east-1:123456789012:payments-dlq"}
+# Their logs are text but for users-auth's, which are JSON (see USERS_AUTH_JSON_LINES).
+for _f in FUNCS:
+    _f["LoggingConfig"]["LogFormat"] = "JSON" if _f["FunctionName"] == "users-auth" else "Text"
 # x86 functions (arm64 candidates for the Savings checks) and the memory each one uses (MB).
 for _f in FUNCS:
     if _f["FunctionName"] in ("report-builder", "orders-sync", "cron-cleanup"):

@@ -27,7 +27,8 @@ what the user dismissed, and withdraw what is no longer true.
 across many resources (arm64, log retention, a log level), write one recommendation for the lever with a single change \
 carrying the summed quantity, not one per resource. There is no limit on how many recommendations to write.
 - Lambda memory against memory used comes from `lambda_memory` (Logs Insights, billed by the data it scans, within a \
-budget the user set): call it with `estimateOnly` first and tell the user the GB and what they cost before running it.
+budget the user set): call it with `estimateOnly` first, tell the user the GB and what they cost, and run it only once the \
+user agrees (unless they already said to go ahead within a budget that covers it).
 - Write recommendations in the user's language.";
 
 /// The prompts offered.
@@ -93,8 +94,8 @@ the log groups kept forever…). A lever of many small findings is often worth m
 5. `cost_by_resource` for the most expensive usage types: which functions, tables, log groups, clusters… cost most.
 6. For the resources that cost most or perform worst: `inventory`, `resource_report` (configuration, metrics, problems \
 in the logs), `metrics` for the evidence you need, and `alarms`. For Lambda memory against memory used, \
-`lambda_memory`: always with `estimateOnly` first; tell me the GB it would scan and what that costs, then run it within \
-the budget (it refuses when I did not allow Logs Insights).
+`lambda_memory`: always with `estimateOnly` first; tell me the GB it would scan and what that costs, and run it only once I \
+agree (unless I already told you to go ahead within a budget that covers it; it refuses when I did not allow Logs Insights).
 7. Services dcli does not explore can still be reasoned about: their usage types in `costs` say what is billed (tokens \
 by model, NAT gateway hours and bytes, traces recorded…), and `metrics` reads any CloudWatch metric (AWS/Bedrock by \
 ModelId, AWS/NATGateway, AWS/XRay…). AWS Support plans are billed as a share of the bill, so every saving lowers \
@@ -135,7 +136,9 @@ mod tests {
         assert!(text.contains("no limit on how many to write") && text.contains("`levers`"));
         assert!(text.contains("write ONE recommendation for the lever"));
         assert!(text.contains("2 % of the bill") && text.contains("to investigate"));
-        assert!(text.contains("`lambda_memory`") && text.contains("`estimateOnly` first"));
+        assert!(text.contains("`lambda_memory`") && text.contains("`estimateOnly` first") && text.contains("only once I \
+agree"));
+        assert!(INSTRUCTIONS.contains("only once the user agrees"));
         assert!(text.contains("Support plans"));
         assert!(!text.contains("at most 5"));
         assert!(INSTRUCTIONS.contains("lever by lever") && INSTRUCTIONS.contains("`lambda_memory`"));
