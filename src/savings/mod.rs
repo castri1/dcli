@@ -13,10 +13,12 @@
 pub mod alarms;
 pub mod apigateway;
 pub mod aurora;
+pub mod bedrock;
 pub mod billing;
 pub mod custom_metrics;
 pub mod dms;
 pub mod dynamodb;
+pub mod ec2;
 pub mod lambda;
 pub mod logs;
 pub mod price;
@@ -25,6 +27,7 @@ pub mod s3;
 pub mod secrets;
 pub mod sfn;
 pub mod sqs;
+pub mod xray;
 
 use std::fmt::Write as _;
 
@@ -278,6 +281,9 @@ pub const CHECKS: &[(&str, Check)] = &[
     ("Aurora", aurora::check),
     ("Redshift", redshift::check),
     ("DMS", dms::check),
+    ("EC2", ec2::check),
+    ("X-Ray", xray::check),
+    ("Bedrock", bedrock::check),
 ];
 
 /// The service of [`CHECKS`] a command-line name stands for: `lambda`, `logs`, `sqs`,
@@ -293,6 +299,8 @@ pub fn find_service(name: &str) -> Option<&'static str> {
         "alarms" | "cloudwatchalarms" => "CloudWatch alarms",
         "metrics" | "custommetrics" | "cloudwatchmetrics" => "CloudWatch metrics",
         "apigw" | "apigateway" | "api" => "API Gateway",
+        "ec2" | "nat" | "ebs" | "vpc" | "ipv4" | "eip" => "EC2",
+        "xray" => "X-Ray",
         _ => "",
     };
     if !alias.is_empty() {
@@ -700,7 +708,11 @@ mod tests {
         assert_eq!(find_service("aur"), Some("Aurora"));
         assert_eq!(find_service("s3"), Some("S3"));
         assert_eq!(find_service("metrics"), Some("CloudWatch metrics"));
-        assert_eq!(find_service("ec2"), None);
+        assert_eq!(find_service("ec2"), Some("EC2"));
+        assert_eq!(find_service("nat"), Some("EC2"));
+        assert_eq!(find_service("xray"), Some("X-Ray"));
+        assert_eq!(find_service("bedrock"), Some("Bedrock"));
+        assert_eq!(find_service("ecs"), None);
         assert_eq!(find_service(""), None);
     }
 

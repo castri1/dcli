@@ -277,7 +277,7 @@ fn schema(name: &str) -> Value {
         })),
         "savings_findings" => object(&["env"], json!({
             "env": env_prop(),
-            "services": { "type": "array", "items": { "type": "string" }, "description": "Only these: lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms (default: all)" },
+            "services": { "type": "array", "items": { "type": "string" }, "description": "Only these: lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms, ec2, xray, bedrock (default: all)" },
             "days": { "type": "integer", "minimum": 1, "maximum": 90, "description": "Days of usage looked at (default 14)" }
         })),
         "resource_report" => object(&["env", "kind", "name"], json!({
@@ -626,7 +626,7 @@ fn savings_findings(s: &Server, args: &Value) -> Result<String, String> {
             Some(svc) => services.push(svc),
             None => {
                 return Err(format!(
-                    "unknown service '{}': lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms",
+                    "unknown service '{}': lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms, ec2, xray, bedrock",
                     sanitize(asked)
                 ));
             }

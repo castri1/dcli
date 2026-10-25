@@ -25,7 +25,7 @@ use crate::util::{ellipsize, fmt_ago, fmt_utc, now_secs, rfc3339, sanitize};
 pub struct Args {
     /// Environment (default: the current one, see `use`)
     env: Option<String>,
-    /// Only these services: lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms
+    /// Only these services: lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms, ec2, xray, bedrock
     #[arg(long, value_delimiter = ',', value_name = "SERVICES")]
     service: Vec<String>,
     /// Days of usage to look at
@@ -66,7 +66,7 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
             find_service(s).ok_or_else(|| {
-                anyhow!("unknown service '{}': use lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift or dms", sanitize(s))
+                anyhow!("unknown service '{}': use lambda, logs, sqs, dynamodb, s3, sfn, secrets, alarms, metrics, apigw, aurora, redshift, dms, ec2, xray or bedrock", sanitize(s))
             })
         })
         .collect::<Result<Vec<_>>>()?;

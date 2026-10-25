@@ -7,6 +7,7 @@
 pub mod alarms;
 pub mod apigateway;
 pub mod appconfig;
+pub mod bedrock;
 pub mod ce;
 pub mod cloudformation;
 pub mod cloudwatch;
@@ -15,6 +16,7 @@ pub mod codepipeline;
 pub mod credentials;
 pub mod dms;
 pub mod dynamodb;
+pub mod ec2;
 pub mod error;
 pub mod events;
 pub mod http;
@@ -36,6 +38,7 @@ pub mod ssm;
 pub mod sso;
 pub mod sts;
 pub mod xml;
+pub mod xray;
 
 use std::sync::Arc;
 use std::time::Duration;
