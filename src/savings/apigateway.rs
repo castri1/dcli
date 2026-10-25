@@ -190,6 +190,7 @@ fn http_candidate(
         format!("{} requests a month billed at the REST API rate", qty(monthly)),
         requests_impact(monthly),
     )
+    .kind("apigw-http")
     .billed_instead(billing::APIGW_REST, billing::APIGW_HTTP, monthly)
     .evidence(format!(
         "{} requests in the last {} days on stage{} {}",
@@ -261,6 +262,7 @@ fn caches(scan: &Scan, api: &Api, detail: &ApiDetail, usage: &HashMap<(String, S
                 format!("a {size} GB cache running all month (about 730 cache-hours)"),
                 cache_impact(gb, wasted),
             )
+            .kind("apigw-cache")
             .billed(&billing::apigw_cache(size), 730.0)
             .evidence(format!(
                 "Last {} days: {} requests, {} cache hits, {} misses · cache status {}",

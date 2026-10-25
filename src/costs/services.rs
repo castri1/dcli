@@ -32,10 +32,10 @@ pub fn check(ce_service: &str) -> Option<&'static str> {
     SERVICES.iter().find(|(ce, _, _)| *ce == ce_service).and_then(|(_, _, c)| *c)
 }
 
-/// Cost Explorer's name for the service a Savings check looks at (CloudWatch alarms and logs
-/// are both `AmazonCloudWatch`).
+/// Cost Explorer's name for the service a Savings check looks at (CloudWatch alarms, custom
+/// metrics and logs are all `AmazonCloudWatch`).
 pub fn of_check(check: &str) -> Option<&'static str> {
-    if check == "CloudWatch alarms" {
+    if check == "CloudWatch alarms" || check == "CloudWatch metrics" {
         return Some("AmazonCloudWatch");
     }
     SERVICES.iter().find(|(_, _, c)| *c == Some(check)).map(|(ce, _, _)| *ce)

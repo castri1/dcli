@@ -109,6 +109,7 @@ fn express_candidate(m: &StateMachine, r: &Runs, definition: &str, days: u32) ->
             format!("≈ {} state transitions a month billed in Standard", qty(transitions)),
             Impact::of(transitions, TRANSITIONS_MEDIUM, TRANSITIONS_HIGH),
         )
+        .kind("sfn-express")
         .score(transitions / TRANSITIONS_HIGH)
         .billed_at_most(billing::SFN_TRANSITIONS, transitions)
         .evidence(format!("{} executions started in {days} days (ExecutionsStarted)", qty(r.executions)))

@@ -139,6 +139,7 @@ fn findings(name: &str, region: &str, config: &Config, classes: &[(&'static str,
             format!("{} in STANDARD with nothing aging it", size(standard)),
             Impact::of(standard, STANDARD_MEDIUM, STANDARD_HIGH),
         )
+        .kind("s3-lifecycle")
         .score(standard / STANDARD_HIGH)
         // As if it all moved to Standard-IA: lifecycle rules move what ages, so at most that.
         .billed_instead(billing::S3_STANDARD, billing::S3_STANDARD_IA, standard / GB)
@@ -163,6 +164,7 @@ fn findings(name: &str, region: &str, config: &Config, classes: &[(&'static str,
                 format!("the parts of {count} uploads, stored but in no listing"),
                 if stale >= STALE_MEDIUM { Impact::Medium } else { Impact::Low },
             )
+            .kind("s3-multipart")
             .score(stale as f64 / 1000.0)
             .evidence(format!("ListMultipartUploads: {count} started more than {STALE_UPLOAD_DAYS} days ago"))
             .evidence(rules.clone())
@@ -179,6 +181,7 @@ fn findings(name: &str, region: &str, config: &Config, classes: &[(&'static str,
             format!("the noncurrent versions within {} stored", size(all)),
             if all >= STANDARD_MEDIUM { Impact::Medium } else { Impact::Low },
         )
+        .kind("s3-versions")
         .score(all / STANDARD_HIGH)
         .evidence(format!("versioning Enabled · {rules}"))
         .caveat("CloudWatch does not split current from noncurrent bytes: S3 Storage Lens or an inventory tells how much is old versions.");
