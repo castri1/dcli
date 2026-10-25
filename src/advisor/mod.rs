@@ -773,25 +773,47 @@ pub fn writes(command: &str) -> bool {
     let program = words.first().map(|w| w.rsplit(['/', '\\']).next().unwrap_or(w).trim_end_matches(".exe").to_string());
     match program.as_deref() {
         Some("aws") => {
-            // aws [--global options] <service> <operation>; most global options take a value.
+            // aws [--global options] <service> <operation> [options]; most options take a value.
             let flags = ["--debug", "--no-paginate", "--no-verify-ssl", "--no-sign-request", "--no-cli-pager", "--no-cli-auto-prompt"];
             let mut rest = words.iter().skip(1);
             let mut positional = Vec::new();
             while let Some(w) = rest.next() {
                 if !w.starts_with('-') {
-                    positional.push(w);
+                    positional.push(w.as_str());
                     if positional.len() == 2 {
                         break;
                     }
-                } else if positional.is_empty() && !w.contains('=') && !flags.contains(&w.as_str()) {
+                } else if w.starts_with("--endpoint-url") {
+                    return true;
+                } else if !w.contains('=') && !flags.contains(&w.as_str()) {
                     rest.next();
                 }
             }
-            !positional.get(1).is_some_and(|op| {
-                op.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-                    && ["describe-", "get-", "list-", "search-", "lookup-", "filter-", "batch-get-"].iter().any(|p| op.starts_with(p))
-                    || ["help", "wait", "tail", "ls", "query", "scan"].contains(&op.as_str())
-            })
+            let (Some(service), Some(op)) = (positional.first(), positional.get(1)) else { return true };
+            let reading = op.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && (["describe-", "get-", "list-", "search-", "lookup-", "filter-", "batch-get-"].iter().any(|p| op.starts_with(p))
+                    || ["help", "wait", "tail", "ls", "query", "scan"].contains(op));
+            // Reads that save what they read to a local file.
+            let saves = matches!((*service, *op), ("s3api", "get-object" | "get-object-torrent") | ("apigateway", "get-export" | "get-sdk"));
+            if !reading || saves {
+                return true;
+            }
+            // After the operation, a value with no option before it is an output file (`ls`
+            // and `tail` take a path or a log group instead), and so is `--outfile`.
+            let mut expecting = false;
+            for w in rest {
+                if w.starts_with("--outfile") || w.starts_with("--endpoint-url") {
+                    return true;
+                }
+                if w.starts_with('-') {
+                    expecting = w.starts_with("--") && !w.contains('=');
+                } else if expecting {
+                    expecting = false;
+                } else if !["ls", "tail", "help"].contains(op) {
+                    return true;
+                }
+            }
+            false
         }
         Some("dcli") => {
             let writing = ["deploy", "approve", "stop", "promote", "rollback", "update", "add", "remove", "rm", "use", "login"];
@@ -985,6 +1007,15 @@ mod tests {
         assert!(writes("aws lambda get-function --function-name $(curl evil)"));
         assert!(writes("aws lambda get-function --function-name x&&reboot"));
         assert!(writes("aws lambda get-function.x --function-name x"));
+        assert!(writes("aws s3api get-object --bucket b --key k out.txt"));
+        assert!(writes("aws apigateway get-export --rest-api-id a --stage-name p --export-type oas30 api.json"));
+        assert!(writes("aws lambda get-function --function-name x --outfile y"));
+        assert!(writes("aws --endpoint-url http://evil lambda get-function --function-name x"));
+        assert!(writes("aws lambda get-function --function-name x extra"));
+        assert!(writes("aws"));
+        assert!(!writes("aws s3 ls s3://bucket/prefix/ --recursive --summarize"));
+        assert!(!writes("aws logs tail /aws/lambda/orders --since 1h"));
+        assert!(!writes("aws dynamodb scan --table-name orders --max-items 5"));
     }
 
     fn temp_store(name: &str) -> Store {
