@@ -160,6 +160,31 @@ impl Snapshot {
         self.coverage.iter().filter(|c| c.service == service).map(|c| c.covered).sum::<f64>().min(1.0)
     }
 
+    /// What `service`'s usage outside its commitments costs a month: removing usage takes that
+    /// off first, since commitments go on covering what is left. `None` when no commitment
+    /// covers the service, or the reading does not say.
+    pub fn on_demand_monthly(&self, service: &str) -> Option<f64> {
+        let entries: Vec<&Coverage> = self.coverage.iter().filter(|c| c.service == service && c.covered > 0.0).collect();
+        // Savings Plans and reservations each say what runs outside them: outside both is at
+        // most the smaller.
+        let outside = entries.iter().map(|c| c.on_demand_cost).fold(f64::INFINITY, f64::min);
+        let known = outside.is_finite() && outside >= 0.0 && !(outside == 0.0 && self.covered(service) < 0.999);
+        known.then(|| outside * 30.4375 / 30.0)
+    }
+
+    /// How much of a saving of `monthly` on `service`'s usage that commitments can cover shows
+    /// on the bill right away: up to what runs outside the commitments (or, when the reading
+    /// does not say, the share they leave uncovered). The rest is saved when they renew.
+    pub fn saved_now(&self, service: &str, monthly: f64) -> f64 {
+        if monthly <= 0.0 {
+            return monthly;
+        }
+        match self.on_demand_monthly(service) {
+            Some(outside) => monthly.min(outside),
+            None => monthly * (1.0 - self.covered(service).clamp(0.0, 1.0)),
+        }
+    }
+
     /// When the first commitment that can cover `service` ends.
     pub fn renewal(&self, service: &str) -> Option<f64> {
         self.commitments.iter().filter(|c| c.services.iter().any(|s| s == service)).filter_map(|c| c.end).reduce(f64::min)

@@ -99,11 +99,18 @@ pub fn price(f: &Finding, s: &Snapshot, region: &str) -> Option<Price> {
             continue;
         }
         at_most |= b.at_most;
-        let now = if coverable(&b.usage) { monthly * (1.0 - covered) } else { monthly };
-        items.push(Item { usage: b.usage.clone(), monthly, now, rate: r, unit, instead });
+        items.push(Item { usage: b.usage.clone(), monthly, now: monthly, rate: r, unit, instead });
     }
     if items.is_empty() {
         return None;
+    }
+    // What commitments can cover comes off the usage outside them first.
+    let coverable_monthly: f64 = items.iter().filter(|i| coverable(&i.usage)).map(|i| i.monthly).sum();
+    if coverable_monthly > 0.0 {
+        let share = s.saved_now(service, coverable_monthly) / coverable_monthly;
+        for i in items.iter_mut().filter(|i| coverable(&i.usage)) {
+            i.now = i.monthly * share;
+        }
     }
     let monthly: f64 = items.iter().map(|i| i.monthly).sum();
     let now: f64 = items.iter().map(|i| i.now).sum();
@@ -118,10 +125,7 @@ pub fn price(f: &Finding, s: &Snapshot, region: &str) -> Option<Price> {
         notes.push("What this usage costs now: the change removes part of it, so it saves at most this.".into());
     }
     if later > 0.0 {
-        notes.push(format!(
-            "{} of {service}'s usage is covered by Savings Plans or reservations: that share is already paid for and saves when they renew, or covers other usage meanwhile.",
-            super::percent(covered)
-        ));
+        notes.push(commitment_note(s, service, covered));
     }
     if !missing.is_empty() {
         notes.push(format!("No cost on this bill for {}: that part is not priced.", missing.join(", ")));
@@ -136,6 +140,21 @@ pub fn price(f: &Finding, s: &Snapshot, region: &str) -> Option<Price> {
         items,
         notes,
     })
+}
+
+/// Why part of a saving waits for the commitments of `service` to renew.
+pub fn commitment_note(s: &Snapshot, service: &str, covered: f64) -> String {
+    match s.on_demand_monthly(service) {
+        Some(outside) => format!(
+            "Savings Plans or reservations cover {} of {service}'s usage and go on covering what is left: what runs outside them ({} a month) is saved now, the rest when they renew (or it covers other usage meanwhile).",
+            super::percent(covered),
+            money(outside, if s.currency.is_empty() { "USD" } else { &s.currency })
+        ),
+        None => format!(
+            "{} of {service}'s usage is covered by Savings Plans or reservations: that share is already paid for and saves when they renew, or covers other usage meanwhile.",
+            super::percent(covered)
+        ),
+    }
 }
 
 /// Prices every finding with `s` (or clears their prices without costs).
@@ -377,6 +396,23 @@ mod tests {
         assert!((p.later - monthly * 0.6).abs() < 1e-9 && (p.now - monthly * 0.4).abs() < 1e-9);
         assert_eq!(p.renewal, Some(1_804_896_000.0));
         assert!(p.describe().contains("when commitments renew, 2027-03-13"), "{}", p.describe());
+    }
+
+    #[test]
+    fn removals_come_off_what_runs_outside_commitments_first() {
+        // Six nodes, four reserved: removing two saves all of it now.
+        let mut s = snapshot();
+        s.coverage[0].on_demand_cost = 190.0;
+        let f = finding("Aurora").billed(&billing::rds_instance("db.r6g.large"), 365.0);
+        let p = price(&f, &s, "us-east-1").unwrap();
+        assert!((p.monthly - 365.0 * 190.0 / 720.0).abs() < 1e-9);
+        assert_eq!((p.now, p.later), (p.monthly, 0.0));
+        // More than runs outside them: the rest waits for the renewal.
+        let f = finding("Aurora").billed(&billing::rds_instance("db.r6g.xlarge"), 730.0);
+        let p = price(&f, &s, "us-east-1").unwrap();
+        let outside = 190.0 * 30.4375 / 30.0;
+        assert!((p.now - outside).abs() < 1e-9 && (p.later - (p.monthly - outside)).abs() < 1e-9);
+        assert!(p.notes.iter().any(|n| n.contains("go on covering what is left")), "{:?}", p.notes);
     }
 
     #[test]

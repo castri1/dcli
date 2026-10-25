@@ -793,20 +793,31 @@ pub fn writes(command: &str) -> bool {
             let reading = op.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
                 && (["describe-", "get-", "list-", "search-", "lookup-", "filter-", "batch-get-"].iter().any(|p| op.starts_with(p))
                     || ["help", "wait", "tail", "ls", "query", "scan"].contains(op));
-            // Reads that save what they read to a local file.
-            let saves = matches!((*service, *op), ("s3api", "get-object" | "get-object-torrent") | ("apigateway", "get-export" | "get-sdk"));
-            if !reading || saves {
+            // Reads that stream what they read into a local file.
+            let saves = [
+                "get-object", "get-object-torrent", "get-job-output", "get-export", "get-sdk", "get-thing-shadow",
+                "get-package-version-asset", "get-snapshot-block", "get-media", "get-media-for-fragment-list", "get-clip",
+                "get-work-unit-results", "get-raw-message-content", "get-retained-message",
+            ]
+            .contains(op);
+            if !reading || saves || *service == "s3api" && op.starts_with("get-object") {
                 return true;
             }
-            // After the operation, a value with no option before it is an output file (`ls`
-            // and `tail` take a path or a log group instead), and so is `--outfile`.
+            // After the operation, a value with no option before it is an output file (`ls` and
+            // `tail` take a path or a log group instead), and so is `--outfile`. Options take a
+            // value, but for those known to take none, so a value after one of those counts too.
+            let boolean = |w: &str| {
+                w.starts_with("--no-")
+                    || ["--debug", "--dry-run", "--recursive", "--summarize", "--human-readable", "--follow", "--force", "--cli-auto-prompt", "--generate-cli-skeleton"]
+                        .contains(&w)
+            };
             let mut expecting = false;
             for w in rest {
                 if w.starts_with("--outfile") || w.starts_with("--endpoint-url") {
                     return true;
                 }
                 if w.starts_with('-') {
-                    expecting = w.starts_with("--") && !w.contains('=');
+                    expecting = w.starts_with("--") && !w.contains('=') && !boolean(w);
                 } else if expecting {
                     expecting = false;
                 } else if !["ls", "tail", "help"].contains(op) {
@@ -1013,6 +1024,9 @@ mod tests {
         assert!(writes("aws --endpoint-url http://evil lambda get-function --function-name x"));
         assert!(writes("aws lambda get-function --function-name x extra"));
         assert!(writes("aws"));
+        assert!(writes("aws s3api get-object --bucket b --key k --no-paginate out.txt"));
+        assert!(writes("aws glacier get-job-output --account-id - --vault-name v --job-id j out"));
+        assert!(writes("aws lambda get-function --function-name x --debug out"));
         assert!(!writes("aws s3 ls s3://bucket/prefix/ --recursive --summarize"));
         assert!(!writes("aws logs tail /aws/lambda/orders --since 1h"));
         assert!(!writes("aws dynamodb scan --table-name orders --max-items 5"));

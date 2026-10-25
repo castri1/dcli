@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::costs::{self, Snapshot};
-use crate::savings::{billing, percent, price};
+use crate::savings::{billing, price};
 
 /// Changes one estimate takes, at most.
 pub const MAX_CHANGES: usize = 20;
@@ -212,10 +212,11 @@ pub fn estimate(changes: &[Change], s: &Snapshot, region: &str) -> Estimate {
         };
         let covered = s.covered(&c.service).clamp(0.0, 1.0);
         let coverable = price::coverable(&usage);
+        // A saving on usage commitments cover is split into now and later below, per service.
         let (monthly, now, to_rate, to_scaled_from) = match c.effect {
             Effect::Remove => {
                 let monthly = c.quantity * rate;
-                (monthly, if coverable { monthly * (1.0 - covered) } else { monthly }, None, None)
+                (monthly, monthly, None, None)
             }
             Effect::Add => {
                 added_covered |= coverable && covered > 0.0;
@@ -234,30 +235,38 @@ pub fn estimate(changes: &[Change], s: &Snapshot, region: &str) -> Estimate {
                 }
                 let monthly = c.quantity * (rate - r2);
                 added_covered |= monthly < 0.0 && coverable && covered > 0.0;
-                let now = if monthly > 0.0 && coverable { monthly * (1.0 - covered) } else { monthly };
-                (monthly, now, Some(r2), from2)
+                (monthly, monthly, Some(r2), from2)
             }
         };
         if !monthly.is_finite() {
             unpriced(&mut out, &usage);
             continue;
         }
-        if monthly - now > 0.0 && !services_later.contains(&c.service) {
-            services_later.push(c.service.clone());
-        }
         out.at_most |= c.at_most;
         out.lines.push(Line { change, monthly, now, rate, unit, to_rate, scaled_from, to_scaled_from });
     }
+    // What commitments can cover comes off the usage outside them first, service by service.
+    let saving_covered = |l: &Line| l.monthly > 0.0 && price::coverable(&l.change.usage_type);
+    for l in &out.lines {
+        if saving_covered(l) && !services_later.contains(&l.change.service) {
+            services_later.push(l.change.service.clone());
+        }
+    }
+    for svc in &services_later {
+        let total: f64 = out.lines.iter().filter(|l| saving_covered(l) && l.change.service == *svc).map(|l| l.monthly).sum();
+        let share = if total > 0.0 { s.saved_now(svc, total) / total } else { 1.0 };
+        for l in out.lines.iter_mut().filter(|l| l.monthly > 0.0 && price::coverable(&l.change.usage_type) && l.change.service == *svc) {
+            l.now = l.monthly * share;
+        }
+    }
+    services_later.retain(|svc| out.lines.iter().any(|l| l.change.service == *svc && l.monthly - l.now > 1e-9));
     out.monthly = out.lines.iter().map(|l| l.monthly).fold(0.0, |a, v| a + v);
     out.now = out.lines.iter().map(|l| l.now).fold(0.0, |a, v| a + v);
     out.later = (out.monthly - out.now).max(0.0);
     if out.later > 0.0 {
         out.renewal = services_later.iter().filter_map(|svc| s.renewal(svc)).reduce(f64::min);
         for svc in &services_later {
-            out.notes.push(format!(
-                "{} of {svc}'s usage is covered by Savings Plans or reservations: that share is already paid for and saves when they renew, or covers other usage meanwhile.",
-                percent(s.covered(svc).clamp(0.0, 1.0))
-            ));
+            out.notes.push(price::commitment_note(s, svc, s.covered(svc).clamp(0.0, 1.0)));
         }
     }
     for l in &out.lines {
@@ -452,6 +461,22 @@ mod tests {
         assert_eq!(e.renewal, Some(1_804_896_000.0));
         assert_eq!(e.lines[0].change.usage_type, "InstanceUsage:db.r6g.xlarge", "the region prefix is dropped");
         assert!(e.describe().contains("when commitments renew, 2027-03-13"), "{}", e.describe());
+    }
+
+    #[test]
+    fn savings_come_off_on_demand_usage_first() {
+        // Commitments cover 60 %; what runs outside them costs US$ 1,000 a month.
+        let mut s = snapshot();
+        s.coverage[0].on_demand_cost = 1000.0 * 30.0 / 30.4375;
+        let small = change(RDS, "InstanceUsage:db.r6g.xlarge", Effect::Remove, 730.0, None);
+        let e = estimate(&[small], &s, "us-east-1");
+        assert!((e.now - e.monthly).abs() < 1e-9 && e.later == 0.0, "all of it comes off on-demand usage");
+        assert!(e.notes.is_empty(), "{:?}", e.notes);
+        let big = change(RDS, "InstanceUsage:db.r6g.xlarge", Effect::Remove, 2920.0, None);
+        let e = estimate(&[big], &s, "us-east-1");
+        assert!((e.now - 1000.0).abs() < 1e-6 && (e.later - (e.monthly - 1000.0)).abs() < 1e-6);
+        assert!(e.notes[0].contains("go on covering what is left"), "{:?}", e.notes);
+        assert_eq!(e.renewal, Some(1_804_896_000.0));
     }
 
     #[test]
