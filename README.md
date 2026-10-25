@@ -445,13 +445,21 @@ the command runs and what was read is more than a day old.
 uses it to look at an environment and leave recommendations in the Advisor module. Add it once:
 
 ```sh
-claude mcp add dcli -- dcli mcp                # this project; --scope user for every project
-claude mcp add dcli -- dcli mcp --env dev,qa   # only these environments
+claude mcp add dcli -- dcli mcp                # this folder only; --scope user for every project
+claude mcp add dcli -- dcli mcp --env prod     # only these environments
+claude mcp add dcli -- dcli mcp --env prod --insights-gb 1000 --insights-gb-month 3000
 ```
+
+The last one also lets Claude read how much memory Lambda functions use, with Logs Insights
+(billed by the data it scans): at most 1,000 GB an analysis and 3,000 GB a month. Claude asks
+for the estimate first (GB and cost at your bill's rate), and dcli refuses what goes over.
 
 Then ask for an audit, naming the environment: `/mcp__dcli__audit prod` (the `audit` prompt;
 its focus can be `cost`, `performance` or `both`), or in your own words ("analyze prod with
-dcli and leave recommendations").
+dcli and leave recommendations"). The audit goes lever by lever, the largest first: a change
+that repeats across resources (arm64 for every x86 function, retention for every log group) is
+one recommendation with its whole saving, and every service worth about 2 % of the bill gets
+either recommendations or a line on what to investigate.
 
 What Claude can and cannot do through it:
 
@@ -459,7 +467,7 @@ What Claude can and cannot do through it:
   writes for AI agents (Lambda, Aurora, Redshift, DMS, API Gateway), the alarms, what the
   Savings scan finds, the bill split over resources, and the costs last read. It never calls
   Cost Explorer (each request is billed): when the reading is missing or old, it asks you to
-  run `dcli costs <env> --refresh`. No Logs Insights either (billed by the data it scans).
+  run `dcli costs <env> --refresh`. Logs Insights only within `--insights-gb` (off by default).
 - **It changes nothing** in AWS and runs nothing. The one thing it writes is recommendations,
   kept in `~/.deployment-cli/advisor/<env>/`.
 - **You choose the environment**: every tool takes it, and `--env` limits which ones exist.
