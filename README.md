@@ -469,16 +469,17 @@ Each recommendation says what was found and the evidence; the steps, as commands
 undo it and how to check it worked; and what it saves or costs a month. Claude describes the
 change as usage the bill knows (so many GB-seconds less; so many hours of `db.r6g.xlarge`
 billed as `db.r6g.large` instead) and dcli prices it at your account's own rates, split into
-what you save now and what you save when Savings Plans or reservations renew. A size the bill
-has not used is priced from another size of its family, in proportion, as AWS prices them.
-What the bill cannot price, Claude may estimate itself: it is shown as Claude's estimate, with
-its reasoning. A performance change that costs more says how much more.
+what you save now and what you save when Savings Plans or reservations renew. A removal never
+counts more than the bill used of that usage type. A size the bill has not used is priced from
+another size of its family, in proportion, as AWS prices them. Only what the bill cannot price
+may Claude estimate itself: it is shown as Claude's estimate, with its reasoning, and left out
+once newer costs price it. A performance change that costs more says how much more.
 
 The Advisor shows recommendations as Claude writes them, those that save most first, with
 the totals. `c` copies a step's command, `m` the whole recommendation as Markdown; `Enter`
 opens the resource in its module. `d` marks one done: it joins the changes Savings follows,
 so a week later the bill says whether it saved what was expected. `x` dismisses it with a
-reason, which Claude reads before proposing anything again. `dcli advisor <env>` lists them,
+reason: the server refuses to have it proposed again, and Claude reads why. `dcli advisor <env>` lists them,
 `--md` writes them as one document to share.
 
 Names, tags and log lines from AWS can hold text written to mislead an AI. The server hands
