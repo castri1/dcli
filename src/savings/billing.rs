@@ -75,6 +75,39 @@ pub fn dms_standby(class: &str) -> String {
     format!("Multi-AZUsg:{class}")
 }
 
+/// NAT gateways (Cost Explorer's "EC2 - Other"): hours each gateway exists, and GB it processes.
+pub const NAT_HOURS: &str = "NatGateway-Hours";
+pub const NAT_BYTES: &str = "NatGateway-Bytes";
+/// EBS snapshots stored, standard tier (GB-Mo, "EC2 - Other").
+pub const EBS_SNAPSHOTS: &str = "EBS:SnapshotUsage";
+/// Public IPv4 addresses not attached to anything (hours; "Amazon Virtual Private Cloud" since
+/// February 2024), and the older name of an idle Elastic IP ("EC2 - Other").
+pub const IPV4_IDLE: &str = "PublicIPv4:IdleAddress";
+pub const EIP_IDLE: &str = "ElasticIP:IdleAddress";
+/// X-Ray traces recorded (traces): the bill's usage type is found by name, since it differs
+/// between accounts (`XRay-TracesStored` is the usual one).
+pub const XRAY_TRACES: &str = "XRay-TracesStored";
+
+/// EBS storage of a volume type (GB-Mo, "EC2 - Other"): `EBS:VolumeUsage.gp2`, `.gp3`,
+/// `.piops` for io1, `.io2`, `.st1`, `.sc1`, and plain `EBS:VolumeUsage` for magnetic.
+pub fn ebs_volume(kind: &str) -> String {
+    match kind {
+        "standard" | "" => "EBS:VolumeUsage".to_string(),
+        "io1" => "EBS:VolumeUsage.piops".to_string(),
+        other => format!("EBS:VolumeUsage.{other}"),
+    }
+}
+
+/// EBS provisioned IOPS of a volume type (IOPS-Mo): io1, io2, and gp3 above its free 3,000.
+pub fn ebs_iops(kind: &str) -> Option<String> {
+    match kind {
+        "io1" => Some("EBS:VolumeP-IOPS.piops".to_string()),
+        "io2" => Some("EBS:VolumeP-IOPS.io2".to_string()),
+        "gp3" => Some("EBS:VolumeP-IOPS.gp3".to_string()),
+        _ => None,
+    }
+}
+
 /// Usage types whose price falls in tiers as usage grows: an average rate prices the last
 /// units a little differently.
 pub fn tiered(usage: &str) -> bool {

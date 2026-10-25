@@ -2245,8 +2245,16 @@ def cw_metrics(action, params):
                  f"<Messages/></GetMetricDataResult></GetMetricDataResponse>")
 
 
+# CloudWatch actions of other sections: hook(action, params) returns (status, xml) or None.
+CW_ACTION_HOOKS = []
+
+
 def cloudwatch(params):
     action = params.get("Action", [""])[0]
+    for hook in CW_ACTION_HOOKS:
+        answer = hook(action, params)
+        if answer is not None:
+            return answer
     if "Alarm" in action:
         return cw_alarms(action, params)
     return cw_metrics(action, params)
@@ -4788,6 +4796,11 @@ def is_appconfig(path):
     return path.startswith("/applications") or path.startswith("/deploymentstrategies")
 
 
+# REST services of other sections: (is_mine(path), handler(method, path, query, headers, body)),
+# tried before S3. Each section appends its own.
+EXTRA_REST = []
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -4827,6 +4840,9 @@ class H(BaseHTTPRequestHandler):
             return self.reply_raw(*apigateway_rest(method, path, query, self.headers, body))
         if is_savingsplans(path):
             return self.reply_raw(*savingsplans_rest(method, path, query, self.headers, body))
+        for is_mine, handler in EXTRA_REST:
+            if is_mine(path):
+                return self.reply_raw(*handler(method, path, query, self.headers, body))
         return self.reply_raw(*s3_rest(method, path, query, self.headers))
 
     def do_GET(self):
@@ -4869,12 +4885,13 @@ class H(BaseHTTPRequestHandler):
         raw = self.raw_body()
         if self.path.startswith("/2015-03-31/functions/") and "/invocations" in self.path:
             return self.reply_raw(*lambda_invoke(self.path, self.headers, raw))
-        if is_appconfig(self.path) or is_apigateway(self.path) or is_savingsplans(self.path):
+        if is_appconfig(self.path) or is_apigateway(self.path) or is_savingsplans(self.path) or any(m(self.path.split("?")[0]) for m, _ in EXTRA_REST):
             return self.route_rest("POST", raw)
         if self.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
             # awsQuery services, told apart by their API version.
             params = parse_qs(raw.decode())
-            service = {"2010-08-01": cloudwatch, "2014-10-31": rds, "2012-12-01": redshift, "2011-06-15": sts}.get(params.get("Version", [""])[0], cloudformation)
+            service = {"2010-08-01": cloudwatch, "2014-10-31": rds, "2012-12-01": redshift, "2011-06-15": sts,
+                       "2016-11-15": ec2_query}.get(params.get("Version", [""])[0], cloudformation)
             return self.reply_xml(*service(params))
         body = json.loads(raw or b"{}")
         target = self.headers.get("x-amz-target", "")
@@ -4947,6 +4964,213 @@ def savings_cost_history(op, body):
 
 
 CE_HOOKS.append(savings_cost_history)
+
+
+# ---- EC2 / VPC (awsQuery, Version 2016-11-15), X-Ray and Bedrock (restJson) ---------------------
+# What the Savings checks of "EC2 - Other", X-Ray and Bedrock read: an idle NAT gateway and a busy
+# one (its VPC has an S3 endpoint, no DynamoDB one), an unattached gp2 volume, a gp2 volume in use,
+# old snapshots (one of an AMI, one from AWS Backup), an idle Elastic IP, a sampling rule at 100 %,
+# a group with Insights, a Claude model without prompt caching, invocation logs in CloudWatch and
+# idle provisioned throughput. Their usage is on the mock's bill below.
+EC2_NS = "http://ec2.amazonaws.com/doc/2016-11-15/"
+# id, GiB, type, state, IOPS, Name tag
+EC2_VOLUMES = [
+    ("vol-0a1b2c3d4e5f60001", 500, "gp2", "available", 1500, "old-reports-data"),
+    ("vol-0a1b2c3d4e5f60002", 2000, "gp2", "in-use", 6000, "orders-db-data"),
+    ("vol-0a1b2c3d4e5f60003", 100, "gp3", "in-use", 3000, "bastion-root"),
+]
+# id, VPC, subnet, Name tag; bytes processed a day
+EC2_NATS = [("nat-0aa11bb22cc33dd01", "vpc-0abc1", "subnet-0a1", "orders-nat-a"),
+            ("nat-0aa11bb22cc33dd02", "vpc-0abc1", "subnet-0b2", "orders-nat-b")]
+EC2_NAT_BYTES = {"nat-0aa11bb22cc33dd01": 25 * GiB, "nat-0aa11bb22cc33dd02": 0.001 * GiB}
+EC2_ENDPOINTS = [("vpce-0s3", "vpc-0abc1", "com.amazonaws.us-east-1.s3")]
+# public IP, allocation, association, Name tag
+EC2_ADDRESSES = [("54.210.10.11", "eipalloc-0idle1", "", "legacy-ftp"), ("54.210.10.12", "eipalloc-0used2", "eipassoc-0x", "")]
+# id, volume, GiB, days old, description, tag keys
+EC2_SNAPSHOTS = [
+    ("snap-0old0001", "vol-0deleted001", 200, 400, "before migration", []),
+    ("snap-0old0002", "vol-0deleted001", 200, 380, "", []),
+    ("snap-0old0003", "vol-0a1b2c3d4e5f60002", 2000, 120, "pre-upgrade", []),
+    ("snap-0ami00004", "vol-0deleted002", 30, 300, "Created by CreateImage(i-0x) for ami-0live", []),
+    ("snap-0backup05", "vol-0a1b2c3d4e5f60002", 2000, 200, "This snapshot is created by the AWS Backup service.", ["aws:backup:source-resource"]),
+]
+EC2_IMAGES = [("ami-0live", ["snap-0ami00004"])]
+
+
+def ec2_x(tag, value):
+    return f"<{tag}>{value}</{tag}>"
+
+
+def ec2_tags(tags):
+    return "<tagSet>" + "".join(f"<item><key>{k}</key><value>{v}</value></item>" for k, v in tags) + "</tagSet>"
+
+
+def ec2_query(params):
+    action = params.get("Action", [""])[0]
+    if action == "DescribeVolumes":
+        items = "".join(
+            "<item>" + ec2_x("volumeId", v) + ec2_x("size", size) + ec2_x("volumeType", kind) + ec2_x("status", state)
+            + ec2_x("iops", iops) + ec2_x("createTime", cw_iso(T0 - 500 * 86400)) + ec2_x("availabilityZone", "us-east-1a")
+            + ("<attachmentSet><item><instanceId>i-0abc</instanceId><status>attached</status></item></attachmentSet>"
+               if state == "in-use" else "<attachmentSet/>")
+            + ec2_tags([("Name", name)]) + "</item>"
+            for v, size, kind, state, iops, name in EC2_VOLUMES)
+        body = f"<volumeSet>{items}</volumeSet>"
+    elif action == "DescribeNatGateways":
+        items = "".join(
+            "<item>" + ec2_x("natGatewayId", n) + ec2_x("vpcId", vpc) + ec2_x("subnetId", subnet) + ec2_x("state", "available")
+            + ec2_x("connectivityType", "public") + ec2_x("createTime", cw_iso(T0 - 700 * 86400)) + ec2_tags([("Name", name)]) + "</item>"
+            for n, vpc, subnet, name in EC2_NATS)
+        body = f"<natGatewaySet>{items}</natGatewaySet>"
+    elif action == "DescribeVpcEndpoints":
+        items = "".join(
+            "<item>" + ec2_x("vpcEndpointId", e) + ec2_x("vpcId", vpc) + ec2_x("serviceName", svc) + ec2_x("vpcEndpointType", "Gateway") + "</item>"
+            for e, vpc, svc in EC2_ENDPOINTS)
+        body = f"<vpcEndpointSet>{items}</vpcEndpointSet>"
+    elif action == "DescribeAddresses":
+        items = "".join(
+            "<item>" + ec2_x("publicIp", ip) + ec2_x("allocationId", alloc) + ec2_x("domain", "vpc")
+            + (ec2_x("associationId", assoc) if assoc else "") + (ec2_tags([("Name", name)]) if name else "") + "</item>"
+            for ip, alloc, assoc, name in EC2_ADDRESSES)
+        body = f"<addressesSet>{items}</addressesSet>"
+    elif action == "DescribeSnapshots":
+        items = "".join(
+            "<item>" + ec2_x("snapshotId", s) + ec2_x("volumeId", vol) + ec2_x("volumeSize", size) + ec2_x("status", "completed")
+            + ec2_x("startTime", cw_iso(T0 - days * 86400)) + ec2_x("description", desc) + ec2_x("storageTier", "standard")
+            + ec2_x("ownerId", ACCOUNT) + ec2_tags([(k, "x") for k in tags]) + "</item>"
+            for s, vol, size, days, desc, tags in EC2_SNAPSHOTS)
+        body = f"<snapshotSet>{items}</snapshotSet>"
+    elif action == "DescribeImages":
+        items = "".join(
+            "<item>" + ec2_x("imageId", ami) + "<blockDeviceMapping>"
+            + "".join(f"<item><deviceName>/dev/xvda</deviceName><ebs><snapshotId>{s}</snapshotId></ebs></item>" for s in snaps)
+            + "</blockDeviceMapping></item>"
+            for ami, snaps in EC2_IMAGES)
+        body = f"<imagesSet>{items}</imagesSet>"
+    else:
+        return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
+    return 200, f'<{action}Response xmlns="{EC2_NS}"><requestId>mock</requestId>{body}</{action}Response>'
+
+
+XRAY_RULES = [
+    {"RuleName": "Default", "RuleARN": f"arn:aws:xray:us-east-1:{ACCOUNT}:sampling-rule/Default", "ResourceARN": "*",
+     "Priority": 10000, "FixedRate": 0.05, "ReservoirSize": 1, "ServiceName": "*", "ServiceType": "*", "Host": "*",
+     "HTTPMethod": "*", "URLPath": "*", "Version": 1, "Attributes": {}},
+    {"RuleName": "checkout-debug", "RuleARN": f"arn:aws:xray:us-east-1:{ACCOUNT}:sampling-rule/checkout-debug", "ResourceARN": "*",
+     "Priority": 100, "FixedRate": 1.0, "ReservoirSize": 50, "ServiceName": "checkout-api", "ServiceType": "*", "Host": "*",
+     "HTTPMethod": "*", "URLPath": "*", "Version": 1, "Attributes": {}},
+]
+XRAY_GROUPS = [
+    {"GroupName": "Default", "GroupARN": f"arn:aws:xray:us-east-1:{ACCOUNT}:group/Default", "FilterExpression": "",
+     "InsightsConfiguration": {"InsightsEnabled": False, "NotificationsEnabled": False}},
+    {"GroupName": "checkout-errors", "GroupARN": f"arn:aws:xray:us-east-1:{ACCOUNT}:group/checkout-errors/x",
+     "FilterExpression": "service(\"checkout-api\") { error }", "InsightsConfiguration": {"InsightsEnabled": True, "NotificationsEnabled": True}},
+]
+
+
+def xray_rest(method, path, query, headers, body):
+    json_type = {"content-type": "application/json"}
+    if method == "POST" and path == "/GetSamplingRules":
+        stamp = T0 - 90 * 86400
+        records = [{"SamplingRule": r, "CreatedAt": stamp, "ModifiedAt": stamp} for r in XRAY_RULES]
+        return 200, json_type, json.dumps({"SamplingRuleRecords": records}).encode()
+    if method == "POST" and path == "/Groups":
+        return 200, json_type, json.dumps({"Groups": XRAY_GROUPS}).encode()
+    return 404, {**json_type, "x-amzn-errortype": "ValidationException"}, json.dumps({"message": f"mock: no route for {method} {path}"}).encode()
+
+
+EXTRA_REST.append((lambda path: path in ("/GetSamplingRules", "/Groups"), xray_rest))
+
+BEDROCK_LOG_GROUP = "/aws/bedrock/modelinvocations"
+BEDROCK_PROVISIONED_ARN = f"arn:aws:bedrock:us-east-1:{ACCOUNT}:provisioned-model/pt0summaries"
+# Per model, a day: invocations and tokens (Claude without prompt caching, Nova with it).
+BEDROCK_USE = {
+    "us.anthropic.claude-sonnet-4-20250514-v1:0": {"Invocations": 9000, "InputTokenCount": 45_000_000, "OutputTokenCount": 2_000_000,
+                                                   "CacheReadInputTokenCount": 0, "CacheWriteInputTokenCount": 0},
+    "amazon.nova-lite-v1:0": {"Invocations": 20000, "InputTokenCount": 4_000_000, "OutputTokenCount": 1_000_000,
+                              "CacheReadInputTokenCount": 1_500_000, "CacheWriteInputTokenCount": 200_000},
+}
+
+
+def bedrock_rest(method, path, query, headers, body):
+    json_type = {"content-type": "application/json"}
+    if method == "GET" and path == "/logging/modelinvocations":
+        config = {"cloudWatchConfig": {"logGroupName": BEDROCK_LOG_GROUP, "roleArn": f"arn:aws:iam::{ACCOUNT}:role/bedrock-logs"},
+                  "textDataDeliveryEnabled": True, "imageDataDeliveryEnabled": False, "embeddingDataDeliveryEnabled": False}
+        return 200, json_type, json.dumps({"loggingConfig": config}).encode()
+    if method == "GET" and path == "/provisioned-model-throughputs":
+        model = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+        summary = {"provisionedModelName": "summaries-pt", "provisionedModelArn": BEDROCK_PROVISIONED_ARN, "modelArn": model,
+                   "desiredModelArn": model, "foundationModelArn": model, "modelUnits": 1, "desiredModelUnits": 1,
+                   "status": "InService", "creationTime": cw_iso(T0 - 60 * 86400), "lastModifiedTime": cw_iso(T0 - 60 * 86400)}
+        return 200, json_type, json.dumps({"provisionedModelSummaries": [summary]}).encode()
+    return 404, {**json_type, "x-amzn-errortype": "ValidationException"}, json.dumps({"message": f"mock: no route for {method} {path}"}).encode()
+
+
+EXTRA_REST.append((lambda path: path in ("/logging/modelinvocations", "/provisioned-model-throughputs"), bedrock_rest))
+
+
+def bedrock_list_metrics(action, params):
+    get = lambda k: params.get(k, [""])[0]
+    if action != "ListMetrics" or get("Namespace") != "AWS/Bedrock":
+        return None
+    name = get("MetricName") or "InputTokenCount"
+    dims = [[("ModelId", m)] for m in BEDROCK_USE] + [[("ModelId", m), ("Region", "us-east-1")] for m in BEDROCK_USE]
+    members = "".join(
+        f"<member><Namespace>AWS/Bedrock</Namespace><MetricName>{name}</MetricName><Dimensions>"
+        + "".join(f"<member><Name>{k}</Name><Value>{v}</Value></member>" for k, v in d) + "</Dimensions></member>"
+        for d in dims)
+    return 200, f"<ListMetricsResponse><ListMetricsResult><Metrics>{members}</Metrics></ListMetricsResult></ListMetricsResponse>"
+
+
+CW_ACTION_HOOKS.append(bedrock_list_metrics)
+
+
+def ec2_bedrock_metric(namespace, name, dims, stat, period, ts):
+    if namespace == "AWS/NATGateway":
+        per_day = EC2_NAT_BYTES.get(dims.get("NatGatewayId"))
+        if per_day is None:
+            return CW_NO_DATA
+        if name in ("BytesInFromSource", "BytesInFromDestination"):
+            return per_day / 2 * period / 86400
+        if name == "ActiveConnectionCount":
+            return 2.0 if per_day < GiB else 350.0
+        return 0.0
+    if namespace == "AWS/Bedrock":
+        per_day = BEDROCK_USE.get(dims.get("ModelId", ""), {}).get(name)
+        return CW_NO_DATA if per_day is None else per_day * period / 86400
+    if namespace == "AWS/Logs" and name == "IncomingBytes" and dims.get("LogGroupName") == BEDROCK_LOG_GROUP:
+        return 3 * GiB * period / 86400
+    return None
+
+
+# First: the Savings section answers every log group's IncomingBytes.
+CW_METRIC_HOOKS.insert(0, ec2_bedrock_metric)
+
+# Their usage on the bill (quantity a day, rate), as the other services above.
+CE_SERVICES.update({
+    "EC2 - Other": [
+        ("USE1-NatGateway-Hours", "Hrs", 48, 0.045),
+        ("USE1-NatGateway-Bytes", "GB", 25, 0.045),
+        ("EBS:VolumeUsage.gp2", "GB-Mo", 85, 0.10),
+        ("EBS:VolumeUsage.gp3", "GB-Mo", 3.3, 0.08),
+        ("EBS:SnapshotUsage", "GB-Mo", 60, 0.05),
+    ],
+    "Amazon Virtual Private Cloud": [
+        ("USE1-PublicIPv4:IdleAddress", "Hrs", 24, 0.005),
+        ("USE1-PublicIPv4:InUseAddress", "Hrs", 120, 0.005),
+    ],
+    "AWS X-Ray": [
+        ("USE1-XRay-TracesStored", "Traces", 600_000, 0.000005),
+        ("USE1-XRay-TracesAccessed", "Traces", 200_000, 0.0000005),
+        ("USE1-XRay-InsightsTraces", "Traces", 150_000, 0.000001),
+    ],
+    "Claude Sonnet 4 (Amazon Bedrock Edition)": [
+        ("USE1-MP:USE1_InputTokenCount-Units", "Units", 45_000, 0.003),
+        ("USE1-MP:USE1_OutputTokenCount-Units", "Units", 2_000, 0.015),
+    ],
+    "Amazon Bedrock": [("USE1-NovaLite-input-tokens", "Units", 4_000, 0.00006)],
+})
 
 
 if __name__ == "__main__":
