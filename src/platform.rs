@@ -166,6 +166,44 @@ pub fn write_temp_file(label: &str, content: &str) -> std::io::Result<PathBuf> {
     Err(last_error.unwrap_or_else(|| std::io::Error::other("no free file name")))
 }
 
+/// Held while this process changes a file other dcli processes change too ([`lock`]).
+pub struct FileLock(PathBuf);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Waits (up to 5 s) to be the only dcli changing `path`: a `.<name>.lock` file next to it,
+/// made exclusively and removed when the returned guard goes. One left by a process that died
+/// is taken over after 10 s.
+pub fn lock(path: &std::path::Path) -> std::io::Result<FileLock> {
+    use std::time::{Duration, Instant};
+    let dir = path.parent().ok_or_else(|| std::io::Error::other(format!("no folder for {}", path.display())))?;
+    std::fs::create_dir_all(dir)?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let lock = dir.join(format!(".{name}.lock"));
+    let start = Instant::now();
+    loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Ok(FileLock(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let age = std::fs::metadata(&lock).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                if age.is_some_and(|a| a > Duration::from_secs(10)) {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
+                if start.elapsed() > Duration::from_secs(5) {
+                    return Err(std::io::Error::other(format!("another dcli is changing {}: try again", path.display())));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Replaces the file at `path` with `content`, readable only by the user: written whole to a
 /// new file next to it (never following a link there), flushed to disk, then moved over the
 /// old one. Each write has its own temporary name, so threads writing at once do not meet.

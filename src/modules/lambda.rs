@@ -367,10 +367,10 @@ impl Lambda {
     fn submit_memory(&mut self, ctx: &mut Ctx) {
         let Some(check) = self.memory.take() else { return };
         let (name, estimate) = (check.name, chosen_estimate(&check.form, &check.estimate));
-        let aws = ctx.env().aws.clone();
+        let (aws, env) = (ctx.env().aws.clone(), self.env_name.clone());
         ctx.toast(Level::Info, format!("Reading the memory use of {name} ({})…", estimate.describe()));
         ctx.spawn(move || {
-            let result = memory::memory_analysis(&aws, &estimate, &|_, _| {});
+            let result = memory::memory_analysis(&aws, &env, &estimate, &|_, _| {});
             Msg::Memory { name, result }
         });
     }
@@ -698,6 +698,8 @@ impl Module for Lambda {
         self.region = ctx.env().region.clone();
         self.env_name = ctx.env().name.clone();
         self.aws = Some(ctx.env().aws.clone());
+        // Memory analyses kept from earlier runs show in the function's details.
+        memory::preload(&ctx.env().aws, &self.env_name);
     }
 
     fn activate(&mut self, ctx: &mut Ctx) {

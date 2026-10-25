@@ -4488,6 +4488,7 @@ CE_SERVICES = {
         ("USE1-DataProcessing-Bytes", "GB", 13.03, 0.50),
         ("USE1-TimedStorage-ByteHrs", "GB-Mo", 50, 0.03),
         ("CW:AlarmMonitorUsage", "Alarms", 1.33, 0.10),
+        ("USE1-DataScanned-Bytes", "GB", 1076, 0.005),
         ("CW:GMD-Metrics", "Metrics", 30_000, 0.00001),
     ],
     "Amazon DynamoDB": [
