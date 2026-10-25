@@ -219,6 +219,12 @@ pub enum Command {
     Costs(crate::clicmd::costs::Args),
     /// What could cost less: unused or oversized resources, in the units AWS bills
     Optimize(crate::clicmd::optimize::Args),
+    /// Claude's recommendations (written through `dcli mcp`): cost and performance changes with
+    /// steps to copy, and what each saves at the bill's rates
+    Advisor(crate::clicmd::advisor::Args),
+    /// MCP server for Claude and other AI agents (stdio): reads the account, never changes it,
+    /// and writes recommendations to the Advisor. Add it with: claude mcp add dcli -- dcli mcp
+    Mcp(crate::mcp::Args),
     /// Update dcli to the latest release (through npm when installed with npm)
     Update {
         /// Only tell whether a newer version exists
@@ -561,6 +567,8 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Dms(args) => crate::clicmd::dms::run(config, args),
         Command::Costs(args) => crate::clicmd::costs::run(config, args),
         Command::Optimize(args) => crate::clicmd::optimize::run(config, args),
+        Command::Advisor(args) => crate::clicmd::advisor::run(config, args),
+        Command::Mcp(args) => crate::mcp::serve(&loaded, args),
         Command::Lambda(args) => crate::clicmd::lambda::run(config, args),
     }
 }

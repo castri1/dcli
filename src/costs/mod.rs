@@ -179,7 +179,7 @@ pub fn cache_path(env: &str) -> Option<PathBuf> {
 
 /// `env` with every byte but ASCII letters, digits, `-` and `_` written `%XX`: reversible, so
 /// distinct names stay distinct.
-fn file_name(env: &str) -> String {
+pub(crate) fn file_name(env: &str) -> String {
     let mut out = String::new();
     for b in env.bytes() {
         if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {

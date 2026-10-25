@@ -1,6 +1,7 @@
 //! One file per service command (`dcli s3`, `dcli sfn`, …), next to the shared helpers in
 //! `cli.rs`. Each defines its clap `Args` and a `run`.
 
+pub mod advisor;
 pub mod alarms;
 pub mod apigw;
 pub mod appconfig;

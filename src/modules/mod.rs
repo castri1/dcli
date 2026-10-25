@@ -3,6 +3,7 @@
 //!   2. implement `tui::module::Module` in `src/modules/<name>.rs`,
 //!   3. register it below. The header and the `:` palette list modules in this order.
 
+mod advisor;
 mod alarms;
 mod apigateway;
 mod appconfig;
@@ -37,6 +38,7 @@ pub fn all() -> Vec<Box<dyn Module>> {
         Box::new(alarms::Alarms::new()),
         Box::new(costs::Costs::new()),
         Box::new(savings::Savings::new()),
+        Box::new(advisor::Advisor::new()),
         Box::new(parameters::Parameters::new()),
         Box::new(secrets::Secrets::new()),
         Box::new(lambda::Lambda::new()),

@@ -255,6 +255,40 @@ pub fn entry_for(f: &Finding, env: &str, region: &str, source: Source, what: imp
     }
 }
 
+/// An entry for a change the user made elsewhere, named by the usage types it touches (a
+/// recommendation of the Advisor marked done): `service` is Cost Explorer's name.
+#[allow(clippy::too_many_arguments)]
+pub fn entry_for_usage(
+    env: &str,
+    region: &str,
+    what: &str,
+    (module, target, resource): (&str, &str, &str),
+    service: &str,
+    usage: Vec<String>,
+    expected: Option<f64>,
+    currency: &str,
+) -> Entry {
+    let at = now_secs();
+    let costs = super::cached(env);
+    Entry {
+        id: new_id(at, &format!("{env}{what}{target}")),
+        env: env.into(),
+        account: costs.as_ref().map(|c| c.account.clone()).unwrap_or_default(),
+        region: region.into(),
+        at,
+        source: Source::Done,
+        what: what.into(),
+        module: module.into(),
+        target: target.into(),
+        resource: resource.into(),
+        service: service.into(),
+        usage,
+        expected,
+        currency: if currency.is_empty() { costs.map(|c| c.currency).unwrap_or_default() } else { currency.into() },
+        verified: None,
+    }
+}
+
 /// A cost-relevant action another module makes (stopping a cluster, a smaller class…), to
 /// record once it is made and verify on the bill later.
 #[derive(Debug, Clone)]

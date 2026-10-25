@@ -1,3 +1,4 @@
+mod advisor;
 mod asl;
 mod aws;
 mod catalog;
@@ -7,6 +8,7 @@ mod config;
 mod costs;
 mod hooks;
 mod matrix;
+mod mcp;
 mod modules;
 mod pipeline;
 mod platform;
