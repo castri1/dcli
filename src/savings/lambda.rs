@@ -1,12 +1,13 @@
 //! Lambda: x86 functions that could run on arm64, provisioned concurrency left idle,
 //! timeouts far above what functions take, and, on demand (Logs Insights bills the data it
-//! scans), memory assigned against memory used.
+//! scans), memory assigned against memory used. Each memory analysis is kept per environment
+//! ([`keep`]), so later scans, and Claude through `dcli mcp`, use it without scanning again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     Finding, Impact, MONTH, Scan, billing, days_label, metric_data, par_map, peak, per_month, percent, qty, query, query_id, size,
@@ -52,6 +53,9 @@ pub fn check(scan: &Scan) -> aws::Result<Vec<Finding>> {
         found.extend(timeout(f, &u));
     }
     found.extend(provisioned(scan.aws, &functions, scan.days)?);
+    let kept = fresh_kept(&kept(scan.env), &functions, now_secs());
+    remember(scan.aws, &kept);
+    found.extend(kept_findings(&kept));
     Ok(found)
 }
 
@@ -277,6 +281,8 @@ pub struct Estimate {
     pub days: u32,
     /// Bytes received each day, oldest first, all groups together.
     pub daily: Vec<f64>,
+    /// Bytes each function's group received over the window, in the order of `functions`.
+    pub per_function: Vec<f64>,
 }
 
 impl Estimate {
@@ -285,6 +291,22 @@ impl Estimate {
         let days = days.min(self.days).max(1);
         let bytes = self.daily.iter().rev().take(days as usize).sum();
         Estimate { bytes, days, ..self.clone() }
+    }
+
+    /// Only the functions named in `names` (in the order given), with what their groups
+    /// received; the days measured are scaled to their share.
+    pub fn only(&self, names: &[String]) -> Estimate {
+        let mut out = Estimate { shared: self.shared.clone(), days: self.days, ..Default::default() };
+        for name in names {
+            if let Some(i) = self.functions.iter().position(|f| f.function_name == *name) {
+                out.functions.push(self.functions[i].clone());
+                out.per_function.push(self.per_function.get(i).copied().unwrap_or(0.0));
+            }
+        }
+        out.bytes = out.per_function.iter().sum();
+        let share = if self.bytes > 0.0 { out.bytes / self.bytes } else { 0.0 };
+        out.daily = self.daily.iter().map(|d| d * share).collect();
+        out
     }
 
     /// `23 functions · ≈ 4.2 GB of logs over 14 days`.
@@ -311,19 +333,35 @@ pub fn memory_estimate(aws: &Aws, functions: Option<Vec<FunctionConfiguration>>,
         .map(|(i, f)| query(query_id("inb", i), "AWS/Logs", "IncomingBytes", &[("LogGroupName", &f.log_group())], "Sum", DAY))
         .collect();
     let mut by_day: std::collections::BTreeMap<i64, f64> = Default::default();
+    let mut per_function = Vec::with_capacity(functions.len());
     for series in metric_data(aws, &queries, days)? {
+        per_function.push(total(&series));
         for (t, bytes) in series.points {
             *by_day.entry(t as i64).or_default() += bytes;
         }
     }
+    per_function.resize(functions.len(), 0.0);
     let daily: Vec<f64> = by_day.into_values().collect();
     let bytes = daily.iter().sum();
-    Ok(Estimate { functions, shared: shared.into_iter().map(|f| f.function_name).collect(), bytes, days, daily })
+    Ok(Estimate { functions, shared: shared.into_iter().map(|f| f.function_name).collect(), bytes, days, daily, per_function })
+}
+
+/// The GB-seconds each of `functions` used over the last `days` days (duration × memory, from
+/// its metrics): what ranks them by what they cost.
+pub fn gb_seconds_by_function(aws: &Aws, functions: &[FunctionConfiguration], days: u32) -> aws::Result<HashMap<String, f64>> {
+    let usage = usage(aws, functions, days)?;
+    Ok(functions
+        .iter()
+        .map(|f| {
+            let u = usage.get(&f.function_name).copied().unwrap_or_default();
+            (f.function_name.clone(), gb_seconds(u.invocations, u.mean_ms, memory_mb(f) as f64))
+        })
+        .collect())
 }
 
 /// The memory a function used, from its REPORT lines.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct MemoryUse {
     pub function: String,
     /// It runs on arm64 (its GB-seconds are billed as such).
@@ -383,11 +421,14 @@ pub struct MemoryRun {
     pub bytes_scanned: f64,
     /// Functions analysed without any REPORT line in the window.
     pub silent: Vec<String>,
+    /// Why the analysis could not be kept for later scans, if it could not.
+    pub keep_error: Option<String>,
 }
 
-/// Runs the memory analysis of an estimate: Insights queries of up to 50 groups, one after
-/// the other. `progress` hears how many groups are done.
-pub fn memory_analysis(aws: &Aws, estimate: &Estimate, progress: &dyn Fn(usize, usize)) -> aws::Result<MemoryRun> {
+/// Runs the memory analysis of an estimate in environment `env`: Insights queries of up to 50
+/// groups, one after the other. `progress` hears how many groups are done. The result is kept
+/// for later scans ([`keep`]).
+pub fn memory_analysis(aws: &Aws, env: &str, estimate: &Estimate, progress: &dyn Fn(usize, usize)) -> aws::Result<MemoryRun> {
     let end = now_secs() as i64;
     let start = end - i64::from(estimate.days) * 86_400;
     let by_group: HashMap<String, &FunctionConfiguration> = estimate.functions.iter().map(|f| (f.log_group(), f)).collect();
@@ -430,6 +471,7 @@ pub fn memory_analysis(aws: &Aws, estimate: &Estimate, progress: &dyn Fn(usize, 
     run.silent = estimate.functions.iter().map(|f| f.function_name.clone()).filter(|n| !seen.contains(n)).collect();
     run.uses.sort_by(|a, b| a.function.cmp(&b.function));
     remember(aws, &run.uses);
+    run.keep_error = keep(env, &run.uses).err().map(|e| e.to_string());
     Ok(run)
 }
 
@@ -475,6 +517,7 @@ pub fn memory_finding(u: &MemoryUse) -> Option<Finding> {
             Impact::of(gbs, GBS_MEDIUM, GBS_HIGH),
         )
         .score(gbs / GBS_HIGH)
+        .kind("memory")
         .billed(if u.arm64 { billing::LAMBDA_GBS_ARM } else { billing::LAMBDA_GBS }, gbs)
         .evidence(format!(
             "p99 memory used {:.0} MB, at most {:.0} MB, over {} invocations ({} of REPORT lines)",
@@ -507,9 +550,134 @@ fn remember(aws: &Aws, uses: &[MemoryUse]) {
     }
 }
 
-/// The last memory analysis of `function` in this run of dcli.
+/// The last memory analysis of `function` in this run of dcli (or kept from an earlier one,
+/// once [`preload`] or a scan read them).
 pub fn remembered(aws: &Aws, function: &str) -> Option<MemoryUse> {
     memory().lock().unwrap().get(&(aws.profile.clone(), aws.region.clone(), function.to_string())).cloned()
+}
+
+// ---- memory analyses kept on disk ------------------------------------------------------------
+
+/// Days a kept analysis still makes findings.
+pub const KEPT_DAYS: f64 = 30.0;
+/// Days an analysis stays in the file at all.
+const KEPT_AT_MOST_DAYS: f64 = 90.0;
+/// Functions kept per environment, at most.
+const KEPT_MAX: usize = 5000;
+
+/// What the file holds: the latest analysis of each function of one environment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct Kept {
+    env: String,
+    uses: Vec<MemoryUse>,
+}
+
+/// `~/.deployment-cli/cache/lambda-memory-<env>.json`, the name escaped as the costs cache's.
+pub fn kept_path(env: &str) -> Option<std::path::PathBuf> {
+    let name = format!("lambda-memory-{}.json", crate::costs::file_name(env));
+    Some(crate::util::home_dir()?.join(".deployment-cli").join("cache").join(name))
+}
+
+/// Keeps `uses` as the latest memory analysis of their functions in `env` (private file; the
+/// other functions' analyses stay).
+pub fn keep(env: &str, uses: &[MemoryUse]) -> std::io::Result<()> {
+    let path = kept_path(env).ok_or_else(|| std::io::Error::other("cannot find the home directory"))?;
+    keep_at(&path, env, uses, now_secs())
+}
+
+fn keep_at(path: &std::path::Path, env: &str, uses: &[MemoryUse], now: f64) -> std::io::Result<()> {
+    if uses.is_empty() {
+        return Ok(());
+    }
+    let _one = crate::platform::lock(path)?;
+    // A file that exists but cannot be read is left for the user, never written over.
+    let mut all = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<Kept>(&text)
+            .map_err(|e| std::io::Error::other(format!("{} is not valid ({e}): fix or delete it", path.display())))?
+            .uses,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    all.retain(|old| !uses.iter().any(|u| u.function == old.function) && now - old.at <= KEPT_AT_MOST_DAYS * 86_400.0);
+    all.extend(uses.iter().cloned());
+    all.sort_by(|a, b| b.at.total_cmp(&a.at));
+    all.truncate(KEPT_MAX);
+    all.sort_by(|a, b| a.function.cmp(&b.function));
+    let kept = Kept { env: env.to_string(), uses: all };
+    crate::platform::write_private(path, serde_json::to_string(&kept).unwrap_or_default().as_bytes())
+}
+
+/// The memory analyses kept for `env`, checked: the file could have been edited.
+pub fn kept(env: &str) -> Vec<MemoryUse> {
+    kept_path(env).map(|p| kept_at(&p, env, now_secs())).unwrap_or_default()
+}
+
+fn kept_at(path: &std::path::Path, env: &str, now: f64) -> Vec<MemoryUse> {
+    let Some(file) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Kept>(&t).ok()) else {
+        return Vec::new();
+    };
+    if file.env != env {
+        return Vec::new();
+    }
+    let ok = |v: f64| v.is_finite() && v >= 0.0;
+    file.uses
+        .into_iter()
+        .filter(|u| {
+            ok(u.p99_mb)
+                && ok(u.max_mb)
+                && ok(u.samples)
+                && ok(u.invocations)
+                && ok(u.avg_billed_ms)
+                && (128..=10_240).contains(&u.memory_mb)
+                && (1..=455).contains(&u.days)
+                && u.at.is_finite()
+                && u.at > 0.0
+                && u.at <= now + 86_400.0
+                && !u.function.is_empty()
+                && u.function.len() <= 170
+                && !u.function.chars().any(crate::util::is_unsafe)
+        })
+        .map(|u| MemoryUse {
+            // What Lambda reports never exceeds the memory assigned.
+            p99_mb: u.p99_mb.min(u.memory_mb as f64),
+            max_mb: u.max_mb.min(u.memory_mb as f64),
+            ..u
+        })
+        .take(KEPT_MAX)
+        .collect()
+}
+
+/// Of `kept`, the analyses of the last [`KEPT_DAYS`] of functions that still exist with the
+/// memory and architecture they had then.
+fn fresh_kept(kept: &[MemoryUse], functions: &[FunctionConfiguration], now: f64) -> Vec<MemoryUse> {
+    let by_name: HashMap<&str, &FunctionConfiguration> = functions.iter().map(|f| (f.function_name.as_str(), f)).collect();
+    kept.iter()
+        .filter(|u| now - u.at <= KEPT_DAYS * 86_400.0)
+        .filter(|u| by_name.get(u.function.as_str()).is_some_and(|f| memory_mb(f) == u.memory_mb && on_x86(f) != u.arm64))
+        .cloned()
+        .collect()
+}
+
+/// The memory findings of kept analyses, each saying when it was read.
+fn kept_findings(kept: &[MemoryUse]) -> Vec<Finding> {
+    kept.iter()
+        .filter_map(|u| {
+            let (y, m, d, ..) = crate::util::utc_parts(u.at as i64);
+            memory_finding(u).map(|f| f.evidence(format!("from the memory analysis of {y:04}-{m:02}-{d:02} (Logs Insights)")))
+        })
+        .collect()
+}
+
+/// Makes the analyses kept for `env` known to [`remembered`] (the Lambda module's hints).
+pub fn preload(aws: &Aws, env: &str) {
+    let now = now_secs();
+    let fresh: Vec<MemoryUse> = kept(env).into_iter().filter(|u| now - u.at <= KEPT_DAYS * 86_400.0).collect();
+    let mut map = memory().lock().unwrap();
+    for u in fresh {
+        // An analysis of this run, newer, stays.
+        map.entry((aws.profile.clone(), aws.region.clone(), u.function.clone())).or_insert(u);
+    }
 }
 
 #[cfg(test)]
@@ -630,6 +798,78 @@ mod tests {
         assert_eq!(f.reduction, "−5 M GB-s a month (−79 %)");
         assert_eq!(f.recommendation, "Set the memory to 640 MB");
         assert_eq!(f.impact, Impact::High);
+        assert_eq!(f.kind, "memory");
         assert!(memory_finding(&used(1024, 900.0, 950.0)).is_none());
+    }
+
+    #[test]
+    fn analyses_are_kept_per_environment_and_checked_when_read() {
+        let dir = std::env::temp_dir().join(format!("dcli-lambda-memory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("lambda-memory-prod.json");
+        let now = 1_793_000_000.0;
+        let a = MemoryUse { function: "a".into(), at: now - 86_400.0, ..used(3008, 410.0, 420.0) };
+        let b = MemoryUse { function: "b".into(), at: now - 86_400.0, ..used(1024, 200.0, 220.0) };
+        keep_at(&path, "prod", &[a.clone(), b.clone()], now).unwrap();
+        // A later analysis of `a` replaces it; `b` stays.
+        let a2 = MemoryUse { p99_mb: 500.0, at: now, ..a.clone() };
+        keep_at(&path, "prod", std::slice::from_ref(&a2), now).unwrap();
+        assert_eq!(kept_at(&path, "prod", now), [a2.clone(), b.clone()]);
+        assert!(kept_at(&path, "dev", now).is_empty(), "another environment's file is not read");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // An edited file: bad figures are dropped, memory used never above the memory assigned.
+        let edited = serde_json::json!({ "env": "prod", "uses": [
+            { "function": "c", "memoryMb": 1024, "p99Mb": 9999.0, "maxMb": 9999.0, "samples": 100.0, "invocations": 100.0, "avgBilledMs": 10.0, "days": 7, "at": now },
+            { "function": "d", "memoryMb": 1024, "p99Mb": -1.0, "days": 7, "at": now },
+            { "function": "e\u{1b}[2J", "memoryMb": 1024, "days": 7, "at": now },
+            { "function": "f", "memoryMb": 99999, "days": 7, "at": now },
+            { "function": "g", "memoryMb": 1024, "days": 7, "at": now + 9e9 },
+        ]});
+        std::fs::write(&path, edited.to_string()).unwrap();
+        let read = kept_at(&path, "prod", now);
+        assert_eq!(read.iter().map(|u| u.function.as_str()).collect::<Vec<_>>(), ["c"]);
+        assert_eq!((read[0].p99_mb, read[0].max_mb), (1024.0, 1024.0));
+        // A file that cannot be read is never written over.
+        std::fs::write(&path, "not json").unwrap();
+        assert!(keep_at(&path, "prod", &[a], now).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_analyses_make_findings_while_they_still_hold() {
+        let now = 1_793_000_000.0;
+        let day = 86_400.0;
+        let fresh = MemoryUse { function: "a".into(), at: now - 2.0 * day, ..used(3008, 410.0, 420.0) };
+        let old = MemoryUse { function: "b".into(), at: now - 40.0 * day, ..used(3008, 410.0, 420.0) };
+        let resized = MemoryUse { function: "c".into(), at: now - day, ..used(3008, 410.0, 420.0) };
+        let moved = MemoryUse { function: "d".into(), at: now - day, ..used(3008, 410.0, 420.0) };
+        let functions =
+            [function("a", 3008, "x86_64", 30), function("b", 3008, "x86_64", 30), function("c", 1024, "x86_64", 30), function("d", 3008, "arm64", 30)];
+        let still = fresh_kept(&[fresh, old, resized, moved], &functions, now);
+        assert_eq!(still.iter().map(|u| u.function.as_str()).collect::<Vec<_>>(), ["a"], "not too old, same memory and architecture");
+        let found = kept_findings(&still);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].evidence.iter().any(|e| e == "from the memory analysis of 2026-10-24 (Logs Insights)"), "{:?}", found[0].evidence);
+    }
+
+    #[test]
+    fn estimates_keep_each_function_s_share() {
+        let e = Estimate {
+            functions: vec![function("a", 128, "x86_64", 3), function("b", 128, "x86_64", 3), function("c", 128, "x86_64", 3)],
+            per_function: vec![10.0, 30.0, 60.0],
+            bytes: 100.0,
+            days: 2,
+            daily: vec![40.0, 60.0],
+            ..Default::default()
+        };
+        let only = e.only(&["c".to_string(), "a".to_string(), "zz".to_string()]);
+        assert_eq!(only.functions.iter().map(|f| f.function_name.as_str()).collect::<Vec<_>>(), ["c", "a"]);
+        assert_eq!((only.bytes, only.per_function.clone()), (70.0, vec![60.0, 10.0]));
+        assert_eq!(only.daily, [28.0, 42.0]);
     }
 }

@@ -314,7 +314,10 @@ impl Savings {
     /// Merges scan and memory findings and applies the filters, keeping the selection.
     fn rebuild(&mut self) {
         let keep = self.selected().map(key_of);
-        self.all = self.found.iter().chain(&self.memory_found).cloned().collect();
+        // A scan brings the memory findings of kept analyses; one run since replaces those of
+        // its functions.
+        let replaced = |f: &&Finding| f.kind == "memory" && self.memory_found.iter().any(|m| m.target == f.target);
+        self.all = self.found.iter().filter(|f| !replaced(f)).chain(&self.memory_found).cloned().collect();
         savings::sort(&mut self.all);
         let query = self.filter.value.trim().to_lowercase();
         self.rows = (0..self.all.len())
@@ -491,10 +494,10 @@ impl Savings {
         let Some(Dialog::Memory { estimate, form }) = self.dialog.take() else { return };
         let estimate = chosen_estimate(&form, &estimate);
         self.memory = MemoryState::Running(0, estimate.functions.len());
-        let aws = ctx.env().aws.clone();
+        let (aws, env) = (ctx.env().aws.clone(), self.env_name.clone());
         ctx.toast(Level::Info, format!("Analysing memory: {}", estimate.describe()));
         ctx.spawn_stream(move |em: Emitter<Msg>| {
-            let result = memory::memory_analysis(&aws, &estimate, &|done, total| {
+            let result = memory::memory_analysis(&aws, &env, &estimate, &|done, total| {
                 em.emit(Msg::MemoryProgress(done, total));
             });
             em.emit(Msg::Memory(result));

@@ -8,13 +8,18 @@
 //! protocol goes to stdout; notes for a person go to stderr.
 //!
 //! It never signs in, opens a browser or reads Cost Explorer (which bills each request): an
-//! expired session or missing costs come back as a message asking the user to act.
+//! expired session or missing costs come back as a message asking the user to act. Logs
+//! Insights (billed by the data it scans) runs only for `lambda_memory`, within the GB the user
+//! allows with `--insights-gb` and `--insights-gb-month`.
 
+mod memory;
 mod prompt;
 mod tools;
+mod usage;
 
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +50,13 @@ pub struct Args {
     /// Only these environments (repeat or separate with commas); default: all of them
     #[arg(long = "env", value_delimiter = ',', value_name = "ENV")]
     envs: Vec<String>,
+    /// GB one Lambda memory analysis may scan with Logs Insights (billed by the data it scans);
+    /// 0, the default, keeps the lambda_memory tool off
+    #[arg(long = "insights-gb", value_name = "GB", default_value_t = 0)]
+    insights_gb: u32,
+    /// GB those analyses may scan in a month in all (default: 3 × --insights-gb)
+    #[arg(long = "insights-gb-month", value_name = "GB")]
+    insights_gb_month: Option<u32>,
 }
 
 pub fn serve(loaded: &Loaded, args: Args) -> Result<ExitCode> {
@@ -58,7 +70,9 @@ pub fn serve(loaded: &Loaded, args: Args) -> Result<ExitCode> {
             crate::util::program()
         );
     }
-    let server = Server::new(loaded.config.clone(), args.envs, Store::home());
+    let per_run = f64::from(args.insights_gb);
+    let per_month = args.insights_gb_month.map_or(3.0 * per_run, f64::from);
+    let server = Server::new(loaded.config.clone(), args.envs, Store::home()).with_insights(per_run, per_month, usage::path());
     serve_io(&server, std::io::stdin().lock(), std::io::stdout());
     Ok(ExitCode::SUCCESS)
 }
@@ -79,6 +93,17 @@ pub struct Server {
     clients: Mutex<HashMap<String, Arc<Aws>>>,
     /// The costs last read for an environment ([`crate::costs::cached`]; tests give their own).
     costs: CostsOf,
+    /// What Logs Insights may scan for `lambda_memory`.
+    insights: Insights,
+}
+
+/// What Logs Insights may scan for `lambda_memory`, in bytes: per analysis (0: the tool is off)
+/// and per month, counted in `usage` ([`usage::path`]).
+#[derive(Debug, Clone, Default)]
+pub struct Insights {
+    pub per_run: f64,
+    pub per_month: f64,
+    pub usage: Option<PathBuf>,
 }
 
 impl Server {
@@ -90,7 +115,16 @@ impl Server {
             author: Mutex::new("an MCP client".into()),
             clients: Mutex::new(HashMap::new()),
             costs: Box::new(crate::costs::cached),
+            insights: Insights::default(),
         }
+    }
+
+    /// Lets `lambda_memory` scan up to `per_run_gb` GB an analysis and `per_month_gb` a month,
+    /// counted in the file `usage`.
+    pub fn with_insights(mut self, per_run_gb: f64, per_month_gb: f64, usage: Option<PathBuf>) -> Server {
+        let gb = crate::savings::GB;
+        self.insights = Insights { per_run: per_run_gb.max(0.0) * gb, per_month: per_month_gb.max(0.0) * gb, usage };
+        self
     }
 
     /// The environments it may read, in the config's order.

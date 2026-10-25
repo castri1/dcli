@@ -106,12 +106,14 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
                 eprintln!("{}", paint(&format!("  {} functions share a log group and are left out", estimate.shared.len()), "90"));
             }
             if args.yes || confirm("Run it?") {
-                let run = memory::memory_analysis(&aws, &estimate, &|done, total| {
+                let run = memory::memory_analysis(&aws, &env_name, &estimate, &|done, total| {
                     if progress && done < total {
                         eprintln!("  {}", paint(&format!("reading log groups {}–{} of {total}…", done + 1, (done + 50).min(total)), "90"));
                     }
                 })?;
                 eprintln!("Lambda memory: {} functions read · {} scanned.", run.uses.len(), size(run.bytes_scanned));
+                // The scan brought the findings of kept analyses: this one replaces its functions'.
+                outcome.findings.retain(|f| !(f.kind == "memory" && run.uses.iter().any(|u| u.function == f.target)));
                 outcome.findings.extend(run.uses.iter().filter_map(memory::memory_finding).map(|f| Finding { service: "Lambda", ..f }));
                 outcome.priced_at = savings::price_with_costs(&mut outcome.findings, &env_name, &aws.region);
                 savings::sort(&mut outcome.findings);
