@@ -16,7 +16,9 @@ try {
   binary = path.join(path.dirname(require.resolve(`${pkg}/package.json`)), "bin", exe);
 } catch {
   console.error(`dcli: no prebuilt binary for ${process.platform}-${process.arch} (${pkg} is not installed).`);
-  console.error("Reinstall without --omit=optional, or use the installer: https://github.com/castri1/dcli#install");
+  // npm skips an optional dependency it cannot unpack (a damaged cache entry, say) without a word.
+  console.error("Reinstall: npm cache verify && npm install -g @castri1/dcli --prefer-online");
+  console.error("(not with --omit=optional), or use the installer: https://github.com/castri1/dcli#install");
   process.exit(1);
 }
 
