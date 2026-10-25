@@ -39,7 +39,13 @@ pub fn list() -> Value {
     })
 }
 
-/// `prompts/get`: the prompt with its arguments, or why it cannot be given.
+/// Whether a prompt of that name exists.
+pub fn exists(name: &str) -> bool {
+    name == "audit"
+}
+
+/// `prompts/get`: the prompt with its arguments (`env` already checked against the config),
+/// or why it cannot be given.
 pub fn get(name: &str, args: &Value) -> Result<Value, String> {
     if name != "audit" {
         return Err(format!("unknown prompt: {name}"));

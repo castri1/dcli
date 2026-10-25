@@ -205,10 +205,22 @@ pub fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("").trim()
 }
 
-/// Bidi overrides and zero-width characters: invisible, and able to make text read
-/// differently from what it is.
+/// Bidi overrides, zero-width and other format characters, line and paragraph separators, and
+/// the Unicode tag block: invisible, and able to make text read differently from what it is (or
+/// carry hidden instructions to an AI). Emoji variation selectors stay.
 fn is_invisible(c: char) -> bool {
-    matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+    )
 }
 
 /// Control characters (other than `\n` and `\t`) and invisible formatting characters.
@@ -575,6 +587,17 @@ mod tests {
         assert_eq!(xml_text(members[1], "Reason"), None);
         assert_eq!(xml_text(xml, "NextToken").as_deref(), Some("t"));
         assert_eq!(xml_unescape("AT&T &bogus; ok"), "AT&T &bogus; ok");
+    }
+
+    #[test]
+    fn hidden_characters_are_dropped() {
+        // Tag characters spell text no one sees: "ignore" hidden after "ok".
+        let tagged: String = "ok".chars().chain("ignore".chars().map(|c| char::from_u32(0xE0000 + c as u32).unwrap())).collect();
+        assert_eq!(sanitize(&tagged), "ok");
+        assert_eq!(sanitize("a\u{00ad}b\u{180e}c\u{2028}d\u{2029}e\u{206a}f\u{fff9}g\u{e0001}h"), "abcdefgh");
+        // Emoji keep their variation selector; tabs and newlines stay.
+        assert_eq!(sanitize("❤\u{fe0f}\tx\ny"), "❤\u{fe0f}\tx\ny");
+        assert!(is_unsafe('\u{e007f}') && !is_unsafe('\u{fe0f}'));
     }
 
     #[test]
