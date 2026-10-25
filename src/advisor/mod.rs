@@ -243,14 +243,18 @@ impl Recommendation {
         self.resources.first()
     }
 
-    /// Prices its changes again with `costs` when those are newer than its last pricing;
-    /// true when it changed.
+    /// Prices its changes again with `costs`, the latest reading (and the way this version of
+    /// dcli prices); true when the figure changed.
     pub fn reprice(&mut self, costs: Option<&Snapshot>) -> bool {
         let Some(s) = costs else { return false };
-        if self.cost.changes.is_empty() || self.cost.bill.as_ref().is_some_and(|b| b.priced_at >= s.read_at) {
+        if self.cost.changes.is_empty() {
             return false;
         }
-        self.cost.bill = Some(estimate::estimate(&self.cost.changes, s, &self.region));
+        let fresh = estimate::estimate(&self.cost.changes, s, &self.region);
+        if self.cost.bill.as_ref() == Some(&fresh) {
+            return false;
+        }
+        self.cost.bill = Some(fresh);
         true
     }
 }
