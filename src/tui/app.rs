@@ -118,6 +118,7 @@ impl App {
                 generation: 0,
                 toasts: Vec::new(),
                 jump: None,
+                intent: None,
                 switch_env: None,
                 login: None,
             },
@@ -223,6 +224,7 @@ impl App {
             self.select_module(i);
             self.with_module(i, |m, ctx| m.open(&target, ctx));
         }
+        self.shared.intent = None;
         if let Some(profile) = self.shared.login.take() {
             self.start_login_for(profile);
         }

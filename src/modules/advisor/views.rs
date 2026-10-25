@@ -230,7 +230,7 @@ impl Advisor {
         } else if !r.cost.changes.is_empty() && self.costs.is_none() {
             lines.push(widgets::kv("", Span::styled("the Costs module (r there) reads the bill that prices it", theme::muted()), KW));
         }
-        if let Some(c) = &r.cost.claude {
+        if let Some(c) = r.cost.claude_counted() {
             let mut first = true;
             for l in sanitize(&c.reasoning).lines() {
                 let label = if first { "Claude's estimate: " } else { "" };

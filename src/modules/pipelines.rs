@@ -1837,10 +1837,10 @@ impl Module for Pipelines {
         self.list_state.select(Some(0));
     }
 
-    /// Selects pipeline `target` (from the matrix, say), or promotes / rolls it back when
-    /// the target is an [`Intent`].
+    /// Selects pipeline `target`, or promotes / rolls it back when the matrix handed over an
+    /// [`Intent`] with the jump ([`Ctx::jump_intent`]).
     fn open(&mut self, target: &str, ctx: &mut Ctx) {
-        if let Some(intent) = Intent::decode(target) {
+        if let Some(intent) = ctx.take_intent() {
             return self.plan(intent, ctx);
         }
         if let Some(i) = self.rows.iter().position(|r| r.name() == target) {

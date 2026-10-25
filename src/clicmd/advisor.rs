@@ -97,7 +97,7 @@ fn decide(store: &Store, env: &str, id: &str, state: State, reason: &str, json: 
         (State::Done, State::Dismissed) => bail!("{} is done: --restore {} puts it back to pending first", current.id, current.id),
         _ => {}
     }
-    let r = advisor::decide(store, env, id, state, reason).map_err(|e| anyhow!(e))?;
+    let r = advisor::decide(store, env, id, state, reason, None).map_err(|e| anyhow!(e))?;
     if json {
         print_json(&json!(r));
         return Ok(ExitCode::SUCCESS);

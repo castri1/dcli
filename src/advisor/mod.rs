@@ -24,8 +24,9 @@ use crate::costs::{self, Snapshot, ledger};
 use crate::savings::price;
 use crate::util::{md_block, md_code, now_secs, sanitize};
 
-/// Recommendations kept per environment, at most.
-pub const MAX_PER_ENV: u32 = 500;
+/// Pending recommendations per environment, at most, and recommendations kept in all.
+pub const MAX_PENDING: usize = 500;
+pub const MAX_KEPT: usize = 5000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -143,10 +144,17 @@ pub struct Cost {
 }
 
 impl Cost {
+    /// Claude's figure when it counts: it is for what the bill cannot price, so once the bill
+    /// prices every change (newer costs read) it is left out rather than counted twice.
+    pub fn claude_counted(&self) -> Option<&ClaudeEstimate> {
+        let bill_prices_all = !self.changes.is_empty() && self.bill.as_ref().is_some_and(|b| b.priced() && b.unpriced.is_empty());
+        self.claude.as_ref().filter(|_| !bill_prices_all)
+    }
+
     /// A month, from the bill and Claude's figure together: positive saves.
     pub fn monthly(&self) -> Option<f64> {
         let bill = self.bill.as_ref().filter(|b| b.priced()).map(|b| b.monthly);
-        let claude = self.claude.as_ref().map(|c| c.monthly);
+        let claude = self.claude_counted().map(|c| c.monthly);
         match (bill, claude) {
             (None, None) => None,
             (b, c) => Some(b.unwrap_or(0.0) + c.unwrap_or(0.0)),
@@ -155,7 +163,7 @@ impl Cost {
 
     /// Whether the whole figure comes from the bill.
     pub fn all_from_bill(&self) -> bool {
-        self.claude.is_none() && self.bill.as_ref().is_some_and(|b| b.priced() && b.unpriced.is_empty())
+        self.claude_counted().is_none() && self.bill.as_ref().is_some_and(|b| b.priced() && b.unpriced.is_empty())
     }
 
     pub fn currency(&self) -> &str {
@@ -179,7 +187,7 @@ impl Cost {
     /// estimate`, or why there is none.
     pub fn source(&self) -> String {
         let bill = self.bill.as_ref().is_some_and(estimate::Estimate::priced);
-        match (bill, self.claude.is_some(), &self.none) {
+        match (bill, self.claude_counted().is_some(), &self.none) {
             (true, true, _) => "your bill and Claude's estimate".into(),
             (true, false, _) => "your bill".into(),
             (false, true, _) => "Claude's estimate".into(),
@@ -337,9 +345,13 @@ impl Draft {
             .resources
             .iter()
             .map(|r| {
+                let target = line(&r.target, 2048, "resources.target", false)?;
+                if target.starts_with(['{', '[']) {
+                    return Err("`resources.target` is the resource's name or id as its dcli module opens it, not JSON".to_string());
+                }
                 Ok(ResourceRef {
                     module: line(&r.module, 40, "resources.module", false)?,
-                    target: line(&r.target, 2048, "resources.target", false)?,
+                    target,
                     name: line(&r.name, 300, "resources.name", true)?,
                 })
             })
@@ -436,6 +448,9 @@ pub fn submit(store: &Store, draft: &Draft, origin: &Origin, costs: Option<&Snap
             _ => {}
         }
     }
+    if d.cost.claude_estimate.is_some() && bill.as_ref().is_some_and(|b| b.priced() && b.unpriced.is_empty()) {
+        return Err("the bill prices every change: leave out `claudeEstimate`, which is only for what the bill cannot price (it would count twice)".into());
+    }
     let now = now_secs();
     let content = |r: &mut Recommendation| {
         r.category = d.category;
@@ -457,6 +472,8 @@ pub fn submit(store: &Store, draft: &Draft, origin: &Origin, costs: Option<&Snap
             r.account = origin.account.to_string();
         }
     };
+    // Claude and the user (the UI, another command) may write at the same moment.
+    let _lock = store.lock(origin.env).map_err(|e| format!("cannot save the recommendation: {e}"))?;
     let existing = store.list(origin.env);
     if let Some(id) = d.id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
         let Some(mut r) = existing.into_iter().find(|r| r.id.eq_ignore_ascii_case(id)) else {
@@ -480,17 +497,35 @@ pub fn submit(store: &Store, draft: &Draft, origin: &Origin, costs: Option<&Snap
         store.save(&r).map_err(|e| format!("cannot save {}: {e}", r.id))?;
         return Ok(r);
     }
-    let key = |title: &str| title.to_lowercase();
+    // The same recommendation: the same title, or the same changes to the bill, on the same
+    // resources. What the user dismissed or made stays decided.
+    let changes = |c: &[estimate::Change]| {
+        let mut keys: Vec<String> = c.iter().map(|c| format!("{}|{}|{:?}|{:?}", c.service, c.usage_type, c.effect, c.to)).collect();
+        keys.sort();
+        keys
+    };
     let same = |r: &Recommendation| {
-        r.state == State::Pending
-            && key(&r.title) == key(&d.title)
-            && r.resources.iter().map(|x| &x.name).eq(d.resources.iter().map(|x| &x.name))
+        r.state != State::Withdrawn
+            && r.resources.iter().map(|x| x.name.to_lowercase()).eq(d.resources.iter().map(|x| x.name.to_lowercase()))
+            && (r.title.to_lowercase() == d.title.to_lowercase()
+                || (!d.cost.changes.is_empty() && changes(&r.cost.changes) == changes(&d.cost.changes)))
     };
     if let Some(r) = existing.iter().find(|r| same(r)) {
-        return Err(format!("{} already recommends this: pass `id: \"{}\"` to change it", r.id, r.id));
+        return Err(match r.state {
+            State::Dismissed => format!(
+                "the user dismissed this as {} ({}): do not propose it again; if something changed, say what in a recommendation that differs",
+                r.id,
+                if r.state_note.is_empty() { "no reason given" } else { &r.state_note }
+            ),
+            State::Done => format!("the user already made this ({}): write a new one only for a further change", r.id),
+            _ => format!("{} already recommends this: pass `id: \"{}\"` to change it", r.id, r.id),
+        });
     }
-    if existing.len() >= MAX_PER_ENV as usize {
-        return Err(format!("'{}' has {MAX_PER_ENV} recommendations: withdraw old ones first", origin.env));
+    if existing.iter().filter(|r| r.state == State::Pending).count() >= MAX_PENDING {
+        return Err(format!("'{}' has {MAX_PENDING} pending recommendations: withdraw the ones no longer true first", origin.env));
+    }
+    if existing.len() >= MAX_KEPT {
+        return Err(format!("'{}' keeps {MAX_KEPT} recommendations: the user has to delete old ones in {}", origin.env, store.dir(origin.env).display()));
     }
     let mut r = Recommendation {
         env: origin.env.to_string(),
@@ -508,6 +543,7 @@ pub fn submit(store: &Store, draft: &Draft, origin: &Origin, costs: Option<&Snap
 /// Claude takes back a pending recommendation of `env` (no longer true, replaced).
 pub fn withdraw(store: &Store, env: &str, id: &str, reason: &str) -> Result<Recommendation, String> {
     let reason = line(reason, 500, "reason", true)?;
+    let _lock = store.lock(env).map_err(|e| format!("cannot save {id}: {e}"))?;
     let mut r = store.get(env, id).ok_or_else(|| format!("'{env}' has no recommendation {id}"))?;
     if r.state != State::Pending {
         return Err(format!("{} is {} already", r.id, r.state.label()));
@@ -520,9 +556,14 @@ pub fn withdraw(store: &Store, env: &str, id: &str, reason: &str) -> Result<Reco
 }
 
 /// The user's decision on a recommendation: done (recorded in the savings ledger when it changes
-/// the bill's usage), dismissed with a reason, or pending again.
-pub fn decide(store: &Store, env: &str, id: &str, state: State, note: &str) -> Result<Recommendation, String> {
+/// the bill's usage), dismissed with a reason, or pending again. `seen` is when the version the
+/// user decided on was written: if Claude rewrote it since, nothing is decided.
+pub fn decide(store: &Store, env: &str, id: &str, state: State, note: &str, seen: Option<f64>) -> Result<Recommendation, String> {
+    let _lock = store.lock(env).map_err(|e| format!("cannot save {id}: {e}"))?;
     let mut r = store.get(env, id).ok_or_else(|| format!("'{env}' has no recommendation {id}"))?;
+    if seen.is_some_and(|t| t != r.updated) {
+        return Err(format!("Claude changed {} after you opened it: look at it again", r.id));
+    }
     r.state = state;
     r.state_note = line(note, 500, "note", false)?;
     r.state_at = now_secs();
@@ -548,10 +589,22 @@ pub fn decide(store: &Store, env: &str, id: &str, state: State, note: &str) -> R
     Ok(r)
 }
 
-/// The savings ledger entry of a recommendation made: only when it names the bill's usage, so the
-/// bill can tell whether it saved.
+/// What the lines of `service` save a month.
+fn service_saving(b: &estimate::Estimate, service: &str) -> f64 {
+    b.lines.iter().filter(|l| l.change.service == service).map(|l| l.monthly).fold(0.0, |a, v| a + v)
+}
+
+/// The savings ledger entry of a recommendation made: only when it names the bill's usage and
+/// saves on it, so the bill can tell whether it did (one service: the ledger follows one).
 pub fn ledger_entry(r: &Recommendation) -> Option<ledger::Entry> {
     let first = r.cost.changes.first()?;
+    let saves = match r.cost.bill.as_ref().filter(|b| b.priced()) {
+        Some(b) => service_saving(b, &first.service) > 0.0,
+        None => r.cost.claude_counted().is_some_and(|c| c.monthly > 0.0),
+    };
+    if !saves {
+        return None;
+    }
     let mut usage: Vec<String> = Vec::new();
     for c in r.cost.changes.iter().filter(|c| c.service == first.service) {
         for u in std::iter::once(&c.usage_type).chain(&c.to) {
@@ -561,7 +614,7 @@ pub fn ledger_entry(r: &Recommendation) -> Option<ledger::Entry> {
         }
     }
     let bill = r.cost.bill.as_ref().filter(|b| b.priced());
-    let expected = bill.filter(|b| !b.at_most && b.monthly > 0.0 && r.cost.claude.is_none()).map(|b| b.monthly);
+    let expected = bill.filter(|b| !b.at_most && r.cost.claude_counted().is_none()).map(|b| service_saving(b, &first.service)).filter(|v| *v > 0.0);
     let resource = r.resource().cloned().unwrap_or_default();
     Some(ledger::entry_for_usage(
         &r.env,
@@ -630,11 +683,50 @@ impl Store {
         crate::platform::write_private(&path, (serde_json::to_string_pretty(r).unwrap_or_default() + "\n").as_bytes())
     }
 
+    /// The folder of `env`, made private (recommendations describe the account).
+    fn make_dir(&self, env: &str) -> std::io::Result<PathBuf> {
+        let dir = self.dir(env);
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in [&self.root, &dir] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Ok(dir)
+    }
+
+    /// One writer at a time for `env`, across processes (the MCP server, the UI, `dcli
+    /// advisor`): a lock file made exclusively, removed when the returned guard goes. A lock
+    /// left by a writer that died is taken over after 10 s.
+    pub fn lock(&self, env: &str) -> std::io::Result<Lock> {
+        use std::time::{Duration, Instant};
+        let path = self.make_dir(env)?.join(".lock");
+        let start = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(Lock { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                    if age.is_some_and(|a| a > Duration::from_secs(10)) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(std::io::Error::other("another dcli is writing recommendations: try again"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Keeps `r` as a new recommendation, giving it the next free number of its environment.
     pub fn create(&self, r: &mut Recommendation) -> std::io::Result<()> {
         use std::io::Write as _;
-        let dir = self.dir(&r.env);
-        std::fs::create_dir_all(&dir)?;
+        let dir = self.make_dir(&r.env)?;
         let mut n = self.list(&r.env).last().map_or(0, Recommendation::number) + 1;
         for _ in 0..50 {
             r.id = format!("R{n}");
@@ -668,6 +760,8 @@ impl Store {
         };
         let mut files: Vec<(String, u64, u64)> = entries
             .flatten()
+            // Not the lock or files being written.
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .filter_map(|e| {
                 let meta = e.metadata().ok()?;
                 let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64;
@@ -699,6 +793,10 @@ fn cleaned(mut r: Recommendation) -> Recommendation {
     r.evidence.iter_mut().for_each(one_line);
     for x in &mut r.resources {
         [&mut x.module, &mut x.target, &mut x.name].into_iter().for_each(one_line);
+        // A target opens a resource by name, never anything else.
+        if x.target.starts_with(['{', '[']) {
+            x.target.clear();
+        }
     }
     for step in &mut r.steps {
         text(&mut step.text);
@@ -753,6 +851,17 @@ fn cleaned(mut r: Recommendation) -> Recommendation {
     r
 }
 
+/// Held while recommendations of an environment are written ([`Store::lock`]).
+pub struct Lock {
+    path: PathBuf,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// `7` for `R7` (or `r7`); `None` for anything else.
 pub fn number(id: &str) -> Option<u32> {
     let digits = id.strip_prefix(['R', 'r'])?;
@@ -794,6 +903,10 @@ pub fn writes(command: &str) -> bool {
                 }
             }
             let (Some(service), Some(op)) = (positional.first(), positional.get(1)) else { return true };
+            // Cost Explorer bills every request.
+            if *service == "ce" {
+                return true;
+            }
             let reading = op.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
                 && (["describe-", "get-", "list-", "search-", "lookup-", "filter-", "batch-get-"].iter().any(|p| op.starts_with(p))
                     || ["help", "wait", "tail", "ls", "query", "scan"].contains(op));
@@ -831,13 +944,25 @@ pub fn writes(command: &str) -> bool {
             false
         }
         Some("dcli") => {
-            let writing = ["deploy", "approve", "stop", "promote", "rollback", "update", "add", "remove", "rm", "use", "login"];
-            // Flags that only choose what to read; any other may act.
+            // Read-only only when it is a command that reads, with no word that acts (several
+            // commands take a verb: `dcli s3 get`, `dcli sqs redrive`) and only options that
+            // choose what to read. Anything else may act, or bill (Logs Insights, Cost Explorer).
+            let commands = [
+                "status", "history", "list", "matrix", "logs", "tail", "report", "optimize", "costs", "advisor", "alarms", "approvals",
+                "lambda", "apigw", "aurora", "redshift", "dms", "cfn", "s3", "sfn", "sqs", "ddb", "events", "flags", "param", "secret",
+            ];
+            let acting = [
+                "get", "put", "set", "download", "presign", "redrive", "start", "stop", "invoke", "delete", "purge", "send", "test",
+                "resume", "reload", "pause", "resize", "failover", "reboot", "snapshot", "scale", "cancel", "deploy", "promote",
+                "rollback", "approve", "reject", "run", "export", "apply", "verify", "refresh", "setup", "done", "dismiss", "restore",
+                "update", "add", "remove", "rm", "use", "login", "query", "insights",
+            ];
             let reading = [
                 "--json", "--since", "--filter", "--follow", "-f", "--full", "--days", "--service", "--report", "--md", "--by-cost",
                 "--ledger", "--limit", "-n", "--range", "--usage", "--daily", "--commitments", "--config", "--all", "--help", "-h",
             ];
-            words.get(1).is_some_and(|w| writing.contains(&w.as_str()))
+            !words.get(1).is_some_and(|w| commands.contains(&w.as_str()))
+                || words.iter().skip(1).any(|w| acting.contains(&w.as_str()))
                 || words.iter().skip(1).any(|w| w.starts_with('-') && !reading.contains(&w.split('=').next().unwrap_or(w)))
         }
         _ => true,
@@ -847,6 +972,8 @@ pub fn writes(command: &str) -> bool {
 /// A recommendation as Markdown: to copy into a ticket, or for `dcli advisor --md`. Claude's text
 /// is kept as written; commands go in code blocks.
 pub fn markdown(r: &Recommendation) -> String {
+    // Claude's text goes in as written, but an image would load its URL wherever it is pasted.
+    let r = &without_images(r);
     let mut md = String::new();
     let _ = writeln!(md, "## {} · {}\n", r.id, r.title);
     let account = if r.account.is_empty() { String::new() } else { format!(", account {}", md_code(&r.account)) };
@@ -870,7 +997,7 @@ pub fn markdown(r: &Recommendation) -> String {
             let _ = writeln!(md, "- {n}");
         }
     }
-    if let Some(c) = &r.cost.claude {
+    if let Some(c) = r.cost.claude_counted() {
         let _ = writeln!(md, "- Claude's estimate: {}", c.reasoning);
     }
     md.push('\n');
@@ -920,6 +1047,28 @@ pub fn markdown(r: &Recommendation) -> String {
     md
 }
 
+/// `r` with `![` written `!\[` in its text, so Markdown shows no image.
+fn without_images(r: &Recommendation) -> Recommendation {
+    let mut r = r.clone();
+    let plain = |t: &mut String| {
+        if t.contains("![") {
+            *t = t.replace("![", "!\\[");
+        }
+    };
+    for t in [&mut r.title, &mut r.finding, &mut r.risk_note, &mut r.rollback, &mut r.verify, &mut r.performance, &mut r.state_note] {
+        plain(t);
+    }
+    r.evidence.iter_mut().for_each(plain);
+    r.steps.iter_mut().for_each(|s| plain(&mut s.text));
+    if let Some(c) = &mut r.cost.claude {
+        plain(&mut c.reasoning);
+    }
+    if let Some(n) = &mut r.cost.none {
+        plain(n);
+    }
+    r
+}
+
 /// `saves ≈ US$ 412 a month (your bill)`.
 pub fn cost_line(c: &Cost) -> String {
     match cost_figure(c) {
@@ -932,7 +1081,7 @@ pub fn cost_line(c: &Cost) -> String {
 /// without a figure; [`Cost::source`] says where it comes from.
 pub fn cost_figure(c: &Cost) -> Option<String> {
     let m = c.monthly()?;
-    Some(match c.bill.as_ref().filter(|b| b.priced() && c.claude.is_none()) {
+    Some(match c.bill.as_ref().filter(|b| b.priced() && c.claude_counted().is_none()) {
         Some(b) => b.describe(),
         None if m < 0.0 => format!("costs ≈ {} more a month", price::money(-m, c.currency())),
         None => format!("saves ≈ {} a month", price::money(m, c.currency())),
@@ -1028,6 +1177,11 @@ mod tests {
         assert!(writes("aws --endpoint-url http://evil lambda get-function --function-name x"));
         assert!(writes("aws lambda get-function --function-name x extra"));
         assert!(writes("aws"));
+        assert!(writes("aws ce get-cost-and-usage --time-period Start=2026-10-01,End=2026-10-25 --granularity MONTHLY --metrics AmortizedCost"));
+        assert!(writes("dcli s3 get prod my-bucket key"));
+        assert!(writes("dcli sqs prod orders-dlq redrive"));
+        assert!(writes("dcli insights prod /aws/lambda/x"));
+        assert!(writes("dcli frobnicate prod"));
         assert!(writes("aws s3api get-object --bucket b --key k --no-paginate out.txt"));
         assert!(writes("aws glacier get-job-output --account-id - --vault-name v --job-id j out"));
         assert!(writes("aws lambda get-function --function-name x --debug out"));
@@ -1071,10 +1225,15 @@ mod tests {
         assert_eq!(submit(&store, &again, &origin, Some(&costs)).unwrap().finding, "Uses 400 of 3008 MB");
         let mut other = draft();
         other.title = "Move orders-api to arm64".into();
+        // Another title for the same change to the bill is the same recommendation.
+        assert!(submit(&store, &other, &origin, Some(&costs)).unwrap_err().contains("R1 already recommends this"));
+        other.cost.changes.clear();
+        other.cost.claude_estimate = Some(ClaudeEstimate { monthly: 10.0, reasoning: "arm64 costs 20 % less".into() });
         assert_eq!(submit(&store, &other, &origin, Some(&costs)).unwrap().id, "R2");
         assert_eq!(store.list("prod.eu").iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["R1", "R2"]);
         // The user's decision stands.
-        decide(&store, "prod.eu", "R1", State::Dismissed, "we need the headroom").unwrap();
+        assert!(decide(&store, "prod.eu", "R1", State::Dismissed, "x", Some(1.0)).unwrap_err().contains("look at it again"));
+        decide(&store, "prod.eu", "R1", State::Dismissed, "we need the headroom", None).unwrap();
         assert!(submit(&store, &again, &origin, Some(&costs)).unwrap_err().contains("we need the headroom"));
         assert!(withdraw(&store, "prod.eu", "R1", "x").unwrap_err().contains("dismissed already"));
         assert_eq!(withdraw(&store, "prod.eu", "R2", "replaced").unwrap().state, State::Withdrawn);

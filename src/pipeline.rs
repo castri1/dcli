@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
 
 use crate::aws::codepipeline::{self as cp, ActionDeclaration, ActionExecutionDetail, ExecutionSummary, PipelineState};
 use crate::aws::{self, Aws};
@@ -421,10 +420,10 @@ pub fn stage_averages(details: &[ActionExecutionDetail]) -> HashMap<String, f64>
 
 // ---- promote, rollback, approvals waiting ---------------------------------------------
 
-/// What another module (the matrix) asks Pipelines to do with a pipeline it opens: the
-/// target of `Ctx::jump`, as JSON. A plain pipeline name only selects it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "do", rename_all = "lowercase")]
+/// What another module (the matrix) asks Pipelines to do with a pipeline it opens, handed over
+/// with `Ctx::jump_intent`: never read from a jump's text, which can come from anywhere (a
+/// recommendation Claude wrote, a resource's name).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
     /// Deploy `revision` of `source_action`, which `from_env` runs (`summary` describes it),
     /// to the pipeline; `behind`: how many deploys that moves it forward, when known.
@@ -438,14 +437,6 @@ impl Intent {
         match self {
             Intent::Promote { pipeline, .. } | Intent::Rollback { pipeline } => pipeline,
         }
-    }
-
-    pub fn encode(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-
-    pub fn decode(target: &str) -> Option<Intent> {
-        target.starts_with('{').then(|| serde_json::from_str(target).ok()).flatten()
     }
 }
 
@@ -661,17 +652,6 @@ mod tests {
         let targets: Vec<_> = plan.targets.iter().map(|t| revision_of(t, "Source").unwrap()).collect();
         assert_eq!(targets, ["aaa", "999"]);
         assert!(rollback_plan(&history[..2]).is_none());
-
-        let intent = Intent::Promote {
-            pipeline: "app-prod".into(),
-            revision: "ccc".into(),
-            source_action: "Source".into(),
-            from_env: "qa".into(),
-            summary: "ccc \"fix\"".into(),
-            behind: Some(2),
-        };
-        assert_eq!(Intent::decode(&intent.encode()), Some(intent));
-        assert_eq!(Intent::decode("app-prod"), None);
     }
 
     #[test]

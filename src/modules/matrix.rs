@@ -177,7 +177,7 @@ impl Matrix {
         if *env != ctx.env().name {
             ctx.switch_env(env.clone());
         }
-        ctx.jump("Pipelines", intent.encode());
+        ctx.jump_intent(intent);
     }
 
     fn render_cell(&self, row: usize, col: usize, view: &View, width: usize) -> Vec<Span<'static>> {

@@ -167,6 +167,15 @@ pub fn validate(changes: &[Change]) -> Result<(), String> {
     if changes.len() > MAX_CHANGES {
         return Err(format!("at most {MAX_CHANGES} changes"));
     }
+    let key = |c: &Change| {
+        let name = |t: &str| billing::split_region(t.trim()).1.to_string();
+        (c.service.trim().to_string(), name(&c.usage_type), c.effect, c.to.as_deref().map(name))
+    };
+    for (i, c) in changes.iter().enumerate() {
+        if let Some(j) = changes[..i].iter().position(|o| key(o) == key(c)) {
+            return Err(format!("change {} repeats change {}: give each usage change once, with its whole quantity", i + 1, j + 1));
+        }
+    }
     for (i, c) in changes.iter().enumerate() {
         let n = i + 1;
         // Names end up on screen and in Markdown: no escape sequences or hidden characters.
@@ -203,13 +212,46 @@ pub fn estimate(changes: &[Change], s: &Snapshot, region: &str) -> Estimate {
     let currency = if s.currency.is_empty() { "USD".to_string() } else { s.currency.clone() };
     let mut out = Estimate { currency, priced_at: s.read_at, ..Default::default() };
     let (mut added_covered, mut different_units, mut services_later) = (false, Vec::new(), Vec::new());
+    // What each removal or move may still take of a usage type: the bill's monthly quantity.
+    let mut left: Vec<((String, String), f64)> = Vec::new();
     for c in changes {
         let usage = billing::split_region(c.usage_type.trim()).1.to_string();
-        let change = Change { usage_type: usage.clone(), to: c.to.as_ref().map(|t| billing::split_region(t.trim()).1.to_string()), ..c.clone() };
+        let mut change = Change { usage_type: usage.clone(), to: c.to.as_ref().map(|t| billing::split_region(t.trim()).1.to_string()), ..c.clone() };
         let Some((rate, unit, scaled_from)) = rate_of(s, &c.service, &usage, region) else {
             unpriced(&mut out, &usage);
             continue;
         };
+        if c.effect != Effect::Add {
+            // Only usage the bill has can go, and no more of it than it used.
+            if scaled_from.is_some() {
+                out.notes.push(format!("{usage} is not on this bill: there is none of it to remove."));
+                unpriced(&mut out, &usage);
+                continue;
+            }
+            let key = (c.service.clone(), usage.clone());
+            let slot = match left.iter().position(|(k, _)| *k == key) {
+                Some(i) => i,
+                None => {
+                    left.push((key, bill_quantity(s, &c.service, &usage, region)));
+                    left.len() - 1
+                }
+            };
+            let available = left[slot].1;
+            if available <= 0.0 {
+                out.notes.push(format!("{usage}: the other changes already remove all the bill used of it."));
+                continue;
+            }
+            if change.quantity > available {
+                out.notes.push(format!(
+                    "{usage}: the bill used {} {unit} a month, so no more than that is counted (asked: {}).",
+                    crate::savings::qty(available),
+                    crate::savings::qty(change.quantity)
+                ));
+                change.quantity = available;
+            }
+            left[slot].1 -= change.quantity;
+        }
+        let c = &change;
         let covered = s.covered(&c.service).clamp(0.0, 1.0);
         let coverable = price::coverable(&usage);
         // A saving on usage commitments cover is split into now and later below, per service.
@@ -300,6 +342,16 @@ pub fn estimate(changes: &[Change], s: &Snapshot, region: &str) -> Estimate {
         out.notes.push(format!("No cost on this bill for {}: that part is not priced.", out.unpriced.join(", ")));
     }
     out
+}
+
+/// How much of `usage` of `service` the bill shows a month, from the same region(s) its rate
+/// comes from ([`price::rate`]).
+fn bill_quantity(s: &Snapshot, service: &str, usage: &str, region: &str) -> f64 {
+    let all: Vec<&crate::costs::UsageCost> = s.usage.iter().filter(|u| u.service == service && billing::split_region(&u.usage_type).1 == usage).collect();
+    let local: Vec<&crate::costs::UsageCost> = all.iter().copied().filter(|u| billing::in_region(&u.usage_type, region)).collect();
+    let picked = if local.iter().any(|u| u.quantity > 0.0) { local } else { all };
+    // The last 30 days, as a month.
+    picked.iter().map(|u| u.quantity).sum::<f64>() * 30.4375 / 30.0
 }
 
 fn unpriced(out: &mut Estimate, usage: &str) {
@@ -465,18 +517,44 @@ mod tests {
 
     #[test]
     fn savings_come_off_on_demand_usage_first() {
-        // Commitments cover 60 %; what runs outside them costs US$ 1,000 a month.
+        // Commitments cover 60 %; what runs outside them costs US$ 100 a month.
         let mut s = snapshot();
-        s.coverage[0].on_demand_cost = 1000.0 * 30.0 / 30.4375;
-        let small = change(RDS, "InstanceUsage:db.r6g.xlarge", Effect::Remove, 730.0, None);
+        s.coverage[0].on_demand_cost = 100.0 * 30.0 / 30.4375;
+        let small = change(RDS, "InstanceUsage:db.r6g.xlarge", Effect::Remove, 100.0, None);
         let e = estimate(&[small], &s, "us-east-1");
         assert!((e.now - e.monthly).abs() < 1e-9 && e.later == 0.0, "all of it comes off on-demand usage");
         assert!(e.notes.is_empty(), "{:?}", e.notes);
-        let big = change(RDS, "InstanceUsage:db.r6g.xlarge", Effect::Remove, 2920.0, None);
+        let big = change(RDS, "InstanceUsage:db.r6g.xlarge", Effect::Remove, 730.0, None);
         let e = estimate(&[big], &s, "us-east-1");
-        assert!((e.now - 1000.0).abs() < 1e-6 && (e.later - (e.monthly - 1000.0)).abs() < 1e-6);
+        assert!((e.now - 100.0).abs() < 1e-6 && (e.later - (e.monthly - 100.0)).abs() < 1e-6);
         assert!(e.notes[0].contains("go on covering what is left"), "{:?}", e.notes);
         assert_eq!(e.renewal, Some(1_804_896_000.0));
+    }
+
+    #[test]
+    fn removals_stop_at_what_the_bill_used() {
+        let s = snapshot();
+        // The bill used 48 M GB-s in 30 days: about 48.7 M a month at most.
+        let huge = change("AWS Lambda", "Lambda-GB-Second", Effect::Remove, 1e12, None);
+        let e = estimate(&[huge], &s, "us-east-1");
+        let most = 48_000_000.0 * 30.4375 / 30.0;
+        assert!((e.lines[0].change.quantity - most).abs() < 1e-3);
+        assert!((e.monthly - most * 800.0 / 48_000_000.0).abs() < 1e-6, "{}", e.monthly);
+        assert!(e.notes.iter().any(|n| n.contains("no more than that is counted")), "{:?}", e.notes);
+        // A removal and a move of one usage type share what the bill used.
+        let half = most / 2.0;
+        let both = [
+            change("AWS Lambda", "Lambda-GB-Second", Effect::Remove, half, None),
+            change("AWS Lambda", "Lambda-GB-Second", Effect::Move, most, Some("Lambda-GB-Second-ARM")),
+        ];
+        let e = estimate(&both, &s, "us-east-1");
+        assert!((e.lines[1].change.quantity - (most - half)).abs() < 1e-3);
+        // Nothing of a usage type the bill does not have can be removed, even of a known family.
+        let unseen = change(RDS, "InstanceUsage:db.r6g.4xlarge", Effect::Remove, 730.0, None);
+        assert!(!estimate(&[unseen], &s, "us-east-1").priced());
+        // The same change twice is refused.
+        let one = change("AWS Lambda", "Lambda-GB-Second", Effect::Remove, 1.0, None);
+        assert!(validate(&[one.clone(), Change { usage_type: "USE1-Lambda-GB-Second".into(), ..one }]).unwrap_err().contains("repeats change 1"));
     }
 
     #[test]

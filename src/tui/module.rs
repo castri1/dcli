@@ -60,6 +60,9 @@ pub struct Shared {
     pub toasts: Vec<Toast>,
     /// A module asked to show another one: (module title, what to open there).
     pub jump: Option<(&'static str, String)>,
+    /// A promote or rollback for Pipelines to plan, handed over with the jump to it
+    /// ([`Ctx::jump_intent`]); dropped once that jump is done.
+    pub intent: Option<crate::pipeline::Intent>,
     /// A module asked to switch to this environment (before the jump, if any).
     pub switch_env: Option<String>,
     /// A module asked for an SSO sign-in with this profile.
@@ -182,6 +185,19 @@ impl Ctx<'_> {
     /// (Lambda → its log group in Logs, for example).
     pub fn jump(&mut self, module: &'static str, target: impl Into<String>) {
         self.shared.jump = Some((module, target.into()));
+    }
+
+    /// Opens Pipelines to promote or roll back a pipeline (the matrix). Only this hands over an
+    /// intent: a jump's text never becomes one.
+    pub fn jump_intent(&mut self, intent: crate::pipeline::Intent) {
+        let pipeline = intent.pipeline().to_string();
+        self.shared.intent = Some(intent);
+        self.jump("Pipelines", pipeline);
+    }
+
+    /// The intent handed over with the jump that opened this module, if any.
+    pub fn take_intent(&mut self) -> Option<crate::pipeline::Intent> {
+        self.shared.intent.take()
     }
 
     /// Switches the whole app to environment `name` (the matrix opening a cell, say).

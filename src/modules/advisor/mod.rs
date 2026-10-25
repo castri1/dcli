@@ -110,10 +110,12 @@ pub(crate) fn commands_text(r: &Recommendation, step: Option<usize>) -> Option<(
     (count > 0).then(|| (text, if count == 1 { "1 command".to_string() } else { format!("{count} commands") }, writes))
 }
 
+/// A decision being confirmed; `seen` is when the recommendation shown was written, so a
+/// version Claude rewrote meanwhile is not decided on blindly.
 enum Dialog {
-    Done { id: String, form: Form },
-    Dismiss { id: String, form: Form },
-    Restore { id: String, form: Form },
+    Done { id: String, seen: f64, form: Form },
+    Dismiss { id: String, seen: f64, form: Form },
+    Restore { id: String, seen: f64, form: Form },
 }
 
 pub struct Advisor {
@@ -355,7 +357,7 @@ impl Advisor {
         } else {
             "For a change you made (the steps, in code or in the console): dcli ran nothing and only records that you made it.".into()
         });
-        self.dialog = Some(Dialog::Done { id: r.id.clone(), form });
+        self.dialog = Some(Dialog::Done { id: r.id.clone(), seen: r.updated, form });
     }
 
     fn open_dismiss(&mut self, ctx: &mut Ctx) {
@@ -379,7 +381,7 @@ impl Advisor {
             "Nothing changes in AWS. Claude sees it dismissed, with your reason, and does not propose it again unless something changes."
                 .into(),
         );
-        self.dialog = Some(Dialog::Dismiss { id: r.id.clone(), form });
+        self.dialog = Some(Dialog::Dismiss { id: r.id.clone(), seen: r.updated, form });
     }
 
     fn restore(&mut self, ctx: &mut Ctx) {
@@ -391,21 +393,21 @@ impl Advisor {
                     .submit_label("back to pending")
                     .enter_submits();
                 form.note = Some("Not made after all: it also leaves the changes Savings › Verified follows.".into());
-                self.dialog = Some(Dialog::Restore { id: r.id.clone(), form });
+                self.dialog = Some(Dialog::Restore { id: r.id.clone(), seen: r.updated, form });
             }
             State::Dismissed | State::Withdrawn => {
-                let id = r.id.clone();
-                self.decide(&id, State::Pending, "", ctx);
+                let (id, seen) = (r.id.clone(), r.updated);
+                self.decide(&id, State::Pending, "", seen, ctx);
             }
         }
     }
 
     /// Records the user's decision on `id`; the error, if any, for the form.
-    fn decide(&mut self, id: &str, state: State, note: &str, ctx: &mut Ctx) -> Option<String> {
+    fn decide(&mut self, id: &str, state: State, note: &str, seen: f64, ctx: &mut Ctx) -> Option<String> {
         let Some(store) = self.store.clone() else {
             return Some("cannot find the home directory".into());
         };
-        match advisor::decide(&store, &self.env_name, id, state, note) {
+        match advisor::decide(&store, &self.env_name, id, state, note, Some(seen)) {
             Ok(r) => {
                 let message = match state {
                     State::Done if r.ledger.is_some() => {
@@ -429,8 +431,8 @@ impl Advisor {
 
     fn dialog_key(&mut self, key: KeyEvent, ctx: &mut Ctx) {
         let Some(dialog) = &mut self.dialog else { return };
-        let (id, form) = match dialog {
-            Dialog::Done { id, form } | Dialog::Dismiss { id, form } | Dialog::Restore { id, form } => (id.clone(), form),
+        let (id, seen, form) = match dialog {
+            Dialog::Done { id, seen, form } | Dialog::Dismiss { id, seen, form } | Dialog::Restore { id, seen, form } => (id.clone(), *seen, form),
         };
         match form.handle(key) {
             FormEvent::Cancel => self.dialog = None,
@@ -442,7 +444,7 @@ impl Advisor {
                     Dialog::Restore { .. } => (State::Pending, String::new()),
                 };
                 let dialog = self.dialog.take();
-                if let Some(error) = self.decide(&id, state, &note, ctx) {
+                if let Some(error) = self.decide(&id, state, &note, seen, ctx) {
                     self.dialog = dialog;
                     if let Some(Dialog::Done { form, .. } | Dialog::Dismiss { form, .. } | Dialog::Restore { form, .. }) = &mut self.dialog {
                         form.fail(error);

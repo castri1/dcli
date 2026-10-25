@@ -44,7 +44,7 @@ impl View {
 /// Where a figure comes from, in the order lists put them: the bill's first.
 fn source_rank(r: &Recommendation) -> u8 {
     let bill = r.cost.bill.as_ref().is_some_and(|b| b.priced());
-    match (bill, r.cost.claude.is_some()) {
+    match (bill, r.cost.claude_counted().is_some()) {
         (true, false) => 0,
         (true, true) => 1,
         (false, true) => 2,
@@ -160,7 +160,7 @@ pub fn totals<'a>(list: impl IntoIterator<Item = &'a Recommendation>) -> Totals 
                 t.bill_later += b.later;
             }
         }
-        match &r.cost.claude {
+        match r.cost.claude_counted() {
             Some(c) if c.monthly < 0.0 => t.claude_costs -= c.monthly,
             Some(c) => t.claude_saves += c.monthly,
             None if bill.is_none() && r.cost.none.is_none() => t.unpriced += 1,
@@ -319,13 +319,14 @@ pub(crate) mod tests {
         let list = [
             rec(1, State::Pending, Some((400.0, 100.0, false)), None),
             rec(2, State::Pending, Some((50.0, 50.0, true)), None),
-            rec(3, State::Pending, Some((-120.0, -120.0, false)), Some(-30.0)),
+            rec(3, State::Pending, Some((-120.0, -120.0, false)), None),
             rec(4, State::Pending, None, Some(40.0)),
             rec(5, State::Pending, None, None),
             rec(6, State::Done, Some((900.0, 900.0, false)), None),
+            rec(8, State::Pending, None, Some(-30.0)),
         ];
         let t = totals(&list);
-        assert_eq!(t.pending, 5);
+        assert_eq!(t.pending, 6);
         assert_eq!((t.bill_saves, t.bill_now, t.bill_later), (400.0, 100.0, 300.0));
         assert_eq!((t.bill_up_to, t.up_to, t.bill_costs), (50.0, 1, 120.0));
         assert_eq!((t.claude_saves, t.claude_costs, t.unpriced), (40.0, 30.0, 1));
@@ -338,6 +339,11 @@ pub(crate) mod tests {
                 "1 not priced yet",
             ]
         );
+        // Claude's figure is for what the bill cannot price: once the bill prices every change,
+        // it is left out instead of counted twice.
+        let both = rec(9, State::Pending, Some((50.0, 50.0, false)), Some(50.0));
+        assert_eq!(both.cost.monthly(), Some(50.0));
+        assert_eq!(totals(std::slice::from_ref(&both)).claude_saves, 0.0);
         let mut same = rec(7, State::Pending, None, Some(10.0));
         same.resources[0].name = "fn-1".into();
         assert!(totals(&[list[0].clone(), same]).overlap);
