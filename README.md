@@ -386,14 +386,22 @@ with 1 when an alarm is firing, for scripts and CI checks.
 The Savings module (and `dcli optimize`) looks at the environment's resources and their usage
 over the last 14 days and lists what could cost less: Lambda functions that could run on arm64,
 idle provisioned concurrency, timeouts far above what functions take; log groups kept forever
-and the biggest ingesters; SQS queues without long polling; DynamoDB capacity far above use,
+and the biggest ingesters (Lambda's logs priced as the vended logs they are billed as); custom
+CloudWatch metrics by namespace (Lambda Insights, embedded metrics, the agent); SQS queues
+without long polling; DynamoDB capacity far above use,
 unused tables, steady on-demand tables, tables that are mostly storage; S3 buckets without
 lifecycle rules, abandoned multipart uploads, old versions kept forever; busy Standard state
 machines of short executions; secrets nobody reads; alarms without data; REST APIs that could
 be HTTP APIs and stage caches that rarely hit; idle or oversized Aurora instances, Serverless
 minimums above use, heavy I/O on Standard storage, old manual snapshots; Redshift clusters idle
 for hours (to pause on a schedule), nodes to spare, old snapshots, heavy concurrency scaling;
-DMS replication instances with nothing running, oversized ones, Multi-AZ outside production.
+DMS replication instances with nothing running, oversized ones, Multi-AZ outside production;
+idle NAT gateways and busy ones without the free S3 or DynamoDB endpoints, EBS volumes attached
+to nothing, gp2 volumes that could be gp3, old snapshots, idle Elastic IPs; X-Ray sampling rules
+that record most requests; Bedrock models used without prompt caching, invocation logs written
+to CloudWatch, provisioned throughput nobody calls. Findings are added up per lever (arm64 for
+every function, retention for every log group…), so a change spread over many resources shows
+its whole saving.
 
 There are no prices in dcli: each finding says how much usage the change removes, in the
 unit AWS bills for it (GB-seconds, GB stored, requests, capacity-unit hours, instance hours),
@@ -416,7 +424,8 @@ splits the bill's most expensive usage types over the resources behind them, by 
 used (functions by duration × memory, log groups by bytes ingested, clusters by node hours…),
 with each resource's findings beside it. `m` (or `M` on a function in Lambda) compares the
 memory functions use with what they have, read from their logs with Logs Insights; Insights is
-billed by the data it scans, so dcli tells you how much first. `c` copies the findings as a
+billed by the data it scans, so dcli tells you how much first. An analysis is kept for the
+environment, and its findings show in later scans (and to Claude) for 30 days. `c` copies the findings as a
 plan for an AI agent.
 
 ### Costs
