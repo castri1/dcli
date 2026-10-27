@@ -2,8 +2,11 @@
 //! AppConfig environments showing what each environment serves (its deployed version) and
 //! deployments in progress. Editing a flag builds a new version from the one deployed in
 //! that environment (so nothing else reaches it), shows the change, and deploys it with a
-//! chosen strategy; a running deployment can be stopped (rolled back). Freeform profiles
-//! are shown read-only.
+//! chosen strategy; a running deployment can be stopped (rolled back). New flags are built
+//! in [`new_flag`] and go to one environment the same way; new feature flag profiles are
+//! created from the profile list. Freeform profiles are shown read-only.
+
+mod new_flag;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -16,6 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
+use self::new_flag::{Builder, Step};
 use super::common::LoadState;
 use crate::aws::appconfig::{
     self as ac, ALL_AT_ONCE, Application, Deployment, EnvState, Environment, Flag, FlagsDoc, Profile, Strategy,
@@ -71,6 +75,7 @@ enum Msg {
     Polled { env: String, result: aws::Result<Deployment> },
     Stopped { env: String, number: i64, result: aws::Result<()> },
     Refreshed { env: String, result: aws::Result<Vec<Deployment>> },
+    ProfileCreated { app: String, name: String, description: String, result: aws::Result<Profile> },
 }
 
 #[derive(PartialEq)]
@@ -89,6 +94,8 @@ struct Plan {
     latest: Option<i64>,
     doc: String,
     diff: Vec<String>,
+    /// A new flag's builder, to go back to when the strategy or the confirmation is cancelled.
+    builder: Option<Box<Builder>>,
 }
 
 enum Dialog {
@@ -96,6 +103,8 @@ enum Dialog {
     Strategy { picker: Picker, plan: Plan },
     Confirm { plan: Plan, strategy: Strategy, input: TextInput, typed: Option<String> },
     Stop { env: usize, number: i64, version: String, input: TextInput, typed: Option<String> },
+    NewFlag(Box<Builder>),
+    NewProfile(Form),
     Busy(String),
 }
 
@@ -121,16 +130,28 @@ pub struct AppConfig {
     list_area: Rect,
     /// An application (id or name) to open once the list arrives (from the `:` search).
     open_target: Option<String>,
+    /// A new flag being deployed: reopened with AppConfig's error if that fails.
+    pending_flag: Option<Box<Builder>>,
 }
 
-/// Grey hint for an empty attribute field.
-fn kind_hint(kind: Option<&str>) -> &'static str {
-    match kind {
-        Some("number") => "number",
-        Some("string[]") => "a, b, c",
-        Some("number[]") => "1, 2, 3",
-        _ => "",
+/// Grey hint for an empty attribute field: its constraints.
+fn constraints_hint(attr: &ac::Attribute) -> &'static str {
+    match attr.kind() {
+        Some(_) => label(&ellipsize(&attr.constraints.summary(), 60)),
+        None => "",
     }
+}
+
+/// Choice options are `&'static`: an attribute's allowed values are interned like labels.
+fn options(values: Vec<String>) -> &'static [&'static str] {
+    static OPTIONS: OnceLock<Mutex<Vec<&'static [&'static str]>>> = OnceLock::new();
+    let mut all = OPTIONS.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(o) = all.iter().find(|o| o.iter().copied().eq(values.iter().map(String::as_str))) {
+        return o;
+    }
+    let o: &'static [&'static str] = Box::leak(values.iter().map(|v| label(v)).collect::<Vec<_>>().into_boxed_slice());
+    all.push(o);
+    o
 }
 
 /// Form labels are `&'static str`; attribute names are interned (a handful per session).
@@ -171,6 +192,7 @@ impl AppConfig {
             scroll: 0,
             list_area: Rect::default(),
             open_target: None,
+            pending_flag: None,
         }
     }
 
@@ -354,10 +376,15 @@ impl AppConfig {
             };
             let current = doc.value(&flag.key, &attr.name);
             let boolean = attr.kind() == Some("boolean") || current.is_some_and(serde_json::Value::is_boolean);
+            let allowed = &attr.constraints.allowed;
             fields.push(if boolean {
                 Field::choice(name, TRUE_FALSE, &current.map(ac::value_text).unwrap_or_else(|| "false".into()))
+            } else if attr.kind() == Some("string") && !allowed.is_empty() && allowed.iter().all(serde_json::Value::is_string) {
+                // One of a list: chosen, with `—` for no value (or one not on the list).
+                let choices = options(std::iter::once("—".to_string()).chain(allowed.iter().map(ac::value_text)).collect());
+                Field::choice(name, choices, &current.map(ac::value_text).unwrap_or_else(|| "—".into()))
             } else {
-                Field::text(name, current.map(ac::value_text).unwrap_or_default()).optional(kind_hint(attr.kind()))
+                Field::text(name, current.map(ac::value_text).unwrap_or_default()).optional(constraints_hint(attr))
             });
         }
         let mut form = Form::new(format!("Edit flag · {} · {}", profile.name, env.name), fields).submit_label("review");
@@ -382,10 +409,14 @@ impl AppConfig {
             };
             let text = form.get(&name);
             let current = doc.value(&flag.key, &attr.name);
-            if text.trim().is_empty() && current.is_none() {
+            if (text.trim().is_empty() && current.is_none()) || text == "—" {
+                if current.is_none() && attr.constraints.required {
+                    return Err(format!("{}: a value is required", attr.name));
+                }
                 continue;
             }
             let value = ac::parse_value(text, attr.kind(), current).map_err(|e| format!("{}: {e}", attr.name))?;
+            attr.constraints.check(Some(&value)).map_err(|e| format!("{}: {e}", attr.name))?;
             attrs.push((attr.name.clone(), value));
         }
         // A flag this version lacks takes its definition from a version that has it.
@@ -397,7 +428,98 @@ impl AppConfig {
         }
         let env_version = self.env_state(env, profile).version();
         let latest = self.latest.get(&profile.id).copied().flatten();
-        Ok(Plan { env, base, env_version, latest, doc: newer.to_json(), diff })
+        Ok(Plan { env, base, env_version, latest, doc: newer.to_json(), diff, builder: None })
+    }
+
+    // ---- new flags and profiles -------------------------------------------------------
+
+    /// Opens the builder for a flag in the selected environment, built on what it serves.
+    fn open_new_flag(&mut self, ctx: &mut Ctx) {
+        let (Some(open), Some(profile)) = (&self.open, self.profile().cloned()) else { return };
+        if !profile.is_feature_flags() || !profile.is_hosted() {
+            return ctx.toast(Level::Info, "New flags go in feature flag profiles hosted in AppConfig");
+        }
+        let Some(env) = open.envs.get(self.col).cloned() else {
+            return ctx.toast(Level::Info, format!("{} has no environments: create one in AppConfig first", open.app.name));
+        };
+        let state = self.env_state(self.col, &profile);
+        let base = state.version().or_else(|| self.latest.get(&profile.id).copied().flatten());
+        let base_doc = match self.doc(&profile, base) {
+            Some(Ok(Doc { flags: Some(doc), .. })) => Some(doc),
+            Some(Ok(_)) => return ctx.toast(Level::Error, "That version is not a feature flags document"),
+            Some(Err(e)) => return ctx.toast(Level::Error, e.short()),
+            None if base.is_none() => None,
+            None => return ctx.toast(Level::Info, "Still loading that version"),
+        };
+        let mut taken: Vec<String> = self.rows(&profile).into_iter().map(|f| f.key).collect();
+        taken.extend(base_doc.into_iter().flat_map(FlagsDoc::flags).map(|f| f.key));
+        if let Some(active) = &state.active {
+            ctx.toast(Level::Warn, format!("{} has a deployment {} — a new one waits for it", env.name, active.progress()));
+        }
+        let from = match (state.version(), base) {
+            (Some(v), _) => format!("{} · now v{v}", env.name),
+            (None, Some(v)) => format!("{} · not deployed yet, from latest v{v}", env.name),
+            (None, None) => format!("{} · the profile's first version", env.name),
+        };
+        let title = format!("{} · {}", profile.name, env.name);
+        self.dialog = Some(Dialog::NewFlag(Box::new(Builder::new(title, self.col, base, from, taken))));
+    }
+
+    /// The change that adds the builder's flag to its base version.
+    fn plan_new(&self, b: &Builder) -> Result<Plan, String> {
+        let profile = self.profile().ok_or("No profile selected")?;
+        let doc = match self.doc(profile, b.base) {
+            Some(Ok(Doc { flags: Some(doc), .. })) => doc.clone(),
+            _ if b.base.is_none() => FlagsDoc::empty(),
+            _ => return Err("The base version is not loaded".into()),
+        };
+        if self.rows(profile).iter().any(|f| f.key == b.flag.key) {
+            return Err(format!("This profile already has a flag {}", b.flag.key));
+        }
+        let newer = doc.with_new_flag(&b.flag)?;
+        let env_version = self.env_state(b.env, profile).version();
+        let latest = self.latest.get(&profile.id).copied().flatten();
+        Ok(Plan { env: b.env, base: b.base, env_version, latest, doc: newer.to_json(), diff: b.flag.describe(), builder: None })
+    }
+
+    fn profile_form(&self, app: &str, name: &str, description: &str) -> Form {
+        let mut form = Form::new(
+            format!("New feature flag profile · {app}"),
+            vec![Field::text("Name", name).hint("e.g. checkout-flags"), Field::text("Description", description).optional("optional")],
+        )
+        .submit_label("create");
+        form.note = Some("Hosted in AppConfig (AWS.AppConfig.FeatureFlags). Its first flag: n in its table.".into());
+        if is_production(&self.env_name) {
+            form = form.confirm_with(&self.env_name);
+        }
+        form
+    }
+
+    fn open_new_profile(&mut self, ctx: &mut Ctx) {
+        match &self.open {
+            None => ctx.toast(Level::Info, "Open an application: profiles are created inside one"),
+            Some(o) if !matches!(o.load, LoadState::Loaded) => ctx.toast(Level::Info, "Still loading the application"),
+            Some(o) => self.dialog = Some(Dialog::NewProfile(self.profile_form(&o.app.name, "", ""))),
+        }
+    }
+
+    fn check_profile(&self, name: &str) -> Result<(), String> {
+        let Some(open) = &self.open else { return Err("No application open".into()) };
+        ac::valid_profile_name(name)?;
+        if open.profiles.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
+            return Err(format!("{} already has a profile {name}", open.app.name));
+        }
+        Ok(())
+    }
+
+    fn create_profile(&mut self, name: String, description: String, ctx: &mut Ctx) {
+        let Some(open) = &self.open else { return };
+        let (aws, app) = (ctx.env().aws.clone(), open.app.id.clone());
+        self.dialog = Some(Dialog::Busy(format!("Creating the profile {name}…")));
+        ctx.spawn(move || {
+            let result = ac::create_flags_profile(&aws, &app, &name, &description);
+            Msg::ProfileCreated { app, name, description, result }
+        });
     }
 
     fn choose_strategy(&mut self, plan: Plan) {
@@ -429,6 +551,7 @@ impl AppConfig {
         let app = open.app.id.clone();
         self.dialog = Some(Dialog::Busy(format!("Creating a version and deploying it to {}…", env.name)));
         let description = ellipsize(&format!("dcli: {}", plan.diff.join("; ")), 900);
+        self.pending_flag = plan.builder;
         let aws = ctx.env().aws.clone();
         let (doc, env_version, known_latest) = (plan.doc, plan.env_version, plan.latest);
         ctx.spawn(move || {
@@ -633,7 +756,7 @@ impl AppConfig {
         }
         let mut lines = vec![Line::from(header), Line::from(status), Line::raw("")];
         if rows.is_empty() {
-            let text = if self.docs_loading.is_empty() { "No flags in this profile" } else { "Loading…" };
+            let text = if self.docs_loading.is_empty() { "No flags in this profile · n creates one" } else { "Loading…" };
             lines.push(Line::styled(format!("{:<flag_w$}{text}", ""), theme::muted()));
         }
         let height = inner.height.saturating_sub(3) as usize;
@@ -678,6 +801,11 @@ impl AppConfig {
         if let Some(d) = flag.description.as_ref().filter(|d| !d.is_empty()) {
             lines.push(widgets::kv("About", d.clone(), kw));
         }
+        match flag.retire_by.as_deref() {
+            Some("") => lines.push(widgets::kv("Short-term", "to retire".to_string(), kw)),
+            Some(date) => lines.push(widgets::kv("Short-term", format!("retire by {date}"), kw)),
+            None => {}
+        }
         match (state.deployed.as_ref(), self.doc(profile, state.version())) {
             (Some(dep), Some(Ok(Doc { flags: Some(doc), .. }))) => {
                 let when = dep.completed().or(dep.started()).map(|t| format!(" · deployed {}", fmt_ago(t))).unwrap_or_default();
@@ -689,7 +817,7 @@ impl AppConfig {
                 ]));
                 for attr in &flag.attributes {
                     let value = doc.value(&flag.key, &attr.name).map_or_else(|| "—".to_string(), ac::value_text);
-                    let kind = attr.kind().map(|k| format!("  ({k})")).unwrap_or_default();
+                    let kind = attr.kind().map(|_| format!("  ({})", attr.constraints.summary())).unwrap_or_default();
                     lines.push(Line::from(vec![
                         Span::styled(format!("{:<kw$} ", ellipsize(&attr.name, kw)), theme::muted()),
                         Span::raw(value),
@@ -708,7 +836,7 @@ impl AppConfig {
                 Style::new().fg(theme::RUNNING),
             ));
         }
-        lines.push(Line::styled("Enter edit · y copy the document · Esc back", theme::muted()));
+        lines.push(Line::styled("Enter edit · n new flag · y copy the document · Esc back", theme::muted()));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(widgets::panel(format!(" {} ", env.name), false)), area);
     }
 
@@ -745,8 +873,14 @@ impl AppConfig {
     fn render_dialog(&mut self, f: &mut Frame, area: Rect, view: &View) {
         let env_names: Vec<String> = self.open.as_ref().map(|o| o.envs.iter().map(|e| e.name.clone()).collect()).unwrap_or_default();
         let profile = self.profile().map(|p| p.name.clone()).unwrap_or_default();
+        let prod = is_production(&self.env_name);
         let Some(dialog) = &mut self.dialog else { return };
         match dialog {
+            Dialog::NewFlag(b) => {
+                let color = env_names.get(b.env).map_or(theme::ACCENT, |n| if is_production(n) || prod { theme::ERR } else { theme::ACCENT });
+                b.render(f, area, color);
+            }
+            Dialog::NewProfile(form) => form.render(f, area, if prod { theme::ERR } else { theme::ACCENT }),
             Dialog::Edit { form, env, .. } => {
                 let color = env_names.get(*env).map_or(theme::ACCENT, |n| if is_production(n) { theme::ERR } else { theme::ACCENT });
                 form.render(f, area, color);
@@ -773,8 +907,12 @@ impl AppConfig {
                     lines.push(Line::styled(format!("  {d}"), Style::new().fg(theme::WARN)));
                 }
                 lines.push(Line::raw(""));
-                let base = plan.base.map(|v| format!("v{v}")).unwrap_or_else(|| "an empty document".into());
-                lines.push(Line::styled(format!("A new version is created from {base} (what {env} serves now)."), theme::muted()));
+                let base = match (plan.base, plan.env_version) {
+                    (Some(v), Some(served)) if v == served => format!("from v{v} (what {env} serves now)"),
+                    (Some(v), _) => format!("from v{v}, the latest ({env} serves none yet)"),
+                    (None, _) => "with only this flag (the profile's first version)".to_string(),
+                };
+                lines.push(Line::styled(format!("A new version is created {base}."), theme::muted()));
                 lines.push(Line::from(vec![
                     Span::styled("Strategy  ", theme::muted()),
                     Span::styled(strategy.name.clone(), theme::bold()),
@@ -791,7 +929,8 @@ impl AppConfig {
                 lines.push(Line::raw(""));
                 lines.push(widgets::hints_line(&[("Enter", "deploy"), ("Esc", "cancel")]));
                 let rect = widgets::popup_area(area, 80, widgets::wrapped_height(&lines, 76) + 2);
-                widgets::popup(f, rect, "Deploy feature flags", color, Text::from(lines));
+                let title = if plan.builder.is_some() { "Create feature flag" } else { "Deploy feature flags" };
+                widgets::popup(f, rect, title, color, Text::from(lines));
                 if let Some((row, col)) = cursor {
                     f.set_cursor_position((rect.x + 2 + col, rect.y + 1 + row));
                 }
@@ -843,8 +982,37 @@ impl AppConfig {
                     }
                 },
             },
+            Dialog::NewFlag(mut b) => match b.handle(key) {
+                Step::Pending => self.dialog = Some(Dialog::NewFlag(b)),
+                Step::Cancel => {}
+                Step::Review => match self.plan_new(&b) {
+                    Ok(mut plan) => {
+                        plan.builder = Some(b);
+                        self.choose_strategy(plan);
+                    }
+                    Err(e) => {
+                        b.fail(e);
+                        self.dialog = Some(Dialog::NewFlag(b));
+                    }
+                },
+            },
+            Dialog::NewProfile(mut form) => match form.handle(key) {
+                FormEvent::Cancel => {}
+                FormEvent::Pending => self.dialog = Some(Dialog::NewProfile(form)),
+                FormEvent::Submit => {
+                    let (name, description) = (form.get("Name").trim().to_string(), form.get("Description").trim().to_string());
+                    match self.check_profile(&name) {
+                        Ok(()) => self.create_profile(name, description, ctx),
+                        Err(e) => {
+                            form.fail(e);
+                            self.dialog = Some(Dialog::NewProfile(form));
+                        }
+                    }
+                }
+            },
             Dialog::Strategy { mut picker, plan } => match picker.handle(key) {
-                Outcome::Cancel => {}
+                // A new flag goes back to its builder.
+                Outcome::Cancel => self.dialog = plan.builder.map(Dialog::NewFlag),
                 Outcome::Pending => self.dialog = Some(Dialog::Strategy { picker, plan }),
                 Outcome::Done(chosen) => {
                     let strategy = self.strategies[chosen[0]].clone();
@@ -852,7 +1020,7 @@ impl AppConfig {
                 }
             },
             Dialog::Confirm { plan, strategy, mut input, typed } => match key.code {
-                KeyCode::Esc => {}
+                KeyCode::Esc => self.dialog = plan.builder.map(Dialog::NewFlag),
                 KeyCode::Enter => {
                     if typed.as_ref().is_some_and(|t| input.value.trim() != t) {
                         ctx.toast(Level::Warn, format!("Type '{}' to confirm", typed.as_deref().unwrap_or("")));
@@ -961,6 +1129,7 @@ impl Module for AppConfig {
                     self.scroll = 0;
                 }
                 KeyCode::Enter if flags => self.open_editor(ctx),
+                KeyCode::Char('n') => self.open_new_flag(ctx),
                 KeyCode::Enter => ctx.toast(Level::Info, "Freeform configurations are read-only in dcli"),
                 KeyCode::Char('x') => self.open_stop(ctx),
                 KeyCode::Char('y') => self.copy_document(ctx),
@@ -992,6 +1161,7 @@ impl Module for AppConfig {
                 }
             },
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') if self.open.is_some() => self.close_app(),
+            KeyCode::Char('n') => self.open_new_profile(ctx),
             KeyCode::Char('y') => self.copy_document(ctx),
             KeyCode::Char('r') => match self.open.as_ref().and_then(|o| self.apps.iter().position(|a| a.id == o.app.id)) {
                 Some(i) => self.open_app(i, ctx),
@@ -1075,17 +1245,60 @@ impl Module for AppConfig {
             }
             Msg::Started { env, profile, doc, result } => {
                 self.dialog = None;
+                let builder = self.pending_flag.take();
                 match result {
                     Ok((version, deployment)) => {
                         let name = self.env_name_of(&env);
                         self.docs.insert((profile.clone(), version), Ok(Doc::new(doc)));
                         self.latest.insert(profile, Some(version));
                         self.tracking.insert((env.clone(), deployment.deployment_number));
-                        ctx.toast(Level::Success, format!("Deploying v{version} to {name} · deployment #{}", deployment.deployment_number));
+                        let number = deployment.deployment_number;
                         self.upsert(&env, deployment);
                         self.last_poll = Some(Instant::now());
+                        match builder {
+                            Some(b) => {
+                                // The new flag's row, selected.
+                                if let Some(i) = self.profile().cloned().and_then(|p| self.rows(&p).iter().position(|f| f.key == b.flag.key)) {
+                                    self.row = i;
+                                }
+                                ctx.toast(Level::Success, format!("Created {} in v{version} · deploying to {name} · #{number}", b.flag.key));
+                            }
+                            None => ctx.toast(Level::Success, format!("Deploying v{version} to {name} · deployment #{number}")),
+                        }
                     }
-                    Err(e) => ctx.toast(Level::Error, format!("Could not deploy: {}", e.short())),
+                    // A new flag goes back to its builder with AppConfig's answer.
+                    Err(e) => match builder {
+                        Some(mut b) => {
+                            b.fail(format!("Not created: {}", e.short()));
+                            self.dialog = Some(Dialog::NewFlag(b));
+                        }
+                        None => ctx.toast(Level::Error, format!("Could not deploy: {}", e.short())),
+                    },
+                }
+            }
+            Msg::ProfileCreated { app, name, description, result } => {
+                self.dialog = None;
+                let Some(open) = self.open.as_mut().filter(|o| o.app.id == app) else { return };
+                match result {
+                    Ok(profile) => {
+                        let id = profile.id.clone();
+                        open.profiles.push(profile);
+                        open.profiles.sort_by_key(|p| (!p.is_feature_flags(), p.name.to_lowercase()));
+                        let index = open.profiles.iter().position(|p| p.id == id).unwrap_or(0);
+                        // No versions yet: nothing to load.
+                        self.latest.insert(id, None);
+                        self.list_state.select(Some(index + 1));
+                        // Its first flag starts in the first environment.
+                        (self.row, self.col, self.scroll) = (0, 0, 0);
+                        self.focus = Focus::Table;
+                        ctx.toast(Level::Success, format!("Created the profile {name} · n adds its first flag"));
+                    }
+                    Err(e) => {
+                        let app_name = open.app.name.clone();
+                        let mut form = self.profile_form(&app_name, &name, &description);
+                        form.fail(format!("Not created: {}", e.short()));
+                        self.dialog = Some(Dialog::NewProfile(form));
+                    }
                 }
             }
             Msg::Polled { env, result } => {
@@ -1181,15 +1394,25 @@ impl Module for AppConfig {
             Some(Dialog::Strategy { .. }) => return vec![("↑↓", "strategy"), ("Enter", "next"), ("Esc", "cancel")],
             Some(Dialog::Confirm { .. }) => return vec![("Enter", "deploy"), ("Esc", "cancel")],
             Some(Dialog::Stop { .. }) => return vec![("Enter", "stop"), ("Esc", "cancel")],
+            Some(Dialog::NewFlag(b)) => return b.hints(),
+            Some(Dialog::NewProfile(_)) => return vec![("Tab", "next field"), ("Enter", "create"), ("Esc", "cancel")],
             Some(Dialog::Busy(_)) => return Vec::new(),
             None => {}
         }
         match (&self.open, &self.focus) {
             (None, _) => vec![("↑↓", "application"), ("Enter", "open"), ("r", "reload")],
-            (Some(_), Focus::List) => vec![("↑↓", "profile"), ("Enter", "flags"), ("Esc", "applications"), ("y", "copy"), ("r", "reload")],
-            (Some(_), Focus::Table) => {
-                vec![("↑↓←→", "flag/env"), ("Enter", "edit"), ("x", "stop deployment"), ("y", "copy"), ("r", "reload"), ("Esc", "profiles")]
+            (Some(_), Focus::List) => {
+                vec![("↑↓", "profile"), ("Enter", "flags"), ("n", "new profile"), ("Esc", "applications"), ("y", "copy"), ("r", "reload")]
             }
+            (Some(_), Focus::Table) => vec![
+                ("↑↓←→", "flag/env"),
+                ("Enter", "edit"),
+                ("n", "new flag"),
+                ("x", "stop deployment"),
+                ("y", "copy"),
+                ("r", "reload"),
+                ("Esc", "profiles"),
+            ],
         }
     }
 
@@ -1207,7 +1430,8 @@ impl Module for AppConfig {
 
     fn paste(&mut self, text: &str, _ctx: &mut Ctx) {
         match &mut self.dialog {
-            Some(Dialog::Edit { form, .. }) => form.paste(text),
+            Some(Dialog::Edit { form, .. }) | Some(Dialog::NewProfile(form)) => form.paste(text),
+            Some(Dialog::NewFlag(b)) => b.paste(text),
             Some(Dialog::Strategy { picker, .. }) => picker.paste(text),
             Some(Dialog::Confirm { input, .. }) | Some(Dialog::Stop { input, .. }) => input.insert_str(text, false),
             _ => {}

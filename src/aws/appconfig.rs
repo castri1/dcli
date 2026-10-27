@@ -853,7 +853,9 @@ impl FlagsDoc {
         let name = newer.flags().into_iter().find(|f| f.key == key).map_or_else(|| key.to_string(), |f| f.name);
         let mut out = Vec::new();
         let (was, now) = (self.enabled(key), newer.enabled(key));
-        if was != now {
+        if !self.has(key) && newer.has(key) {
+            out.push(format!("{name}: added here, {}", on_off(now)));
+        } else if was != now {
             out.push(format!("{name}: {} → {}", on_off(was), on_off(now)));
         }
         let mut names: Vec<String> = newer.values(key).into_iter().flat_map(Map::keys).cloned().collect();
@@ -993,7 +995,9 @@ mod tests {
         assert!(doc.diff(&doc.clone(), "beta_checkout").is_empty());
         let definition = json!({ "name": "Brand new", "attributes": {} });
         let added = doc.with_values("brand_new", true, &[], Some(&definition));
-        assert_eq!(doc.diff(&added, "brand_new"), ["Brand new: off → on"]);
+        assert_eq!(doc.diff(&added, "brand_new"), ["Brand new: added here, on"]);
+        let off = doc.with_values("brand_new", false, &[("limit".into(), json!(3))], Some(&definition));
+        assert_eq!(doc.diff(&off, "brand_new"), ["Brand new: added here, off", "Brand new.limit: — → 3"]);
         assert_eq!(added.definition("brand_new"), Some(definition));
         assert!(FlagsDoc::parse(&added.to_json()).unwrap().has("brand_new"));
     }
