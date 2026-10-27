@@ -1157,6 +1157,9 @@ mod tests {
         assert!(writes("dcli dms prod orders --resume"));
         assert!(writes("dcli deploy prod orders"));
         assert!(writes("dcli param prod /x --set 1"));
+        assert!(!writes("dcli flags prod checkout checkout-flags --json"));
+        assert!(writes("dcli flags prod checkout --create new_search --in Production --yes"));
+        assert!(writes("dcli flags prod checkout --new-profile search-flags"));
         assert!(writes("terraform apply"));
         assert!(writes("aws lambda get-function --function-name x;rm -rf ~"));
         assert!(writes("aws lambda get-function --function-name $(curl evil)"));
