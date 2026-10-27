@@ -4,6 +4,7 @@ import calendar
 import hashlib
 import json
 import math
+import re
 import sys
 import time
 import uuid
@@ -2475,11 +2476,14 @@ def ac_flags(values, extra=()):
     """A feature flags document: values {key: (enabled, {attr: value})}."""
     defs = {
         "new_checkout": {"name": "New checkout", "description": "One-page checkout",
-                         "attributes": {"rollout_percent": {"constraints": {"type": "number"}}}},
-        "dark_mode": {"name": "Dark mode", "attributes": {"theme": {"constraints": {"type": "string"}}}},
+                         "attributes": {"rollout_percent": {"constraints": {"type": "number", "minimum": 0,
+                                                                            "maximum": 100, "required": True}}}},
+        "dark_mode": {"name": "Dark mode", "attributes": {"theme": {"constraints": {"type": "string",
+                                                                                     "enum": ["day", "night", "auto"]}}}},
         "express_shipping": {"name": "Express shipping", "description": "Same-day delivery in big cities",
                              "attributes": {"max_items": {"constraints": {"type": "number"}},
-                                            "carriers": {"constraints": {"type": "string[]"}}}},
+                                            "carriers": {"constraints": {"type": "array", "elements": {
+                                                "type": "string", "enum": ["dhl", "fedex", "ups"]}}}}},
         "beta_banner": {"name": "Beta banner", "attributes": {"message": {"constraints": {"type": "string"}}},
                         "_createdAt": "2026-10-01T10:00:00.000Z"},
     }
@@ -2514,6 +2518,69 @@ AC_STRATEGIES = [
      "Description": "AWS recommended", "DeploymentDurationInMinutes": 20, "GrowthType": "EXPONENTIAL",
      "GrowthFactor": 10, "FinalBakeTimeInMinutes": 10},
 ]
+
+
+AC_KEY = re.compile(r"^[a-z][a-zA-Z\d_-]{0,63}$")
+
+
+def ac_check_flags(text):
+    """The AWS.AppConfig.FeatureFlags checks AppConfig runs on a new version: None when valid."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return "The content is not valid JSON"
+    if not isinstance(doc, dict) or doc.get("version") != "1" or set(doc) - {"version", "flags", "values"}:
+        return "The document needs \"version\": \"1\" and only flags and values"
+    flags, values = doc.get("flags", {}), doc.get("values", {})
+    for key, d in flags.items():
+        if not AC_KEY.match(key):
+            return f"Invalid flag key {key}"
+        if set(d) - {"name", "description", "_createdAt", "_updatedAt", "_deprecation", "attributes"}:
+            return f"Unknown property in flag {key}"
+        if "name" in d and not re.match(r"^[^\n]{1,64}$", d["name"]):
+            return f"Invalid name for flag {key}"
+        attrs = d.get("attributes", {})
+        if len(attrs) > 25:
+            return f"Flag {key} has more than 25 attributes"
+        for name, a in attrs.items():
+            c = a.get("constraints", {})
+            if not AC_KEY.match(name) or name == "enabled":
+                return f"Invalid attribute name {name}"
+            if c and c.get("type") not in ("string", "number", "boolean", "array"):
+                return f"Invalid constraint type for {key}.{name}"
+            if "pattern" in c and "enum" in c:
+                return f"{key}.{name} cannot have both a pattern and an enum"
+    for key, v in values.items():
+        if key not in flags:
+            return f"Value for undefined flag {key}"
+        if not isinstance(v.get("enabled"), bool):
+            return f"Flag {key} needs enabled true or false"
+        for name, a in flags[key].get("attributes", {}).items():
+            c = a.get("constraints", {})
+            if name not in v:
+                if c.get("required"):
+                    return f"Attribute {key}.{name} is required"
+                continue
+            x = v[name]
+            kind, limits = c.get("type"), c
+            if kind == "array":
+                if not isinstance(x, list):
+                    return f"Attribute {key}.{name} must be an array"
+                limits = c.get("elements", {})
+                items, kind = x, limits.get("type")
+            else:
+                items = [x]
+            for item in items:
+                if kind == "string" and not isinstance(item, str) or kind == "boolean" and not isinstance(item, bool) \
+                        or kind == "number" and (isinstance(item, bool) or not isinstance(item, (int, float))):
+                    return f"Attribute {key}.{name} must be a {kind}"
+                if "enum" in limits and item not in limits["enum"]:
+                    return f"Attribute {key}.{name}: {item!r} is not one of {limits['enum']}"
+                if "pattern" in limits and not re.search(limits["pattern"], item):
+                    return f"Attribute {key}.{name}: {item!r} does not match {limits['pattern']}"
+                if "minimum" in limits and item < limits["minimum"] or "maximum" in limits and item > limits["maximum"]:
+                    return f"Attribute {key}.{name}: {item} is out of range"
+    return None
 
 
 def ac_history(app, env, rows):
@@ -2581,6 +2648,16 @@ def appconfig_rest(method, path, query, headers, body):
     app = parts[1]
     if parts[2:] == ["environments"]:
         return ok({"Items": [{**e, "ApplicationId": app, "State": "READY_FOR_DEPLOYMENT"} for e in AC_ENVS[app]]})
+    if parts[2:] == ["configurationprofiles"] and method == "POST":
+        req = json.loads(body or b"{}")
+        name = req.get("Name", "")
+        if not 1 <= len(name) <= 128 or req.get("LocationUri") != "hosted" \
+                or req.get("Type") not in ("AWS.AppConfig.FeatureFlags", "AWS.Freeform"):
+            return err(400, "BadRequestException", "Invalid configuration profile")
+        profile = {"Id": f"prof{len(AC_PROFILES[app]) + 1:02d}{app[:3]}", "Name": name, "Type": req["Type"],
+                   "LocationUri": "hosted", **({"Description": req["Description"]} if req.get("Description") else {})}
+        AC_PROFILES[app].append(profile)
+        return ok({**profile, "ApplicationId": app}, 201)
     if parts[2:] == ["configurationprofiles"]:
         return ok({"Items": [{**p, "ApplicationId": app} for p in AC_PROFILES[app]]})
     if parts[2] == "environments" and len(parts) >= 5 and parts[4] == "deployments":
@@ -2624,6 +2701,10 @@ def appconfig_rest(method, path, query, headers, body):
             lock = headers.get("latest-version-number")
             if lock is not None and int(lock) != latest:
                 return err(409, "ConflictException", f"Latest version is {latest}, not {lock}")
+            profile = next((p for p in AC_PROFILES[app] if p["Id"] == parts[3]), {})
+            problem = ac_check_flags(body) if profile.get("Type") == "AWS.AppConfig.FeatureFlags" else None
+            if problem:
+                return err(400, "BadRequestException", f"Invalid feature flag configuration: {problem}")
             json.loads(body)  # the mock, like AppConfig, rejects invalid JSON for this profile
             versions[latest + 1] = body.decode()
             return 201, {"content-type": "application/json", "Version-Number": str(latest + 1),

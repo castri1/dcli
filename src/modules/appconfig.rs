@@ -353,11 +353,11 @@ impl AppConfig {
                 label(&attr.name)
             };
             let current = doc.value(&flag.key, &attr.name);
-            let boolean = attr.kind.as_deref() == Some("boolean") || current.is_some_and(serde_json::Value::is_boolean);
+            let boolean = attr.kind() == Some("boolean") || current.is_some_and(serde_json::Value::is_boolean);
             fields.push(if boolean {
                 Field::choice(name, TRUE_FALSE, &current.map(ac::value_text).unwrap_or_else(|| "false".into()))
             } else {
-                Field::text(name, current.map(ac::value_text).unwrap_or_default()).optional(kind_hint(attr.kind.as_deref()))
+                Field::text(name, current.map(ac::value_text).unwrap_or_default()).optional(kind_hint(attr.kind()))
             });
         }
         let mut form = Form::new(format!("Edit flag · {} · {}", profile.name, env.name), fields).submit_label("review");
@@ -385,7 +385,7 @@ impl AppConfig {
             if text.trim().is_empty() && current.is_none() {
                 continue;
             }
-            let value = ac::parse_value(text, attr.kind.as_deref(), current).map_err(|e| format!("{}: {e}", attr.name))?;
+            let value = ac::parse_value(text, attr.kind(), current).map_err(|e| format!("{}: {e}", attr.name))?;
             attrs.push((attr.name.clone(), value));
         }
         // A flag this version lacks takes its definition from a version that has it.
@@ -689,7 +689,7 @@ impl AppConfig {
                 ]));
                 for attr in &flag.attributes {
                     let value = doc.value(&flag.key, &attr.name).map_or_else(|| "—".to_string(), ac::value_text);
-                    let kind = attr.kind.as_deref().map(|k| format!("  ({k})")).unwrap_or_default();
+                    let kind = attr.kind().map(|k| format!("  ({k})")).unwrap_or_default();
                     lines.push(Line::from(vec![
                         Span::styled(format!("{:<kw$} ", ellipsize(&attr.name, kw)), theme::muted()),
                         Span::raw(value),
