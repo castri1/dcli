@@ -117,6 +117,10 @@ dcli ddb orders --scan --limit 20                                 # read the who
 dcli events orders-bus                                            # rules and their targets
 dcli events send --bus orders-bus --source orders.service --detail-type OrderPaid --detail '{"amount": 101}'
 dcli flags checkout                                               # AppConfig feature flags × environments
+dcli flags checkout checkout-flags --create free_shipping --in Development \
+  --attr 'min_order:number!=50000' --range min_order=0..1000000 \
+  --attr 'carriers:string[]=dhl,fedex' --allowed carriers=dhl,fedex,ups   # a new flag, deployed there (asks first)
+dcli flags checkout --new-profile payments-flags                  # a new feature flag profile
 dcli apigw                                                        # API Gateway: REST, HTTP and WebSocket APIs
 dcli apigw public-api --stages                                    # which deployment each stage runs
 dcli apigw public-api --metrics -s prod --route 'POST /orders' --since 1h
@@ -197,7 +201,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Redshift | `Enter`/`Esc` open a cluster / back · `←→` nodes / performance / queries / tables / events / configuration · `↑↓` node, or a query after `Enter` in Queries · `Enter` a node's metrics; in Queries select, then the whole SQL · `x` cancel the selected query · `t` sort tables · `i` database identity · `p` pause / resume · `R` resize · `s` manual snapshot · `m` 1h/24h/7d · `y` copy endpoint (or query) · `Y` copy a `psql` command · `c` copy a performance diagnosis for AI · `/` search · `o` console · `r` reload |
 | DMS | `←→` tasks / instances / endpoints (in a task: overview / tables / settings) · `Enter` open a task (on an instance: its tasks; on an endpoint: test it) · `s` resume or start · `x` stop · `R` reload (marked tables, those in error, or every table) · `S` change the instance class · `t` test an endpoint's connection · `Space` / `E` mark a table / those in error · `f` filter tables · `/` search · `c` copy a report for AI · `l` its logs · `m` 1h/24h/7d · `y` copy ARN · `o` console · `r` refresh |
 | EventBridge | `Enter` a bus's rules · `→` targets, `Enter` on one opens it (Lambda, Step Functions, Logs) · `t` send a test event · `y` copy the pattern · `o` console |
-| AppConfig | `Enter` application → profile → flags · `↑↓←→` flag × environment · `Enter` edit and deploy · `x` stop the deployment (rolls back) · `y` copy the document |
+| AppConfig | `Enter` application → profile → flags · `↑↓←→` flag × environment · `Enter` edit and deploy · `n` new flag in the selected environment (in the profile list: new feature flag profile) · `x` stop the deployment (rolls back) · `y` copy the document |
 
 Lists with a search box (`:`, `e`, `n`) filter as you type; `Space` marks several items
 where that makes sense and `Ctrl+A` marks every match.
@@ -321,11 +325,23 @@ before deploying and before creating or changing parameters and secrets.
   fails.
 - **AppConfig**: each cell is what that environment serves now. Editing starts from that
   version, so other environments' changes do not slip in; you see the change, pick a
-  deployment strategy, and dcli creates the new version, deploys it and follows it. Freeform
-  profiles (JSON, YAML, text) are shown read-only.
+  deployment strategy, and dcli creates the new version, deploys it and follows it. Values
+  with allowed values are chosen from them, and required values and ranges are checked
+  before anything is sent. Freeform profiles (JSON, YAML, text) are shown read-only.
+  - **New flags** (`n` in the table, or `dcli flags … --create KEY --in ENV`): a key, a
+    name, on or off, optionally short-term with a date to retire it, and up to 25
+    attributes — string, number, boolean, string list or number list, each required or
+    not, with allowed values or a pattern (text) or a minimum and maximum (numbers), and
+    its value. The flag goes to the version the selected environment serves and is
+    deployed there like an edit; in the other environments its row shows `—`, and `Enter`
+    there adds it with the same definition, so a flag starts in development and reaches
+    production when you take it there. AppConfig's own checks (a pattern, for example)
+    come back to the form, with nothing created.
+  - **New profiles** (`n` in the profile list, or `--new-profile NAME`): a feature flag
+    profile hosted in AppConfig; its first flag makes its first version.
 
 Production-looking environments ask for their name before these writes too (redrive, start,
-stop, test events, flag deploys, invoking a function, SQS redrives, promote and rollback, API
+stop, test events, flag deploys and new flags and profiles, invoking a function, SQS redrives, promote and rollback, API
 Gateway stage changes and route tests, Aurora, Redshift and DMS actions, savings fixes; for
 AppConfig, also when its environment is named like production, and for API Gateway when the
 stage is).
