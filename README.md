@@ -5,7 +5,8 @@ where, promote and rollback, an inbox of approvals), **CloudWatch** alarms, Logs
 Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke), **API
 Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **Aurora**
 (topology, performance, top SQL, failover), **Redshift** (nodes, queries, table health),
-**DMS** (tasks, tables, CDC latency), **EventBridge** and **AppConfig** feature flags, plus
+**DMS** (tasks, tables, CDC latency), **EventBridge**, **AppConfig** feature flags and
+**Route 53** records, plus
 **Costs** from Cost Explorer and a **Savings** scan of what could cost less, priced with your
 bill's own rates. Failures (pipelines, executions, functions, stacks,
 routes, migration tasks) and slow databases can be copied as Markdown reports for an AI agent,
@@ -208,6 +209,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | DMS | `←→` tasks / instances / endpoints (in a task: overview / tables / settings) · `Enter` open a task (on an instance: its tasks; on an endpoint: test it) · `s` resume or start · `x` stop · `R` reload (marked tables, those in error, or every table) · `S` change the instance class · `t` test an endpoint's connection · `Space` / `E` mark a table / those in error · `f` filter tables · `/` search · `c` copy a report for AI · `l` its logs · `m` 1h/24h/7d · `y` copy ARN · `o` console · `r` refresh |
 | EventBridge | `Enter` a bus's rules · `→` targets, `Enter` on one opens it (Lambda, Step Functions, Logs) · `t` send a test event · `y` copy the pattern · `o` console |
 | AppConfig | `Enter` application → profile → flags · `↑↓←→` flag × environment · `Enter` edit and deploy · `n` new flag in the selected environment (in the profile list: new feature flag profile) · `x` stop the deployment (rolls back) · `y` copy the document |
+| Route 53 | `Enter`/`Esc` open a hosted zone / back · `/` search records (name, type, value) · `n` new record (values, or an alias) · `Enter` edit what the selected record answers · `y` copy the name (zone list: the id) · `c` copy the values · `o` console · `r` reload |
 
 Lists with a search box (`:`, `e`, `n`) filter as you type; `Space` marks several items
 where that makes sense and `Ctrl+A` marks every match.
@@ -218,7 +220,7 @@ show it there: approvals waiting, alarms firing, DMS tasks failed.
 
 Typing in `:` also searches the environment's resources by name: pipelines, functions, log
 groups, parameters, secrets, stacks, buckets, state machines, queues, tables, APIs, Aurora and
-Redshift clusters, DMS tasks, event buses, AppConfig applications and alarms (listed in the background the first time, then kept for
+Redshift clusters, DMS tasks, event buses, AppConfig applications, alarms and Route 53 hosted zones (listed in the background the first time, then kept for
 five minutes). Enter opens the resource in its module.
 
 The mouse works too: wheel to scroll, click to select and switch modules. Forms accept pasted
@@ -345,6 +347,19 @@ before deploying and before creating or changing parameters and secrets.
     come back to the form, with nothing created.
   - **New profiles** (`n` in the profile list, or `--new-profile NAME`): a feature flag
     profile hosted in AppConfig; its first flag makes its first version.
+- **Route 53**: hosted zones (public and private, with their name servers or VPCs) and their
+  records, with routing policies (weighted, failover, latency, geolocation…), health checks
+  and alias targets. `n` creates a record: A, AAAA, CNAME, TXT, MX, SRV, CAA, NS or PTR with
+  its values (separated by commas; TXT gets its quotes and long texts are split as DNS
+  needs), or an alias chosen from the account's CloudFront distributions, load balancers,
+  API Gateway custom domains and the zone's own records, or typed by hand (S3 website, VPC
+  endpoint…). The form shows the full name as you type, and warns when CloudFront or API
+  Gateway would not serve that name. Creating never overwrites a record. `Enter` edits what a
+  record answers (TTL and values, or the alias target and health evaluation), keeping its
+  routing policy and health check; Route 53 swaps it in one change, which is refused if the
+  record changed since it was read. Records Route 53 or a traffic policy manages (SOA, the
+  apex NS) are left alone. Every change is followed until all of Route 53's name servers
+  answer with it. `dcli dns` does the same from scripts.
 
 Production-looking environments ask for their name before these writes too (redrive, start,
 stop, test events, flag deploys and new flags and profiles, Route 53 record creates and edits, invoking a function, SQS redrives, promote and rollback, API
