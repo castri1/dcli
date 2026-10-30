@@ -212,6 +212,19 @@ impl Record {
         }
     }
 
+    /// What it answers now.
+    pub fn answer(&self) -> Answer {
+        match &self.alias {
+            Some(a) => Answer::Alias(a.clone()),
+            None => Answer::Values { ttl: self.ttl.unwrap_or(0), values: self.values.clone() },
+        }
+    }
+
+    /// Identifies it within its zone: name, type and set identifier.
+    pub fn key(&self) -> (String, String, Option<String>) {
+        (self.name.to_lowercase(), self.kind.clone(), self.set_id.clone())
+    }
+
     /// The name relative to the zone: `api`, or `@` for the apex.
     pub fn relative(&self, zone: &str) -> String {
         relative(&self.name, zone)

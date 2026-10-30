@@ -21,6 +21,7 @@ mod matrix;
 mod parameters;
 mod pipelines;
 mod redshift;
+mod route53;
 mod s3;
 mod savings;
 mod secrets;
@@ -52,6 +53,7 @@ pub fn all() -> Vec<Box<dyn Module>> {
         Box::new(aurora::Aurora::new()),
         Box::new(redshift::Redshift::new()),
         Box::new(dms::Dms::new()),
+        Box::new(route53::Route53::new()),
         Box::new(events::EventBridge::new()),
         Box::new(appconfig::AppConfig::new()),
     ]

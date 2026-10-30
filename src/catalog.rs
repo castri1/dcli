@@ -1,9 +1,9 @@
 //! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, log
 //! groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues,
 //! tables, API Gateway APIs, Aurora and Redshift clusters, DMS replication tasks, event
-//! buses, AppConfig applications and alarms, each with the module that opens it. Services are listed in parallel and capped; a service the user cannot read is left out.
+//! buses, AppConfig applications, alarms and Route 53 hosted zones, each with the module that opens it. Services are listed in parallel and capped; a service the user cannot read is left out.
 
-use crate::aws::{self, Aws, alarms, appconfig, cloudformation, dynamodb, events, lambda, logs, s3, secrets, sfn, sqs, ssm};
+use crate::aws::{self, Aws, alarms, appconfig, cloudformation, dynamodb, events, lambda, logs, route53, s3, secrets, sfn, sqs, ssm};
 use crate::util::show_invisible;
 
 /// Resources listed at most per service (some accounts have thousands of log groups).
@@ -45,6 +45,7 @@ const LISTERS: &[Lister] = &[
     buses,
     applications,
     alarm_list,
+    zones,
 ];
 
 /// The resources of the environment `aws` points at, `pipelines` being those in its config,
@@ -149,6 +150,11 @@ fn alarm_list(aws: &Aws) -> aws::Result<Vec<Resource>> {
     // Alarm names are kept byte-exact for the API: shown with their invisible characters made visible.
     let list = alarms::describe_alarms(aws)?;
     Ok(list.iter().map(|a| Resource::new("Alarms", &show_invisible(&a.name), a.name.clone(), "alarm")).collect())
+}
+
+fn zones(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    let list = route53::list_zones(aws)?;
+    Ok(list.iter().map(|z| Resource::new("Route 53", z.domain(), z.id.clone(), &format!("{} hosted zone", z.kind()))).collect())
 }
 
 fn applications(aws: &Aws) -> aws::Result<Vec<Resource>> {
