@@ -121,6 +121,12 @@ dcli flags checkout checkout-flags --create free_shipping --in Development \
   --attr 'min_order:number!=50000' --range min_order=0..1000000 \
   --attr 'carriers:string[]=dhl,fedex' --allowed carriers=dhl,fedex,ups   # a new flag, deployed there (asks first)
 dcli flags checkout --new-profile payments-flags                  # a new feature flag profile
+dcli dns                                                          # Route 53 hosted zones
+dcli dns prod acme.dev --type A --name api                        # a zone's records (the id when public and private share a name)
+dcli dns prod acme.dev --create shop --type A --value 192.0.2.50 --value 192.0.2.51   # asks first; never overwrites
+dcli dns prod acme.dev --create www --alias d111111abcdef8.cloudfront.net   # alias: CloudFront, load balancer, API Gateway domain or a record
+dcli dns prod acme.dev --edit legacy --ttl 60 --wait              # atomic: refused if the record changed meanwhile
+dcli dns prod acme.dev --edit app --set-id blue --evaluate-health false   # records under a routing policy, by set id
 dcli apigw                                                        # API Gateway: REST, HTTP and WebSocket APIs
 dcli apigw public-api --stages                                    # which deployment each stage runs
 dcli apigw public-api --metrics -s prod --route 'POST /orders' --since 1h
@@ -341,7 +347,7 @@ before deploying and before creating or changing parameters and secrets.
     profile hosted in AppConfig; its first flag makes its first version.
 
 Production-looking environments ask for their name before these writes too (redrive, start,
-stop, test events, flag deploys and new flags and profiles, invoking a function, SQS redrives, promote and rollback, API
+stop, test events, flag deploys and new flags and profiles, Route 53 record creates and edits, invoking a function, SQS redrives, promote and rollback, API
 Gateway stage changes and route tests, Aurora, Redshift and DMS actions, savings fixes; for
 AppConfig, also when its environment is named like production, and for API Gateway when the
 stage is).

@@ -10,6 +10,7 @@ pub mod aurora;
 pub mod cfn;
 pub mod costs;
 pub mod dms;
+pub mod dns;
 pub mod dynamodb;
 pub mod events;
 pub mod insights;

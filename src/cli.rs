@@ -193,6 +193,8 @@ pub enum Command {
     Events(crate::clicmd::events::Args),
     /// AppConfig feature flags per environment
     Flags(crate::clicmd::appconfig::Args),
+    /// Route 53: hosted zones and their records; create and edit records
+    Dns(crate::clicmd::dns::Args),
     /// Manual approvals waiting in every environment
     Approvals(crate::clicmd::approvals::Args),
     /// Deploy the commit an environment runs to the next environment of an application
@@ -554,6 +556,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Ddb(args) => crate::clicmd::dynamodb::run(config, args),
         Command::Events(args) => crate::clicmd::events::run(config, args),
         Command::Flags(args) => crate::clicmd::appconfig::run(config, args),
+        Command::Dns(args) => crate::clicmd::dns::run(config, args),
         Command::Approvals(args) => crate::clicmd::approvals::run(config, args),
         Command::Promote(args) => crate::clicmd::promote::run(&loaded, args),
         Command::Rollback(args) => crate::clicmd::promote::rollback(&loaded, args),
