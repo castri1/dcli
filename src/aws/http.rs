@@ -122,6 +122,11 @@ pub fn api_error(resp: &RawResponse) -> AwsError {
             let message = crate::util::xml_text(&text, "Message").unwrap_or_default();
             return AwsError::Api { status: resp.status, code: crate::util::sanitize(&code), message: crate::util::sanitize(&message) };
         }
+        // Route 53 rejects a change batch as <InvalidChangeBatch><Messages><Message>…, no code.
+        if text.contains("<InvalidChangeBatch") {
+            let messages: Vec<String> = crate::util::xml_blocks(&text, "Message").into_iter().map(crate::util::xml_decode).collect();
+            return AwsError::Api { status: resp.status, code: "InvalidChangeBatch".into(), message: messages.join(" · ") };
+        }
     }
     let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or_default();
     let field = |names: &[&str]| {

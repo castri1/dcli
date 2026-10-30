@@ -1055,6 +1055,48 @@ pub fn domains(aws: &Aws) -> Result<Vec<Domain>> {
     Ok(out)
 }
 
+/// Where DNS points a custom domain name: an alias to API Gateway's domain name in its hosted zone.
+#[derive(Debug, Clone)]
+pub struct DomainTarget {
+    pub name: String,
+    pub endpoint_type: String,
+    pub target: String,
+    pub hosted_zone_id: String,
+    pub dualstack: bool,
+}
+
+/// Custom domain names with their DNS targets, without their mappings (fewer requests than [`domains`]).
+pub fn domain_targets(aws: &Aws) -> Result<Vec<DomainTarget>> {
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "camelCase", default)]
+    struct DomainOut {
+        domain_name: String,
+        domain_name_configurations: Vec<ConfigOut>,
+    }
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "camelCase", default)]
+    struct ConfigOut {
+        endpoint_type: String,
+        api_gateway_domain_name: String,
+        hosted_zone_id: String,
+        ip_address_type: Option<String>,
+    }
+    let names: Vec<DomainOut> = v2_items(aws, &["v2", "domainnames"])?;
+    Ok(names
+        .into_iter()
+        .filter_map(|d| {
+            let c = d.domain_name_configurations.into_iter().next()?;
+            (!c.api_gateway_domain_name.is_empty() && !c.hosted_zone_id.is_empty()).then(|| DomainTarget {
+                name: d.domain_name,
+                endpoint_type: c.endpoint_type,
+                target: c.api_gateway_domain_name,
+                hosted_zone_id: c.hosted_zone_id,
+                dualstack: c.ip_address_type.as_deref() == Some("dualstack"),
+            })
+        })
+        .collect())
+}
+
 /// REST usage plans: (plan name, API id, stage) for every stage a plan covers.
 pub fn usage_plan_stages(aws: &Aws) -> Result<Vec<(String, String, String)>> {
     #[derive(Deserialize, Default)]

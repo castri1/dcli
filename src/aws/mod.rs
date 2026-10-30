@@ -28,6 +28,7 @@ pub mod profile;
 pub mod rds;
 pub mod redshift;
 pub mod redshift_data;
+pub mod route53;
 pub mod s3;
 pub mod savingsplans;
 pub mod secrets;
@@ -70,8 +71,8 @@ pub struct Aws {
 const MAX_ATTEMPTS: u32 = 4;
 
 /// Services that answer on one host whatever the region (`savingsplans.amazonaws.com`),
-/// signed for the client's region (us-east-1).
-const GLOBAL_ENDPOINTS: &[&str] = &["savingsplans"];
+/// signed for the client's region, which callers set to us-east-1.
+const GLOBAL_ENDPOINTS: &[&str] = &["savingsplans", "route53", "cloudfront"];
 
 impl Aws {
     pub fn new(profile: &str, region: &str) -> Arc<Aws> {

@@ -347,6 +347,22 @@ pub fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
     out
 }
 
+/// Text to put in an XML element of a request (Route 53 change batches).
+pub fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn xml_unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;

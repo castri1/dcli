@@ -5005,7 +5005,7 @@ class H(BaseHTTPRequestHandler):
             # awsQuery services, told apart by their API version.
             params = parse_qs(raw.decode())
             service = {"2010-08-01": cloudwatch, "2014-10-31": rds, "2012-12-01": redshift, "2011-06-15": sts,
-                       "2016-11-15": ec2_query}.get(params.get("Version", [""])[0], cloudformation)
+                       "2016-11-15": ec2_query, "2015-12-01": elbv2}.get(params.get("Version", [""])[0], cloudformation)
             return self.reply_xml(*service(params))
         body = json.loads(raw or b"{}")
         target = self.headers.get("x-amz-target", "")
@@ -5334,6 +5334,336 @@ CE_SERVICES.update({
     ],
     "Amazon Bedrock": [("USE1-NovaLite-input-tokens", "Units", 4_000, 0.00006)],
 })
+
+
+# ---- Route 53 (restXml, /2013-04-01), with the alias targets dcli lists: CloudFront distributions
+# (restXml, /2020-05-31) and load balancers (awsQuery, Version 2015-12-01) ---------------------------
+import xml.etree.ElementTree as ET  # noqa: E402
+
+R53_XMLNS = "https://route53.amazonaws.com/doc/2013-04-01/"
+R53_ORDER = ["Name", "Type", "SetIdentifier", "Weight", "Region", "GeoLocation", "Failover", "MultiValueAnswer", "TTL",
+             "ResourceRecords", "AliasTarget", "HealthCheckId", "TrafficPolicyInstanceId"]
+R53_SYNC_AFTER = 3.0
+ALB_ZONE, NLB_ZONE, CF_ZONE, APIGW_ZONE = "Z35SXDOTRQ7X7K", "Z26RNL4JYFTOTI", "Z2FDTNDATAQYW2", "Z1UJRXOUMOOFQ8"
+ALB_BLUE = "web-blue-1234567890.us-east-1.elb.amazonaws.com"
+ALB_GREEN = "web-green-0987654321.us-east-1.elb.amazonaws.com"
+
+
+def _rr(name, kind, ttl=None, values=(), alias=None, **extra):
+    r = {"Name": name, "Type": kind, **extra}
+    if ttl is not None:
+        r["TTL"] = ttl
+        r["ResourceRecords"] = list(values)
+    if alias:
+        zone, dns, health = alias
+        r["AliasTarget"] = {"HostedZoneId": zone, "DNSName": dns, "EvaluateTargetHealth": health}
+    return r
+
+
+_DKIM = "p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC" + "x7Kq" * 60
+_NS = ["ns-101.awsdns-12.com.", "ns-1500.awsdns-59.org.", "ns-700.awsdns-23.net.", "ns-1900.awsdns-45.co.uk."]
+
+R53_ZONES = {
+    "Z0ACME0001PUB": {"name": "acme.dev.", "private": False, "comment": "Public site, APIs and mail", "records": [
+        _rr("acme.dev.", "NS", 172800, _NS),
+        _rr("acme.dev.", "SOA", 900, ["ns-101.awsdns-12.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"]),
+        _rr("acme.dev.", "A", alias=(CF_ZONE, "d2x9y8z7w6v5u4.cloudfront.net.", False)),
+        _rr("acme.dev.", "MX", 300, ["10 inbound-smtp.us-east-1.amazonaws.com"]),
+        _rr("acme.dev.", "TXT", 300, ['"v=spf1 include:amazonses.com ~all"', '"google-site-verification=Xy12abCD"']),
+        _rr("acme.dev.", "CAA", 300, ['0 issue "amazon.com"', '0 issuewild "amazon.com"']),
+        _rr("_dmarc.acme.dev.", "TXT", 300, ['"v=DMARC1; p=quarantine; rua=mailto:dmarc@acme.dev"']),
+        _rr("resend._domainkey.acme.dev.", "TXT", 300, [f'"{_DKIM[:255]}" "{_DKIM[255:]}"']),
+        _rr("api.acme.dev.", "A", alias=(APIGW_ZONE, "d-abc123.execute-api.us-east-1.amazonaws.com.", False)),
+        _rr("partners.acme.dev.", "A", alias=(CF_ZONE, "d111111abcdef8.cloudfront.net.", False)),
+        _rr("www.acme.dev.", "CNAME", 300, ["acme.dev"]),
+        _rr("app.acme.dev.", "A", alias=(ALB_ZONE, f"dualstack.{ALB_BLUE}.", True), SetIdentifier="blue", Weight=90),
+        _rr("app.acme.dev.", "A", alias=(ALB_ZONE, f"dualstack.{ALB_GREEN}.", True), SetIdentifier="green", Weight=10),
+        _rr("status.acme.dev.", "CNAME", 60, ["status-primary.acme.dev"], SetIdentifier="primary", Failover="PRIMARY",
+            HealthCheckId="4f1b2c3d-1111-2222-3333-444455556666"),
+        _rr("status.acme.dev.", "CNAME", 60, ["status-backup.acme-pages.net"], SetIdentifier="backup", Failover="SECONDARY"),
+        _rr("eu.acme.dev.", "A", 60, ["192.0.2.80"], SetIdentifier="eu-west-1", Region="eu-west-1"),
+        _rr("eu.acme.dev.", "A", 60, ["192.0.2.81"], SetIdentifier="us-east-1", Region="us-east-1"),
+        _rr("\\052.preview.acme.dev.", "CNAME", 60, ["previews.acme-cdn.net"]),
+        _rr("_sip._tcp.acme.dev.", "SRV", 300, ["10 5 5060 sip.acme.dev"]),
+        _rr("sip.acme.dev.", "A", 300, ["192.0.2.40"]),
+        _rr("legacy.acme.dev.", "A", 3600, ["192.0.2.10", "192.0.2.11"]),
+        _rr("ipv6.acme.dev.", "AAAA", 300, ["2001:db8::10"]),
+        _rr("dev.acme.dev.", "NS", 300, ["ns-201.awsdns-25.com.", "ns-1100.awsdns-11.org."]),
+        _rr("promo.acme.dev.", "A", 60, ["192.0.2.90"], TrafficPolicyInstanceId="tpi-0a1b2c3d"),
+    ]},
+    "Z0ACME0002PRV": {"name": "acme.dev.", "private": True, "comment": "Split horizon for the VPC",
+                      "vpcs": [("us-east-1", "vpc-0a1b2c3d4e")], "records": [
+        _rr("acme.dev.", "NS", 172800, ["ns-0.awsdns-00.com."]),
+        _rr("acme.dev.", "SOA", 900, ["ns-0.awsdns-00.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"]),
+        _rr("api.acme.dev.", "A", 60, ["10.0.12.40"]),
+    ]},
+    "Z0INTERNAL003": {"name": "internal.acme.dev.", "private": True, "comment": None,
+                      "vpcs": [("us-east-1", "vpc-0a1b2c3d4e"), ("us-west-2", "vpc-0f9e8d7c6b")], "records": [
+        _rr("internal.acme.dev.", "NS", 172800, ["ns-0.awsdns-00.com."]),
+        _rr("internal.acme.dev.", "SOA", 900, ["ns-0.awsdns-00.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"]),
+        _rr("db.internal.acme.dev.", "CNAME", 300, ["orders.cluster-abc.us-east-1.rds.amazonaws.com"]),
+        _rr("cache.internal.acme.dev.", "CNAME", 300, ["orders-cache.abc123.use1.cache.amazonaws.com"]),
+    ]},
+    # More records than one page (300), for paging.
+    "Z0TENANTS004": {"name": "tenants.acme.app.", "private": False, "comment": "One record per customer", "records": [
+        _rr("tenants.acme.app.", "NS", 172800, _NS),
+        _rr("tenants.acme.app.", "SOA", 900, ["ns-101.awsdns-12.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"]),
+    ] + [_rr(f"c-{i:04d}.tenants.acme.app.", "CNAME", 300, ["app.acme.dev"]) for i in range(700)]},
+}
+R53_CHANGES = {}
+
+CF_DISTRIBUTIONS = [
+    {"Id": "E2QWRTY0SITE", "DomainName": "d2x9y8z7w6v5u4.cloudfront.net", "Aliases": ["acme.dev", "www.acme.dev"],
+     "Comment": "Public site", "IsIPV6Enabled": True},
+    {"Id": "E3ASSETS0CDN", "DomainName": "d3k4l5m6n7o8p9.cloudfront.net", "Aliases": ["assets.acme.dev", "*.cdn.acme.dev"],
+     "Comment": "Static assets", "IsIPV6Enabled": False},
+]
+ELB_LBS = [
+    {"LoadBalancerName": "web-blue", "DNSName": ALB_BLUE, "CanonicalHostedZoneId": ALB_ZONE, "Type": "application",
+     "Scheme": "internet-facing", "IpAddressType": "dualstack"},
+    {"LoadBalancerName": "web-green", "DNSName": ALB_GREEN, "CanonicalHostedZoneId": ALB_ZONE, "Type": "application",
+     "Scheme": "internet-facing", "IpAddressType": "ipv4"},
+    {"LoadBalancerName": "orders-internal", "DNSName": "orders-internal-55aa66bb.elb.us-east-1.amazonaws.com",
+     "CanonicalHostedZoneId": NLB_ZONE, "Type": "network", "Scheme": "internal", "IpAddressType": "ipv4"},
+]
+APIGW_DOMAINS[0]["domainNameConfigurations"][0]["hostedZoneId"] = APIGW_ZONE
+APIGW_DOMAINS[1]["domainNameConfigurations"][0]["hostedZoneId"] = CF_ZONE
+
+
+def _r53_name(name):
+    """A name compared as Route 53 does: escapes decoded, any case, with the final dot."""
+    name = re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1), 8)), name).lower()
+    return name if name.endswith(".") else name + "."
+
+
+def _r53_escape(name):
+    return "".join(c if c.isalnum() or c in "-_." else f"\\{ord(c):03o}" for c in _r53_name(name))
+
+
+def _r53_order(r):
+    labels = _r53_name(r["Name"]).rstrip(".").split(".")[::-1]
+    return labels, r["Type"], r.get("SetIdentifier", "")
+
+
+def _r53_rrset_xml(r):
+    out = []
+    for key in R53_ORDER:
+        if key not in r:
+            continue
+        v = r[key]
+        if key == "ResourceRecords":
+            v = "".join(f"<ResourceRecord><Value>{xml_escape(x)}</Value></ResourceRecord>" for x in v)
+        elif key == "AliasTarget":
+            v = (f"<HostedZoneId>{v['HostedZoneId']}</HostedZoneId><DNSName>{xml_escape(v['DNSName'])}</DNSName>"
+                 f"<EvaluateTargetHealth>{str(v['EvaluateTargetHealth']).lower()}</EvaluateTargetHealth>")
+        elif key == "GeoLocation":
+            v = "".join(f"<{k}>{x}</{k}>" for k, x in v.items())
+        elif isinstance(v, bool):
+            v = str(v).lower()
+        else:
+            v = xml_escape(str(v))
+        out.append(f"<{key}>{v}</{key}>")
+    return "<ResourceRecordSet>" + "".join(out) + "</ResourceRecordSet>"
+
+
+def _r53_parse_rrset(el):
+    """A <ResourceRecordSet> of a request, as the dicts above."""
+    tag = lambda e: e.tag.split("}")[-1]
+    r = {}
+    for child in el:
+        key = tag(child)
+        if key == "ResourceRecords":
+            r[key] = [v.text or "" for rr in child for v in rr if tag(v) == "Value"]
+        elif key == "AliasTarget":
+            a = {tag(x): (x.text or "") for x in child}
+            r[key] = {"HostedZoneId": a.get("HostedZoneId", ""), "DNSName": a.get("DNSName", ""),
+                      "EvaluateTargetHealth": a.get("EvaluateTargetHealth") == "true"}
+        elif key == "GeoLocation":
+            r[key] = {tag(x): x.text for x in child}
+        elif key in ("TTL", "Weight"):
+            r[key] = int(child.text)
+        elif key == "MultiValueAnswer":
+            r[key] = child.text == "true"
+        else:
+            r[key] = child.text or ""
+    return r
+
+
+def _r53_same(a, b):
+    """The same record, compared as Route 53 compares a delete with what it has."""
+    def norm(r):
+        r = dict(r)
+        r["Name"] = _r53_name(r["Name"])
+        if "AliasTarget" in r:
+            r["AliasTarget"] = {**r["AliasTarget"], "DNSName": _r53_name(r["AliasTarget"]["DNSName"])}
+        return r
+    return norm(a) == norm(b)
+
+
+def _r53_key(r):
+    return _r53_name(r["Name"]), r["Type"], r.get("SetIdentifier")
+
+
+def _r53_xml(code, body):
+    return code, {"content-type": "text/xml"}, ('<?xml version="1.0" encoding="UTF-8"?>' + body).encode()
+
+
+def _r53_error(code, kind, message):
+    return _r53_xml(code, f'<ErrorResponse xmlns="{R53_XMLNS}"><Error><Type>Sender</Type><Code>{kind}</Code>'
+                          f"<Message>{xml_escape(message)}</Message></Error><RequestId>mock</RequestId></ErrorResponse>")
+
+
+def _r53_invalid(messages):
+    items = "".join(f"<Message>{xml_escape(m)}</Message>" for m in messages)
+    return _r53_xml(400, f'<InvalidChangeBatch xmlns="{R53_XMLNS}"><Messages>{items}</Messages><RequestId>mock</RequestId></InvalidChangeBatch>')
+
+
+def _r53_zone_xml(zid, z):
+    comment = f"<Comment>{xml_escape(z['comment'])}</Comment>" if z.get("comment") else ""
+    return (f"<HostedZone><Id>/hostedzone/{zid}</Id><Name>{z['name']}</Name><CallerReference>mock-{zid}</CallerReference>"
+            f"<Config>{comment}<PrivateZone>{str(z['private']).lower()}</PrivateZone></Config>"
+            f"<ResourceRecordSetCount>{len(z['records'])}</ResourceRecordSetCount></HostedZone>")
+
+
+def _r53_check_value(kind, v):
+    """Route 53's own checks of a value, a few of them."""
+    if kind == "A" and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", v):
+        return f"Invalid Resource Record: 'FATAL problem: ARRDATAIllegalIPv4Address (Value is not a valid IPv4 address) encountered with '{v}''"
+    if kind in ("TXT", "SPF") and not v.startswith('"'):
+        return f"Invalid Resource Record: 'FATAL problem: InvalidCharacterString (Value should be enclosed in quotation marks) encountered with '{v}''"
+    return None
+
+
+def _r53_change(zid, zone, body):
+    root = ET.fromstring(body)
+    ns = {"r": R53_XMLNS}
+    records = list(zone["records"])
+    errors = []
+    for change in root.findall(".//r:Change", ns):
+        action = change.find("r:Action", ns).text
+        rr = _r53_parse_rrset(change.find("r:ResourceRecordSet", ns))
+        key = _r53_key(rr)
+        label = f"[name='{key[0]}', type='{key[1]}'" + (f", set-identifier='{key[2]}'" if key[2] else "") + "]"
+        at = next((i for i, r in enumerate(records) if _r53_key(r) == key), None)
+        if not key[0].endswith("." + _r53_name(zone["name"])) and key[0] != _r53_name(zone["name"]):
+            errors.append(f"RRSet with DNS name {key[0]} is not permitted in zone {zone['name']}")
+            continue
+        if action == "DELETE":
+            if at is None:
+                errors.append(f"Tried to delete resource record set {label} but it was not found")
+            elif not _r53_same(records[at], rr):
+                errors.append(f"Tried to delete resource record set {label} but the values provided do not match the current values")
+            else:
+                records.pop(at)
+            continue
+        if action == "CREATE" and at is not None:
+            errors.append(f"Tried to create resource record set {label} but it already exists")
+            continue
+        others = [r for r in records if _r53_name(r["Name"]) == key[0] and _r53_key(r) != key]
+        if any(r["Type"] == "CNAME" for r in others) or (rr["Type"] == "CNAME" and others):
+            errors.append(f"RRSet of type CNAME with DNS name {key[0]} is not permitted as it conflicts with other records "
+                          f"with the same DNS name in zone {zone['name']}")
+            continue
+        bad = [m for m in (_r53_check_value(rr["Type"], v) for v in rr.get("ResourceRecords", [])) if m]
+        alias = rr.get("AliasTarget")
+        if alias and alias["HostedZoneId"] == zid and not any(_r53_name(r["Name"]) == _r53_name(alias["DNSName"]) for r in records):
+            bad.append(f"Tried to create an alias that targets {_r53_name(alias['DNSName'])}, type {rr['Type']} in zone {zid}, "
+                       "but the alias target name does not lie within the target zone")
+        if bad:
+            errors.extend(bad)
+            continue
+        rr["Name"] = _r53_escape(rr["Name"])
+        if at is None:
+            records.append(rr)
+        else:
+            records[at] = rr
+    if errors:
+        return _r53_invalid(errors)
+    zone["records"] = records
+    cid = "C" + uuid.uuid4().hex[:12].upper()
+    R53_CHANGES[cid] = time.time()
+    return _r53_xml(200, f'<ChangeResourceRecordSetsResponse xmlns="{R53_XMLNS}"><ChangeInfo><Id>/change/{cid}</Id>'
+                         f"<Status>PENDING</Status><SubmittedAt>{s3_iso(time.time())}</SubmittedAt></ChangeInfo>"
+                         "</ChangeResourceRecordSetsResponse>")
+
+
+def route53_rest(method, path, query, headers, body):
+    p = [unquote(x) for x in path.strip("/").split("/")]
+    if p[0] == "2020-05-31":
+        return cloudfront_rest(method, p, query)
+    p = p[1:]
+    if p == ["hostedzone"] and method == "GET":
+        zones = sorted(R53_ZONES.items(), key=lambda kv: (kv[1]["name"], kv[0]))
+        start = next((i for i, (zid, _) in enumerate(zones) if zid == query.get("marker")), 0)
+        size = int(query.get("maxitems", 100))
+        page, rest = zones[start:start + size], zones[start + size:]
+        more = f"<NextMarker>{rest[0][0]}</NextMarker>" if rest else ""
+        items = "".join(_r53_zone_xml(zid, z) for zid, z in page)
+        return _r53_xml(200, f'<ListHostedZonesResponse xmlns="{R53_XMLNS}"><HostedZones>{items}</HostedZones>'
+                             f"<IsTruncated>{str(bool(rest)).lower()}</IsTruncated>{more}<MaxItems>{size}</MaxItems></ListHostedZonesResponse>")
+    if p[:1] == ["change"] and len(p) == 2:
+        if p[1] not in R53_CHANGES:
+            return _r53_error(404, "NoSuchChange", f"A change with the specified change ID does not exist: {p[1]}")
+        status = "INSYNC" if time.time() - R53_CHANGES[p[1]] >= R53_SYNC_AFTER else "PENDING"
+        return _r53_xml(200, f'<GetChangeResponse xmlns="{R53_XMLNS}"><ChangeInfo><Id>/change/{p[1]}</Id>'
+                             f"<Status>{status}</Status></ChangeInfo></GetChangeResponse>")
+    if p[:1] != ["hostedzone"] or len(p) < 2:
+        return _r53_error(404, "NotFound", f"mock: no route for {method} {path}")
+    zone = R53_ZONES.get(p[1])
+    if zone is None:
+        return _r53_error(404, "NoSuchHostedZone", f"No hosted zone found with ID: {p[1]}")
+    if len(p) == 2 and method == "GET":
+        if zone["private"]:
+            extra = "<VPCs>" + "".join(f"<VPC><VPCRegion>{r}</VPCRegion><VPCId>{v}</VPCId></VPC>" for r, v in zone["vpcs"]) + "</VPCs>"
+        else:
+            extra = "<DelegationSet><NameServers>" + "".join(f"<NameServer>{n}</NameServer>" for n in _NS) + "</NameServers></DelegationSet>"
+        return _r53_xml(200, f'<GetHostedZoneResponse xmlns="{R53_XMLNS}">{_r53_zone_xml(p[1], zone)}{extra}</GetHostedZoneResponse>')
+    if p[2:3] == ["rrset"] and method == "POST":
+        return _r53_change(p[1], zone, body)
+    if p[2:3] == ["rrset"] and method == "GET":
+        records = sorted(zone["records"], key=_r53_order)
+        start = 0
+        if "name" in query:
+            want = (_r53_name(query["name"]), query.get("type"), query.get("identifier"))
+            start = next((i for i, r in enumerate(records) if _r53_key(r) == want), len(records))
+        size = min(int(query.get("maxitems", 300)), 300)
+        page, rest = records[start:start + size], records[start + size:]
+        more = ""
+        if rest:
+            more = f"<NextRecordName>{rest[0]['Name']}</NextRecordName><NextRecordType>{rest[0]['Type']}</NextRecordType>"
+            if rest[0].get("SetIdentifier"):
+                more += f"<NextRecordIdentifier>{rest[0]['SetIdentifier']}</NextRecordIdentifier>"
+        items = "".join(_r53_rrset_xml(r) for r in page)
+        return _r53_xml(200, f'<ListResourceRecordSetsResponse xmlns="{R53_XMLNS}"><ResourceRecordSets>{items}</ResourceRecordSets>'
+                             f"<IsTruncated>{str(bool(rest)).lower()}</IsTruncated>{more}<MaxItems>{size}</MaxItems></ListResourceRecordSetsResponse>")
+    return _r53_error(404, "NotFound", f"mock: no route for {method} {path}")
+
+
+def cloudfront_rest(method, p, query):
+    if p[1:] != ["distribution"] or method != "GET":
+        return _r53_xml(404, "<ErrorResponse><Error><Code>NotFound</Code><Message>mock</Message></Error></ErrorResponse>")
+    items = ""
+    for d in CF_DISTRIBUTIONS:
+        names = "".join(f"<CNAME>{a}</CNAME>" for a in d["Aliases"])
+        items += (f"<DistributionSummary><Id>{d['Id']}</Id><DomainName>{d['DomainName']}</DomainName>"
+                  f"<Aliases><Quantity>{len(d['Aliases'])}</Quantity><Items>{names}</Items></Aliases>"
+                  f"<Comment>{d['Comment']}</Comment><Enabled>true</Enabled><Status>Deployed</Status>"
+                  f"<IsIPV6Enabled>{str(d['IsIPV6Enabled']).lower()}</IsIPV6Enabled></DistributionSummary>")
+    return _r53_xml(200, f'<DistributionList xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><Marker></Marker>'
+                         f"<MaxItems>100</MaxItems><IsTruncated>false</IsTruncated><Quantity>{len(CF_DISTRIBUTIONS)}</Quantity>"
+                         f"<Items>{items}</Items></DistributionList>")
+
+
+def elbv2(params):
+    action = params.get("Action", [""])[0]
+    if action != "DescribeLoadBalancers":
+        return 400, query_error("InvalidAction", f"{action} is not in the mock yet")
+    members = "".join("<member>" + "".join(f"<{k}>{v}</{k}>" for k, v in lb.items()) + "</member>" for lb in ELB_LBS)
+    return 200, (f"<DescribeLoadBalancersResponse><DescribeLoadBalancersResult><LoadBalancers>{members}</LoadBalancers>"
+                 "</DescribeLoadBalancersResult></DescribeLoadBalancersResponse>")
+
+
+EXTRA_REST.append((lambda path: path.startswith("/2013-04-01/") or path.startswith("/2020-05-31/"), route53_rest))
 
 
 if __name__ == "__main__":
