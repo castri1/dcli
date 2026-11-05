@@ -18,9 +18,11 @@ pub mod dms;
 pub mod dynamodb;
 pub mod ec2;
 pub mod ecs;
+pub mod eks;
 pub mod error;
 pub mod events;
 pub mod http;
+pub mod k8s;
 pub mod lambda;
 pub mod logs;
 pub mod metrics;
@@ -265,6 +267,17 @@ impl Aws {
         let (_, amz_date) = amz_dates(now_secs() as i64);
         let query = sigv4::presign_query("GET", &host, &canonical_uri, &creds, &self.region, svc.signing_name, &amz_date, expires);
         Ok(format!("{base}{path}?{query}"))
+    }
+
+    /// A presigned GET of a query API at `/` (STS): `params` its own query parameters,
+    /// `headers` signed in (whoever uses the URL must send them). Valid `expires` seconds.
+    pub fn presign_api(&self, svc: &Service, params: &[(String, String)], headers: &[(String, String)], expires: u64) -> Result<String> {
+        let (base, host) = self.endpoint(svc);
+        let creds = self.creds.get()?;
+        let (_, amz_date) = amz_dates(now_secs() as i64);
+        let empty = sigv4::sha256_hex(b"");
+        let presign = sigv4::Presign { method: "GET", host: &host, canonical_uri: "/", params, headers, payload_hash: &empty };
+        Ok(format!("{base}/?{}", presign.query(&creds, &self.region, svc.signing_name, &amz_date, expires)))
     }
 
     /// Streams a GET to the file at `path`; returns the bytes written.

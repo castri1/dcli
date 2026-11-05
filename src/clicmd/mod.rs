@@ -13,6 +13,7 @@ pub mod dms;
 pub mod dns;
 pub mod dynamodb;
 pub mod ecs;
+pub mod eks;
 pub mod events;
 pub mod insights;
 pub mod lambda;

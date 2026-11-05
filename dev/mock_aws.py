@@ -4928,6 +4928,8 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def check_sig(self):
+        if self.path.startswith("/k8s/"):
+            return  # the fake Kubernetes API takes EKS tokens, not SigV4
         auth = self.headers.get("authorization", "")
         SIGNED["ok" if auth.startswith("AWS4-HMAC-SHA256 Credential=AKIDTEST/") and "Signature=" in auth else "unsigned"] += 1
 
@@ -6151,6 +6153,511 @@ def ecs_metric(namespace, name, dims, stat, period, ts):
 
 
 CW_METRIC_HOOKS.append(ecs_metric)
+
+# ---- EKS (restJson) and a fake Kubernetes API of its clusters -----------------------------------
+# shop-prod: standard support ending in 45 days, a degraded node group, a node group a version
+# behind, an add-on with an update and one degraded, failing pods (crash loop, image pull,
+# unschedulable, OOM kill, not ready). data-legacy: extended support, aws-auth only, and the
+# caller is not mapped (401). platform-dev: Auto Mode, the caller may read only a namespace (403).
+# vpn-only: a private endpoint nothing answers on. Kubernetes requests must carry an EKS token
+# whose presigned STS URL is signed (secret "test") for that cluster's name.
+import base64 as _b64  # noqa: E402
+import hmac as _hmac  # noqa: E402
+from urllib.parse import quote as _quote, urlparse as _urlparse  # noqa: E402
+
+EKS_DAY = 86400
+# version, status, end of standard support and of extended support (days from now)
+EKS_VERSIONS = [
+    ("1.30", "UNSUPPORTED", -420, -60),
+    ("1.31", "EXTENDED_SUPPORT", -300, 20),
+    ("1.32", "EXTENDED_SUPPORT", -60, 300),
+    ("1.33", "STANDARD_SUPPORT", 45, 410),
+    ("1.34", "STANDARD_SUPPORT", 200, 565),
+    ("1.35", "STANDARD_SUPPORT", 380, 745),
+]
+EKS_CLUSTERS = {
+    "shop-prod": {"version": "1.33", "auth": "API_AND_CONFIG_MAP", "support": "EXTENDED", "public": True, "cidrs": ["0.0.0.0/0"],
+                  "logs": ["api", "audit", "authenticator"], "issues": [], "k8s": "ok", "auto": False, "age": 700},
+    "data-legacy": {"version": "1.31", "auth": "CONFIG_MAP", "support": "EXTENDED", "public": True, "cidrs": ["0.0.0.0/0"],
+                    "logs": [], "k8s": "401", "auto": False, "age": 1300,
+                    "issues": [{"code": "Ec2SecurityGroupNotFound", "resourceIds": ["sg-0legacy1234"],
+                                "message": "We couldn't find one or more security group associated with your cluster."}]},
+    "platform-dev": {"version": "1.35", "auth": "API", "support": "STANDARD", "public": True, "cidrs": ["203.0.113.0/24", "0.0.0.0/0"],
+                     "logs": ["api"], "issues": [], "k8s": "403", "auto": True, "age": 90},
+    "vpn-only": {"version": "1.34", "auth": "API", "support": "EXTENDED", "public": False, "cidrs": [], "logs": [], "issues": [],
+                 "k8s": "unreachable", "auto": False, "age": 400},
+}
+_NG_ISSUE = {"code": "AsgInstanceLaunchFailures", "resourceIds": ["eks-workers-arm-4ac9-asg"],
+             "message": "Could not launch On-Demand Instances. InsufficientInstanceCapacity - We currently do not have sufficient "
+                        "m7g.xlarge capacity in the Availability Zone you requested (us-east-1c)."}
+EKS_NODEGROUPS = {
+    "shop-prod": [
+        {"nodegroupName": "workers-arm", "status": "DEGRADED", "capacityType": "ON_DEMAND", "instanceTypes": ["m7g.xlarge"],
+         "scalingConfig": {"minSize": 2, "maxSize": 6, "desiredSize": 3}, "amiType": "AL2023_ARM_64_STANDARD",
+         "releaseVersion": "1.33.5-20251020", "version": "1.33", "health": {"issues": [_NG_ISSUE]}},
+        {"nodegroupName": "workers-spot", "status": "ACTIVE", "capacityType": "SPOT", "instanceTypes": ["m6i.large", "m5.large"],
+         "scalingConfig": {"minSize": 0, "maxSize": 10, "desiredSize": 3}, "amiType": "AL2023_x86_64_STANDARD",
+         "releaseVersion": "1.32.9-20250915", "version": "1.32", "health": {"issues": []}},
+    ],
+    "data-legacy": [
+        {"nodegroupName": "etl", "status": "ACTIVE", "capacityType": "ON_DEMAND", "instanceTypes": ["r5.xlarge"],
+         "scalingConfig": {"minSize": 2, "maxSize": 2, "desiredSize": 2}, "amiType": "AL2_x86_64",
+         "releaseVersion": "1.30.4-20240917", "version": "1.30", "health": {"issues": []}},
+    ],
+    "platform-dev": [],
+    "vpn-only": [
+        {"nodegroupName": "system", "status": "ACTIVE", "capacityType": "ON_DEMAND", "instanceTypes": ["t3.large"],
+         "scalingConfig": {"minSize": 1, "maxSize": 3, "desiredSize": 2}, "amiType": "BOTTLEROCKET_x86_64",
+         "releaseVersion": "1.42.0-21ed13ac", "version": "1.34", "health": {"issues": []}},
+    ],
+}
+EKS_ADDON_VERSIONS = {"vpc-cni": ["v1.19.2-eksbuild.1", "v1.18.3-eksbuild.2", "v1.15.1-eksbuild.1"],
+                      "coredns": ["v1.11.4-eksbuild.2", "v1.10.1-eksbuild.13"],
+                      "aws-ebs-csi-driver": ["v1.37.0-eksbuild.1"], "metrics-server": ["v0.7.2-eksbuild.1"]}
+_CSI_ISSUE = {"code": "InsufficientNumberOfReplicas", "resourceIds": [],
+              "message": "The add-on is unhealthy because it doesn't have the desired number of replicas."}
+EKS_ADDONS = {
+    "shop-prod": [("vpc-cni", "v1.18.3-eksbuild.2", "ACTIVE", []), ("coredns", "v1.11.4-eksbuild.2", "ACTIVE", []),
+                  ("kube-proxy", "v1.33.0-eksbuild.2", "ACTIVE", []), ("aws-ebs-csi-driver", "v1.37.0-eksbuild.1", "DEGRADED", [_CSI_ISSUE])],
+    "data-legacy": [("vpc-cni", "v1.15.1-eksbuild.1", "ACTIVE", []), ("coredns", "v1.10.1-eksbuild.13", "ACTIVE", []),
+                    ("kube-proxy", "v1.31.0-eksbuild.2", "ACTIVE", [])],
+    "platform-dev": [("metrics-server", "v0.7.2-eksbuild.1", "ACTIVE", [])],
+    "vpn-only": [("vpc-cni", "v1.19.2-eksbuild.1", "ACTIVE", [])],
+}
+EKS_FARGATE = {"shop-prod": [{"fargateProfileName": "fp-batch", "status": "ACTIVE",
+                              "selectors": [{"namespace": "batch", "labels": {"app": "report"}}]}]}
+
+
+def _eks_insight(iid, name, status, reason, version, deprecations=None):
+    out = {"id": iid, "name": name, "category": "UPGRADE_READINESS", "kubernetesVersion": version,
+           "lastRefreshTime": T0 - 3600, "lastTransitionTime": T0 - 86400 * 3,
+           "description": f"Checks for {name.lower()}.", "insightStatus": {"status": status, "reason": reason}}
+    if deprecations:
+        out["recommendation"] = "Update manifests and API clients to use newer Kubernetes APIs if applicable before upgrading."
+        out["categorySpecificSummary"] = {"deprecationDetails": deprecations, "addonCompatibilityDetails": []}
+        out["resources"] = []
+    return out
+
+
+def _eks_insights(name):
+    nxt = {"shop-prod": "1.34", "data-legacy": "1.32", "platform-dev": "1.36", "vpn-only": "1.35"}[name]
+    skew = {"shop-prod": "workers-spot", "data-legacy": "etl"}.get(name)
+    deps = {
+        "shop-prod": [{"usage": "/apis/resource.k8s.io/v1beta1/resourceclaims", "replacedWith": "/apis/resource.k8s.io/v1beta2/resourceclaims",
+                       "stopServingVersion": "1.34", "startServingReplacementVersion": "1.33",
+                       "clientStats": [{"userAgent": "gpu-operator/v24.9.0", "numberOfRequestsLast30Days": 4310, "lastRequestTime": T0 - 3600}]}],
+        "data-legacy": [{"usage": "/apis/flowcontrol.apiserver.k8s.io/v1beta3/flowschemas", "replacedWith": "/apis/flowcontrol.apiserver.k8s.io/v1/flowschemas",
+                         "stopServingVersion": "1.32", "startServingReplacementVersion": "1.29",
+                         "clientStats": [{"userAgent": "kube-state-metrics/v2.9.2", "numberOfRequestsLast30Days": 86000, "lastRequestTime": T0 - 600}]}],
+    }.get(name)
+    version = EKS_CLUSTERS[name]["version"]
+    out = [_eks_insight(f"{name}-deprecated", f"Deprecated APIs removed in Kubernetes v{nxt}",
+                        ("ERROR" if name == "data-legacy" else "WARNING") if deps else "PASSING",
+                        f"Deprecated API usage detected within last 30 days and your cluster is on Kubernetes v{version}." if deps
+                        else "No deprecated API usage detected within the last 30 days.", nxt, deps)]
+    skewed = _eks_insight(f"{name}-skew", "Kubelet version skew", "WARNING" if skew else "PASSING",
+                          f"Node group {skew} runs a kubelet older than the control plane." if skew else "No kubelet version skew detected.", nxt)
+    if skew:
+        skewed["resources"] = [{"insightStatus": {"status": "WARNING"},
+                                "arn": f"arn:aws:eks:us-east-1:{ACCOUNT}:nodegroup/{name}/{skew}/0a1b2c3d"}]
+    out.append(skewed)
+    out.append(_eks_insight(f"{name}-addons", "Amazon EKS add-on version compatibility", "PASSING", "All add-ons are compatible.", nxt))
+    return out
+
+
+_EKS_ME = f"arn:aws:iam::{CE_DEFAULT_ACCOUNT}:user/demo"
+_POLICY = "arn:aws:eks::aws:cluster-access-policy/"
+EKS_ACCESS = {
+    "shop-prod": [
+        (f"arn:aws:iam::{ACCOUNT}:role/Admin", "STANDARD", [("AmazonEKSClusterAdminPolicy", "cluster", [])]),
+        (f"arn:aws:iam::{ACCOUNT}:role/AWSReservedSSO_Developers_0a1b2c3d", "STANDARD", [("AmazonEKSViewPolicy", "namespace", ["shop", "web"])]),
+        (f"arn:aws:iam::{ACCOUNT}:role/eks-node-role", "EC2_LINUX", []),
+        (_EKS_ME, "STANDARD", [("AmazonEKSViewPolicy", "cluster", [])]),
+    ],
+    "platform-dev": [(_EKS_ME, "STANDARD", [("AmazonEKSViewPolicy", "namespace", ["platform"])])],
+    "vpn-only": [(_EKS_ME, "STANDARD", [("AmazonEKSClusterAdminPolicy", "cluster", [])])],
+}
+
+# A month of EKS on the bill: three clusters at the standard rate, one in extended support.
+CE_SERVICES["Amazon Elastic Container Service for Kubernetes"] = [
+    ("AmazonEKS-Hours:perCluster", "Hrs", 72, 0.10),
+    ("AmazonEKS-Hours:extendedSupport", "Hrs", 24, 0.60),
+]
+
+
+def _eks_json(code, obj, kind=None):
+    headers = {"content-type": "application/json"}
+    if kind:
+        headers["x-amzn-errortype"] = kind
+    return code, headers, json.dumps(obj).encode()
+
+
+def _eks_not_found(what):
+    return _eks_json(404, {"message": f"No {what} found"}, "ResourceNotFoundException")
+
+
+def _k8s_tls_server(port):
+    """The fake Kubernetes API over HTTPS on `port`, with a certificate of a CA made for this run
+    (kubectl sends no credentials over plain http). Returns (host, the CA's PEM in base64)."""
+    import os
+    import ssl
+    import subprocess
+    import tempfile
+    import threading
+    d = tempfile.mkdtemp(prefix="dcli-mock-k8s-")
+    with open(os.path.join(d, "ca.cnf"), "w") as f:
+        f.write("[req]\ndistinguished_name=dn\nx509_extensions=ca\nprompt=no\n[dn]\nCN=dcli mock Kubernetes CA\n"
+                "[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n"
+                "[srv]\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+                "extendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1,DNS:localhost\n")
+    run = lambda *a: subprocess.run(["openssl", *a], cwd=d, check=True, capture_output=True)  # noqa: E731
+    run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "3", "-config", "ca.cnf")
+    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "srv.key", "-out", "srv.csr", "-subj", "/CN=127.0.0.1")
+    run("x509", "-req", "-in", "srv.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", "srv.pem",
+        "-days", "3", "-extfile", "ca.cnf", "-extensions", "srv")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(os.path.join(d, "srv.pem"), os.path.join(d, "srv.key"))
+    server = ThreadingHTTPServer(("127.0.0.1", port), H)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    with open(os.path.join(d, "ca.pem"), "rb") as f:
+        return f"127.0.0.1:{port}", _b64.b64encode(f.read()).decode()
+
+
+# Port of the mock + 1000; without openssl, the clusters answer on plain http (dcli accepts that
+# only with AWS_ENDPOINT_URL set; kubectl and k9s send no token there).
+K8S_TLS = None
+if __name__ == "__main__" and len(sys.argv) > 1:
+    try:
+        K8S_TLS = _k8s_tls_server(int(sys.argv[1]) + 1000)
+    except Exception as e:  # noqa: BLE001
+        print(f"mock: the fake Kubernetes API is on plain http ({e})", file=sys.stderr)
+
+
+def _eks_cluster(name, host):
+    c = EKS_CLUSTERS[name]
+    if c["k8s"] == "unreachable":
+        endpoint = "https://127.0.0.1:9" if K8S_TLS else "http://127.0.0.1:9"
+    elif K8S_TLS:
+        endpoint = f"https://{K8S_TLS[0]}/k8s/{name}"
+    else:
+        endpoint = f"http://{host}/k8s/{name}"
+    all_logs = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+    out = {
+        "name": name, "arn": f"arn:aws:eks:us-east-1:{ACCOUNT}:cluster/{name}", "createdAt": T0 - c["age"] * EKS_DAY,
+        "version": c["version"], "endpoint": endpoint, "roleArn": f"arn:aws:iam::{ACCOUNT}:role/eks-cluster-role",
+        "resourcesVpcConfig": {"subnetIds": ["subnet-0a1", "subnet-0b2"], "securityGroupIds": [], "vpcId": "vpc-0eks1234",
+                               "clusterSecurityGroupId": "sg-0cluster", "endpointPublicAccess": c["public"],
+                               "endpointPrivateAccess": True, "publicAccessCidrs": c["cidrs"]},
+        "logging": {"clusterLogging": [{"types": c["logs"], "enabled": True},
+                                       {"types": [t for t in all_logs if t not in c["logs"]], "enabled": False}]},
+        "status": "ACTIVE", "platformVersion": "eks.12", "tags": {"team": "platform"},
+        "health": {"issues": c["issues"]},
+        "accessConfig": {"authenticationMode": c["auth"], "bootstrapClusterCreatorAdminPermissions": True},
+        "upgradePolicy": {"supportType": c["support"]},
+    }
+    if K8S_TLS:
+        out["certificateAuthority"] = {"data": K8S_TLS[1]}
+    if c["auto"]:
+        out["computeConfig"] = {"enabled": True, "nodePools": ["general-purpose", "system"],
+                                "nodeRoleArn": f"arn:aws:iam::{ACCOUNT}:role/eks-auto-node"}
+    return out
+
+
+def eks_rest(method, path, query, headers, body):
+    p = [unquote(x) for x in path.strip("/").split("/")]
+    if p == ["cluster-versions"]:
+        versions = [{"clusterVersion": v, "clusterType": "eks", "versionStatus": s, "defaultVersion": v == "1.34",
+                     "releaseDate": T0 + (std - 425) * EKS_DAY, "endOfStandardSupportDate": T0 + std * EKS_DAY,
+                     "endOfExtendedSupportDate": T0 + ext * EKS_DAY, "kubernetesPatchVersion": f"{v}.4"}
+                    for v, s, std, ext in EKS_VERSIONS]
+        return _eks_json(200, {"clusterVersions": versions})
+    if p == ["addons", "supported-versions"]:
+        name, k8s = query.get("addonName", ""), query.get("kubernetesVersion", "")
+        versions = EKS_ADDON_VERSIONS.get(name) or ([f"v{k8s}.0-eksbuild.2"] if name == "kube-proxy" else [])
+        compat = [{"clusterVersion": v, "platformVersions": ["*"], "defaultVersion": False} for v, *_ in EKS_VERSIONS]
+        return _eks_json(200, {"addons": [{"addonName": name, "type": "networking", "owner": "aws",
+                                           "addonVersions": [{"addonVersion": x, "compatibilities": compat} for x in versions]}]})
+    if p[0] != "clusters":
+        return _eks_not_found(f"route for {method} {path}")
+    if len(p) == 1:
+        return _eks_json(200, {"clusters": sorted(EKS_CLUSTERS)})
+    name = p[1]
+    if name not in EKS_CLUSTERS:
+        return _eks_not_found(f"cluster found for name: {name}.")
+    if len(p) == 2:
+        return _eks_json(200, {"cluster": _eks_cluster(name, headers.get("host", "127.0.0.1"))})
+    sub, rest = p[2], p[3:]
+    if sub == "node-groups":
+        groups = {g["nodegroupName"]: g for g in EKS_NODEGROUPS.get(name, [])}
+        if not rest:
+            return _eks_json(200, {"nodegroups": sorted(groups)})
+        g = groups.get(rest[0])
+        if not g:
+            return _eks_not_found(f"node group found for name: {rest[0]}.")
+        return _eks_json(200, {"nodegroup": dict(g, clusterName=name, createdAt=T0 - 200 * EKS_DAY, modifiedAt=T0 - 3 * EKS_DAY)})
+    if sub == "addons":
+        addons = {a[0]: a for a in EKS_ADDONS.get(name, [])}
+        if not rest:
+            return _eks_json(200, {"addons": sorted(addons)})
+        a = addons.get(rest[0])
+        if not a:
+            return _eks_not_found(f"addon found for name: {rest[0]}.")
+        return _eks_json(200, {"addon": {"addonName": a[0], "clusterName": name, "addonVersion": a[1], "status": a[2],
+                                         "health": {"issues": a[3]}, "modifiedAt": T0 - 20 * EKS_DAY}})
+    if sub == "fargate-profiles":
+        profiles = {f["fargateProfileName"]: f for f in EKS_FARGATE.get(name, [])}
+        if not rest:
+            return _eks_json(200, {"fargateProfileNames": sorted(profiles)})
+        f = profiles.get(rest[0])
+        return _eks_json(200, {"fargateProfile": f}) if f else _eks_not_found(f"Fargate profile found for name: {rest[0]}.")
+    if sub == "insights":
+        insights = _eks_insights(name)
+        if not rest and method == "POST":
+            keys = ("id", "name", "category", "kubernetesVersion", "lastRefreshTime", "lastTransitionTime", "description", "insightStatus")
+            return _eks_json(200, {"insights": [{k: i[k] for k in keys} for i in insights]})
+        i = next((i for i in insights if rest and i["id"] == rest[0]), None)
+        return _eks_json(200, {"insight": i}) if i else _eks_not_found("insight")
+    if sub == "access-entries":
+        if EKS_CLUSTERS[name]["auth"] == "CONFIG_MAP":
+            return _eks_json(400, {"message": "The cluster's authentication mode must be set to one of [API, API_AND_CONFIG_MAP] to perform this operation."},
+                             "InvalidRequestException")
+        entries = {e[0]: e for e in EKS_ACCESS.get(name, [])}
+        if not rest:
+            return _eks_json(200, {"accessEntries": sorted(entries)})
+        e = entries.get(rest[0])
+        if not e:
+            return _eks_not_found(f"access entry found for principal {rest[0]}.")
+        if rest[1:] == ["access-policies"]:
+            policies = [{"policyArn": _POLICY + pol, "accessScope": {"type": scope, "namespaces": ns},
+                         "associatedAt": T0 - 30 * EKS_DAY} for pol, scope, ns in e[2]]
+            return _eks_json(200, {"clusterName": name, "principalArn": e[0], "associatedAccessPolicies": policies})
+        return _eks_json(200, {"accessEntry": {"clusterName": name, "principalArn": e[0], "type": e[1], "kubernetesGroups": [],
+                                               "username": e[0] if e[1] == "STANDARD" else "system:node:{{EC2PrivateDNSName}}",
+                                               "createdAt": T0 - 60 * EKS_DAY}})
+    return _eks_not_found(f"route for {method} {path}")
+
+
+EXTRA_REST.append((lambda path: path.startswith("/clusters") or path == "/cluster-versions" or path == "/addons/supported-versions", eks_rest))
+
+
+# -- the fake Kubernetes API ------------------------------------------------------------------------
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _k8s_token_ok(headers, cluster):
+    """The EKS token: k8s-aws-v1. + base64url of a presigned STS GetCallerIdentity whose signature
+    (with the mock's secret, "test") covers x-k8s-aws-id: <cluster>. Returns an error, or None."""
+    auth = headers.get("authorization", "")
+    prefix = "Bearer k8s-aws-v1."
+    if not auth.startswith(prefix):
+        return "no EKS token"
+    raw = auth[len(prefix):]
+    if "=" in raw:
+        return "the token is padded base64"
+    try:
+        url = _b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+    except Exception:
+        return "the token is not base64url"
+    u = _urlparse(url)
+    q = parse_qs(u.query)
+    one = lambda k: q.get(k, [""])[0]  # noqa: E731
+    if one("Action") != "GetCallerIdentity" or one("Version") != "2011-06-15":
+        return "the token is not a GetCallerIdentity"
+    signed = one("X-Amz-SignedHeaders").split(";")
+    if "x-k8s-aws-id" not in signed:
+        return "the token does not sign x-k8s-aws-id"
+    amz_date = one("X-Amz-Date")
+    try:
+        age = time.time() - calendar.timegm(time.strptime(amz_date, "%Y%m%dT%H%M%SZ"))
+    except ValueError:
+        return "bad X-Amz-Date"
+    if age > 900:
+        return "the token expired"
+    cred = one("X-Amz-Credential").split("/")
+    pairs = sorted((_quote(k, safe="-_.~"), _quote(v, safe="-_.~")) for k, vs in q.items() for v in vs if k != "X-Amz-Signature")
+    values = {"host": u.netloc, "x-k8s-aws-id": cluster}
+    canonical = "\n".join(["GET", u.path or "/", "&".join(f"{k}={v}" for k, v in pairs),
+                           "".join(f"{h}:{values.get(h, '')}\n" for h in signed), ";".join(signed), hashlib.sha256(b"").hexdigest()])
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, "/".join(cred[1:]), hashlib.sha256(canonical.encode()).hexdigest()])
+    key = b"AWS4test"
+    for part in cred[1:]:
+        key = _hmac.new(key, part.encode(), hashlib.sha256).digest()
+    if _hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest() != one("X-Amz-Signature"):
+        return f"the token's signature does not match cluster {cluster}"
+    return None
+
+
+def _k8s_status(code, reason, message):
+    return code, {"content-type": "application/json"}, json.dumps(
+        {"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure", "message": message, "reason": reason, "code": code}).encode()
+
+
+def _k8s_ok(obj):
+    return 200, {"content-type": "application/json"}, json.dumps(obj).encode()
+
+
+def _k8s_list(kind, items):
+    return _k8s_ok({"kind": kind, "apiVersion": "v1", "metadata": {"resourceVersion": "1"}, "items": items})
+
+
+def _cstat(name, image, ready=True, restarts=0, state=None, last=None):
+    return {"name": name, "image": image, "ready": ready, "restartCount": restarts,
+            "state": state or {"running": {"startedAt": _iso(T0 - 7200)}}, "lastState": last or {}}
+
+
+def _pod(ns, name, owner, phase, statuses, age=86400, conditions=None, node="ip-10-0-1-15.ec2.internal"):
+    containers = [{"name": s["name"], "image": s["image"], "env": [{"name": "DB_PASSWORD", "value": "hunter2-mock-secret"}]} for s in statuses]
+    return {"metadata": {"name": name, "namespace": ns, "creationTimestamp": _iso(T0 - age),
+                         "ownerReferences": [{"kind": owner[0], "name": owner[1]}] if owner else []},
+            "spec": {"nodeName": node if phase != "Pending" else None, "containers": containers},
+            "status": {"phase": phase, "conditions": conditions or [], "containerStatuses": statuses}}
+
+
+_ECR = f"{ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com"
+K8S_NAMESPACES = ["default", "kube-system", "shop", "web", "batch"]
+K8S_PODS = [
+    *[_pod("shop", f"checkout-5f7c9d8b4-{s}", ("ReplicaSet", "checkout-5f7c9d8b4"), "Running", [_cstat("app", f"{_ECR}/checkout:v3.2.0")]) for s in ("a1b2c", "d3e4f", "g5h6i")],
+    _pod("shop", "cart-7d9f8b6c5d-x2x9q", ("ReplicaSet", "cart-7d9f8b6c5d"), "Running",
+         [_cstat("app", f"{_ECR}/cart:v2.4.1", False, 14, {"waiting": {"reason": "CrashLoopBackOff", "message": "back-off 5m0s restarting failed container=app pod=cart-7d9f8b6c5d-x2x9q_shop"}},
+                 {"terminated": {"reason": "Error", "exitCode": 1, "finishedAt": _iso(T0 - 120)}})], age=3600),
+    _pod("shop", "cart-7d9f8b6c5d-q8w2e", ("ReplicaSet", "cart-7d9f8b6c5d"), "Pending",
+         [_cstat("app", f"{_ECR}/cart:v2.4.1-rc", False, 0, {"waiting": {"reason": "ImagePullBackOff", "message": f'Back-off pulling image "{_ECR}/cart:v2.4.1-rc"'}})], age=3600),
+    _pod("shop", "cart-7d9f8b6c5d-z9k4t", ("ReplicaSet", "cart-7d9f8b6c5d"), "Pending", [], age=3600,
+         conditions=[{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                      "message": "0/6 nodes are available: 3 Insufficient memory, 3 node(s) had untolerated taint {node.kubernetes.io/unreachable: }. "
+                                 "preemption: 0/6 nodes are available: 6 No preemption victims found for incoming pod."}]),
+    _pod("batch", "report-28934-7xk2p", ("Job", "report-28934"), "Running",
+         [_cstat("job", f"{_ECR}/report:v1.9.0", False, 3, {"waiting": {"reason": "CrashLoopBackOff", "message": "back-off 40s"}},
+                 {"terminated": {"reason": "OOMKilled", "exitCode": 137, "finishedAt": _iso(T0 - 60)}})], age=1800),
+    *[_pod("web", f"frontend-6c8d7f9b5-{s}", ("ReplicaSet", "frontend-6c8d7f9b5"), "Running", [_cstat("web", f"{_ECR}/frontend:v8.1.3")]) for s in ("mn4op", "qr5st")],
+    *[_pod("kube-system", f"coredns-7bb5c8f9d4-{s}", ("ReplicaSet", "coredns-7bb5c8f9d4"), "Running",
+           [_cstat("coredns", "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/coredns:v1.11.4-eksbuild.2")]) for s in ("k7x2a", "p9w3b")],
+    _pod("kube-system", "ebs-csi-controller-6d9f7c8b5-r2d2c", ("ReplicaSet", "ebs-csi-controller-6d9f7c8b5"), "Running",
+         [_cstat("ebs-plugin", "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/aws-ebs-csi-driver:v1.37.0")]),
+    _pod("kube-system", "ebs-csi-controller-6d9f7c8b5-c3p0x", ("ReplicaSet", "ebs-csi-controller-6d9f7c8b5"), "Running",
+         [_cstat("ebs-plugin", "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/aws-ebs-csi-driver:v1.37.0", False)], age=7200),
+    _pod("default", "migrate-db-29001-hx8kq", ("Job", "migrate-db-29001"), "Succeeded",
+         [_cstat("migrate", f"{_ECR}/migrate:v5", False, 0, {"terminated": {"reason": "Completed", "exitCode": 0}})]),
+]
+
+
+def _deploy(ns, name, replicas, ready, conditions=None):
+    conds = conditions or [{"type": "Available", "status": "True", "reason": "MinimumReplicasAvailable"},
+                           {"type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable"}]
+    return {"metadata": {"name": name, "namespace": ns}, "spec": {"replicas": replicas},
+            "status": {"replicas": replicas, "readyReplicas": ready, "updatedReplicas": replicas, "availableReplicas": ready, "conditions": conds}}
+
+
+K8S_DEPLOYMENTS = [
+    _deploy("shop", "checkout", 3, 3),
+    _deploy("shop", "cart", 3, 0, [{"type": "Available", "status": "False", "reason": "MinimumReplicasUnavailable",
+                                     "message": "Deployment does not have minimum availability."},
+                                    {"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded",
+                                     "message": 'ReplicaSet "cart-7d9f8b6c5d" has timed out progressing.'}]),
+    _deploy("web", "frontend", 2, 2),
+    _deploy("kube-system", "coredns", 2, 2),
+    _deploy("kube-system", "ebs-csi-controller", 2, 1, [{"type": "Available", "status": "True", "reason": "MinimumReplicasAvailable"},
+                                                        {"type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable"}]),
+]
+K8S_EVENTS = {
+    ("shop", "cart-7d9f8b6c5d-x2x9q"): [("BackOff", 212, 30, "Back-off restarting failed container app in pod cart-7d9f8b6c5d-x2x9q_shop")],
+    ("shop", "cart-7d9f8b6c5d-q8w2e"): [
+        ("Failed", 31, 50, f'Failed to pull image "{_ECR}/cart:v2.4.1-rc": rpc error: code = NotFound desc = failed to pull and unpack image: '
+                           f'{_ECR}/cart:v2.4.1-rc: not found'),
+        ("BackOff", 290, 20, f'Back-off pulling image "{_ECR}/cart:v2.4.1-rc"')],
+    ("shop", "cart-7d9f8b6c5d-z9k4t"): [("FailedScheduling", 44, 40, "0/6 nodes are available: 3 Insufficient memory, 3 node(s) had untolerated taint "
+                                                                      "{node.kubernetes.io/unreachable: }.")],
+    ("batch", "report-28934-7xk2p"): [("BackOff", 9, 15, "Back-off restarting failed container job in pod report-28934-7xk2p_batch")],
+    ("kube-system", "ebs-csi-controller-6d9f7c8b5-c3p0x"): [("Unhealthy", 120, 10, "Readiness probe failed: HTTP probe failed with statuscode: 500")],
+}
+K8S_LOGS = {
+    ("cart-7d9f8b6c5d-x2x9q", "app", True): [
+        "2026-11-05T10:01:02Z INFO starting cart service v2.4.1",
+        "2026-11-05T10:01:02Z INFO connecting to redis at ${REDIS_URL}",
+        "2026-11-05T10:01:03Z ERROR config: REDIS_URL is not a valid URL: missing scheme",
+        "panic: redis: invalid URL scheme: \"\"",
+        "goroutine 1 [running]:",
+        "main.main()\n\t/src/cmd/cart/main.go:48 +0x1d4",
+    ],
+    ("cart-7d9f8b6c5d-x2x9q", "app", False): ["2026-11-05T10:06:02Z INFO starting cart service v2.4.1"],
+    ("report-28934-7xk2p", "job", True): [
+        "INFO loading orders for 2026-10 (2,301,554 rows)",
+        "INFO building the monthly report in memory",
+        "fatal error: runtime: out of memory",
+    ],
+    ("report-28934-7xk2p", "job", False): ["INFO loading orders for 2026-10 (2,301,554 rows)"],
+    ("ebs-csi-controller-6d9f7c8b5-c3p0x", "ebs-plugin", False): [
+        "I1105 10:00:01 driver.go:84] Driver: ebs.csi.aws.com Version: v1.37.0",
+        "E1105 10:00:04 metadata.go:51] failed to get instance metadata: EC2MetadataError: failed to make EC2Metadata request (hop limit 1)",
+    ],
+}
+
+
+def k8s_rest(method, path, query, headers, body):
+    p = [unquote(x) for x in path.split("/")]  # ['', 'k8s', cluster, ...]
+    cluster, rest = p[2], "/" + "/".join(p[3:])
+    c = EKS_CLUSTERS.get(cluster)
+    if c is None:
+        return _k8s_status(404, "NotFound", f"no cluster {cluster}")
+    why = _k8s_token_ok(headers, cluster)
+    if why or c["k8s"] == "401":
+        return _k8s_status(401, "Unauthorized", "Unauthorized")
+    resource = {"/api/v1/namespaces": "namespaces", "/apis/apps/v1/deployments": "deployments", "/api/v1/pods": "pods"}.get(rest)
+    if c["k8s"] == "403" and resource:
+        group = "apps" if resource == "deployments" else ""
+        return _k8s_status(403, "Forbidden", f'{resource} is forbidden: User "{_EKS_ME}" cannot list resource "{resource}" in API group "{group}" at the cluster scope')
+    if method != "GET":
+        return _k8s_status(405, "MethodNotAllowed", "the mock only reads")
+    # Discovery, enough for kubectl get pods|deployments|namespaces|events.
+    res = lambda name, kind, ns: {"name": name, "singularName": "", "namespaced": ns, "kind": kind, "verbs": ["get", "list"]}  # noqa: E731
+    if rest == "/api":
+        return _k8s_ok({"kind": "APIVersions", "versions": ["v1"], "serverAddressByClientCIDRs": []})
+    if rest == "/apis":
+        return _k8s_ok({"kind": "APIGroupList", "apiVersion": "v1", "groups": [
+            {"name": "apps", "versions": [{"groupVersion": "apps/v1", "version": "v1"}], "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"}}]})
+    if rest == "/api/v1":
+        return _k8s_ok({"kind": "APIResourceList", "groupVersion": "v1", "resources": [
+            res("pods", "Pod", True), res("namespaces", "Namespace", False), res("events", "Event", True), res("pods/log", "Pod", True)]})
+    if rest == "/apis/apps/v1":
+        return _k8s_ok({"kind": "APIResourceList", "groupVersion": "apps/v1", "resources": [res("deployments", "Deployment", True)]})
+    if rest == "/api/v1/namespaces":
+        return _k8s_list("NamespaceList", [{"metadata": {"name": n}, "status": {"phase": "Active"}} for n in K8S_NAMESPACES])
+    if rest == "/apis/apps/v1/deployments":
+        return _k8s_list("DeploymentList", K8S_DEPLOYMENTS)
+    if rest == "/api/v1/pods":
+        return _k8s_list("PodList", K8S_PODS)
+    m = re.fullmatch(r"/api/v1/namespaces/([^/]+)/events", rest)
+    if m:
+        fields = dict(f.split("=", 1) for f in query.get("fieldSelector", "").split(",") if "=" in f)
+        events = [{"metadata": {"name": f"{fields.get('involvedObject.name')}.{i}", "namespace": m.group(1)}, "type": "Warning",
+                   "reason": r, "message": msg, "count": n, "lastTimestamp": _iso(T0 - ago * 60),
+                   "involvedObject": {"kind": "Pod", "name": fields.get("involvedObject.name")}}
+                  for i, (r, n, ago, msg) in enumerate(K8S_EVENTS.get((m.group(1), fields.get("involvedObject.name")), []))]
+        return _k8s_list("EventList", events if fields.get("type", "Warning") == "Warning" else [])
+    m = re.fullmatch(r"/api/v1/namespaces/([^/]+)/pods/([^/]+)/log", rest)
+    if m:
+        pod = next((x for x in K8S_PODS if x["metadata"]["namespace"] == m.group(1) and x["metadata"]["name"] == m.group(2)), None)
+        if not pod:
+            return _k8s_status(404, "NotFound", f'pods "{m.group(2)}" not found')
+        container = query.get("container") or pod["spec"]["containers"][0]["name"]
+        previous = query.get("previous") == "true"
+        status = next((s for s in pod["status"]["containerStatuses"] if s["name"] == container), None)
+        if status is None:
+            return _k8s_status(400, "BadRequest", f'container {container} is not valid for pod {m.group(2)}')
+        if previous and not status["lastState"]:
+            return _k8s_status(400, "BadRequest", f'previous terminated container "{container}" in pod "{m.group(2)}" not found')
+        if "waiting" in status["state"] and status["state"]["waiting"]["reason"] != "CrashLoopBackOff" and not previous:
+            return _k8s_status(400, "BadRequest", f'container "{container}" in pod "{m.group(2)}" is waiting to start: {status["state"]["waiting"]["reason"]}')
+        lines = K8S_LOGS.get((m.group(2), container, previous), [f"{_iso(T0)} INFO {container} up"])
+        tail = int(query.get("tailLines", 0) or 0)
+        text = "\n".join(lines[-tail:] if tail else lines) + "\n"
+        return 200, {"content-type": "text/plain"}, text.encode()
+    return _k8s_status(404, "NotFound", f"the server could not find the requested resource ({rest})")
+
+
+EXTRA_REST.append((lambda path: path.startswith("/k8s/"), k8s_rest))
 
 
 if __name__ == "__main__":

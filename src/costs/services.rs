@@ -20,6 +20,7 @@ const SERVICES: &[(&str, &str, Option<&str>)] = &[
     ("AWS Systems Manager", "Parameters", None),
     ("Amazon EventBridge", "EventBridge", None),
     ("AWS AppConfig", "AppConfig", None),
+    ("Amazon Elastic Container Service for Kubernetes", "EKS", Some("EKS")),
 ];
 
 /// Services a Savings check looks at that no dcli module explores: (Cost Explorer's name,

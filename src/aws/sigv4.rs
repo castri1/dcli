@@ -120,24 +120,60 @@ pub fn presign_query(
     amz_date: &str,
     expires: u64,
 ) -> String {
-    let date = &amz_date[..8];
-    let scope = format!("{date}/{region}/{service}/aws4_request");
-    let mut query: Vec<(String, String)> = vec![
-        ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
-        ("X-Amz-Credential".into(), format!("{}/{scope}", creds.access_key_id)),
-        ("X-Amz-Date".into(), amz_date.into()),
-        ("X-Amz-Expires".into(), expires.to_string()),
-        ("X-Amz-SignedHeaders".into(), "host".into()),
-    ];
-    if let Some(token) = &creds.session_token {
-        query.push(("X-Amz-Security-Token".into(), token.clone()));
+    let presign = Presign { method, host, canonical_uri, params: &[], headers: &[], payload_hash: "UNSIGNED-PAYLOAD" };
+    presign.query(creds, region, service, amz_date, expires)
+}
+
+/// A presigned request in general: query parameters of its own (`Action`…) and headers that
+/// are signed in and must be sent with it (an EKS token signs `x-k8s-aws-id`).
+pub struct Presign<'a> {
+    pub method: &'a str,
+    pub host: &'a str,
+    pub canonical_uri: &'a str,
+    /// Raw (unencoded) query parameters besides the signature's own.
+    pub params: &'a [(String, String)],
+    /// Headers signed besides `host`.
+    pub headers: &'a [(String, String)],
+    /// `UNSIGNED-PAYLOAD` (S3), or the SHA-256 of the body (of the empty body of a GET, as
+    /// the SDKs presign requests to other services).
+    pub payload_hash: &'a str,
+}
+
+impl Presign<'_> {
+    /// The query string, signature included, valid `expires` seconds from `amz_date`.
+    pub fn query(&self, creds: &Credentials, region: &str, service: &str, amz_date: &str, expires: u64) -> String {
+        let date = &amz_date[..8];
+        let scope = format!("{date}/{region}/{service}/aws4_request");
+        let mut headers: Vec<(String, String)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.split_whitespace().collect::<Vec<_>>().join(" ")))
+            .collect();
+        headers.push(("host".into(), self.host.into()));
+        headers.sort();
+        let signed_headers = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+        let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+        let mut query: Vec<(String, String)> = self.params.to_vec();
+        query.extend([
+            ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
+            ("X-Amz-Credential".into(), format!("{}/{scope}", creds.access_key_id)),
+            ("X-Amz-Date".into(), amz_date.into()),
+            ("X-Amz-Expires".into(), expires.to_string()),
+            ("X-Amz-SignedHeaders".into(), signed_headers.clone()),
+        ]);
+        if let Some(token) = &creds.session_token {
+            query.push(("X-Amz-Security-Token".into(), token.clone()));
+        }
+        let query_string = canonical_query(&query);
+        let canonical_request = format!(
+            "{}\n{}\n{query_string}\n{canonical_headers}\n{signed_headers}\n{}",
+            self.method, self.canonical_uri, self.payload_hash
+        );
+        let string_to_sign =
+            format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
+        let signature = hex(&hmac(&signing_key(creds, date, region, service), string_to_sign.as_bytes()));
+        format!("{query_string}&X-Amz-Signature={signature}")
     }
-    let query_string = canonical_query(&query);
-    let canonical_request = format!("{method}\n{canonical_uri}\n{query_string}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
-    let string_to_sign =
-        format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
-    let signature = hex(&hmac(&signing_key(creds, date, region, service), string_to_sign.as_bytes()));
-    format!("{query_string}&X-Amz-Signature={signature}")
 }
 
 #[cfg(test)]
@@ -251,5 +287,26 @@ mod tests {
         let query =
             presign_query("GET", "examplebucket.s3.amazonaws.com", "/test.txt", &creds, "us-east-1", "s3", "20130524T000000Z", 86400);
         assert!(query.ends_with("X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"), "{query}");
+    }
+
+    /// An EKS token's presigned STS GetCallerIdentity, as botocore signs it for `aws eks
+    /// get-token` (SigV4QueryAuth: the empty payload's hash, `x-k8s-aws-id` signed).
+    #[test]
+    fn presigned_sts_matches_botocore() {
+        let creds = Credentials {
+            access_key_id: "AKIDEXAMPLE".into(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            session_token: Some("FwoGZXIvYXdzEXAMPLE/token+==".into()),
+            expires_at: None,
+        };
+        let params = [("Action".to_string(), "GetCallerIdentity".to_string()), ("Version".to_string(), "2011-06-15".to_string())];
+        let headers = [("x-k8s-aws-id".to_string(), "demo-cluster".to_string())];
+        let empty = sha256_hex(b"");
+        let presign =
+            Presign { method: "GET", host: "sts.us-east-1.amazonaws.com", canonical_uri: "/", params: &params, headers: &headers, payload_hash: &empty };
+        let query = presign.query(&creds, "us-east-1", "sts", "20240102T030405Z", 60);
+        assert!(query.contains("X-Amz-SignedHeaders=host%3Bx-k8s-aws-id"), "{query}");
+        assert!(query.contains("X-Amz-Security-Token=FwoGZXIvYXdzEXAMPLE%2Ftoken%2B%3D%3D"), "{query}");
+        assert!(query.ends_with("X-Amz-Signature=4f3f53a7619c2b46e1f0b9701a762df91859121dbf0aa2ba6075e59b50014a38"), "{query}");
     }
 }

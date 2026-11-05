@@ -19,6 +19,7 @@ pub mod custom_metrics;
 pub mod dms;
 pub mod dynamodb;
 pub mod ec2;
+pub mod eks;
 pub mod lambda;
 pub mod logs;
 pub mod price;
@@ -282,6 +283,7 @@ pub const CHECKS: &[(&str, Check)] = &[
     ("Redshift", redshift::check),
     ("DMS", dms::check),
     ("EC2", ec2::check),
+    ("EKS", eks::check),
     ("X-Ray", xray::check),
     ("Bedrock", bedrock::check),
 ];
@@ -301,6 +303,7 @@ pub fn find_service(name: &str) -> Option<&'static str> {
         "apigw" | "apigateway" | "api" => "API Gateway",
         "ec2" | "nat" | "ebs" | "vpc" | "ipv4" | "eip" => "EC2",
         "xray" => "X-Ray",
+        "eks" | "kubernetes" | "k8s" => "EKS",
         _ => "",
     };
     if !alias.is_empty() {

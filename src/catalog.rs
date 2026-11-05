@@ -1,7 +1,7 @@
 //! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, ECS
 //! clusters and services, log groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues,
 //! tables, API Gateway APIs, Aurora and Redshift clusters, DMS replication tasks, event
-//! buses, AppConfig applications, alarms and Route 53 hosted zones, each with the module that opens it. Services are listed in parallel and capped; a service the user cannot read is left out.
+//! buses, AppConfig applications, alarms, Route 53 hosted zones and EKS clusters, each with the module that opens it. Services are listed in parallel and capped; a service the user cannot read is left out.
 
 use crate::aws::{self, Aws, alarms, appconfig, cloudformation, dynamodb, events, lambda, logs, route53, s3, secrets, sfn, sqs, ssm};
 use crate::util::show_invisible;
@@ -48,6 +48,7 @@ const LISTERS: &[(&str, Lister)] = &[
     ("AppConfig", applications),
     ("Alarms", alarm_list),
     ("Route 53", zones),
+    ("EKS", eks_clusters),
 ];
 
 /// What [`list`] found.
@@ -180,6 +181,11 @@ fn alarm_list(aws: &Aws) -> aws::Result<Vec<Resource>> {
     // Alarm names are kept byte-exact for the API: shown with their invisible characters made visible.
     let list = alarms::describe_alarms(aws)?;
     Ok(list.iter().map(|a| Resource::new("Alarms", &show_invisible(&a.name), a.name.clone(), "alarm")).collect())
+}
+
+/// EKS clusters; the target is the cluster name.
+fn eks_clusters(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    Ok(aws::eks::list_clusters(aws)?.iter().map(|c| Resource::new("EKS", c, c.clone(), "Kubernetes cluster")).collect())
 }
 
 fn zones(aws: &Aws) -> aws::Result<Vec<Resource>> {

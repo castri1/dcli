@@ -16,6 +16,7 @@ mod cwlogs;
 mod dms;
 mod dynamodb;
 mod ecs;
+mod eks;
 mod events;
 mod lambda;
 mod matrix;
@@ -45,6 +46,7 @@ pub fn all() -> Vec<Box<dyn Module>> {
         Box::new(secrets::Secrets::new()),
         Box::new(lambda::Lambda::new()),
         Box::new(ecs::Ecs::new()),
+        Box::new(eks::Eks::new()),
         Box::new(apigateway::ApiGateway::new()),
         Box::new(cwlogs::CwLogs::new()),
         Box::new(cfn::CloudFormation::new()),

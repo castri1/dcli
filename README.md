@@ -5,8 +5,9 @@ where, promote and rollback, an inbox of approvals), **CloudWatch** alarms, Logs
 Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke), **ECS** and
 Fargate (deployments, why tasks stopped, redeploy, scale, roll back), **API Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **Aurora**
 (topology, performance, top SQL, failover), **Redshift** (nodes, queries, table health),
-**DMS** (tasks, tables, CDC latency), **EventBridge**, **AppConfig** feature flags and
-**Route 53** records, plus
+**DMS** (tasks, tables, CDC latency), **EventBridge**, **AppConfig** feature flags,
+**Route 53** records and **EKS** (version support, node groups, add-ons, upgrade insights,
+failing pods, k9s on any cluster), plus
 **Costs** from Cost Explorer and a **Savings** scan of what could cost less, priced with your
 bill's own rates. Failures (pipelines, executions, functions, stacks,
 routes, migration tasks) and slow databases can be copied as Markdown reports for an AI agent,
@@ -134,6 +135,11 @@ dcli dns prod acme.dev --create shop --type A --value 192.0.2.50 --value 192.0.2
 dcli dns prod acme.dev --create www --alias d111111abcdef8.cloudfront.net   # alias: CloudFront, load balancer, API Gateway domain or a record
 dcli dns prod acme.dev --edit legacy --ttl 60 --wait              # atomic: refused if the record changed meanwhile
 dcli dns prod acme.dev --edit app --set-id blue --evaluate-health false   # records under a routing policy, by set id
+dcli eks                                                          # EKS clusters: Kubernetes version, support (extended costs ~6×)
+dcli eks prod shop                                                # node groups, add-ons and updates, upgrade insights, access
+dcli eks prod shop --pods                                         # deployments and pods not well (read inside the cluster)
+dcli eks prod shop --report                                       # Markdown for an AI agent, with events and logs of failing pods
+eval "$(dcli eks prod shop --kubeconfig)"                         # KUBECONFIG for kubectl/k9s; tokens come from dcli
 dcli apigw                                                        # API Gateway: REST, HTTP and WebSocket APIs
 dcli apigw public-api --stages                                    # which deployment each stage runs
 dcli apigw public-api --metrics -s prod --route 'POST /orders' --since 1h
@@ -217,6 +223,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | EventBridge | `Enter` a bus's rules · `→` targets, `Enter` on one opens it (Lambda, Step Functions, Logs) · `t` send a test event · `y` copy the pattern · `o` console |
 | AppConfig | `Enter` application → profile → flags · `↑↓←→` flag × environment · `Enter` edit and deploy · `n` new flag in the selected environment (in the profile list: new feature flag profile) · `x` stop the deployment (rolls back) · `y` copy the document |
 | Route 53 | `Enter`/`Esc` open a hosted zone / back · `/` search records (name, type, value) · `n` new record (values, or an alias) · `Enter` edit what the selected record answers · `y` copy the name (zone list: the id) · `c` copy the values · `o` console · `r` reload |
+| EKS | `↑↓` cluster · `←→` overview / node groups / add-ons / insights / access / workloads · `Enter` its rows (an insight opens its deprecated APIs; a pod its warning events and logs, `p` the other run; a deployment its conditions and events) · `w` workloads · `a` every deployment / those not well · `K` k9s on the cluster · `c` copy a report for AI · `l` control plane logs · `y` copy · `/` search · `o` console · `r` reload |
 
 Lists with a search box (`:`, `e`, `n`) filter as you type; `Space` marks several items
 where that makes sense and `Ctrl+A` marks every match.
@@ -226,7 +233,7 @@ shows only the current one, and `:` reaches the rest by name. Modules with somet
 show it there: approvals waiting, alarms firing, DMS tasks failed.
 
 Typing in `:` also searches the environment's resources by name: pipelines, functions, ECS
-clusters and services, log groups, parameters, secrets, stacks, buckets, state machines, queues, tables, APIs, Aurora and
+clusters and services, EKS clusters, log groups, parameters, secrets, stacks, buckets, state machines, queues, tables, APIs, Aurora and
 Redshift clusters, DMS tasks, event buses, AppConfig applications, alarms and Route 53 hosted zones (listed in the background the first time, then kept for
 five minutes). Enter opens the resource in its module.
 
