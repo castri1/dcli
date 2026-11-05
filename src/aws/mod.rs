@@ -17,6 +17,7 @@ pub mod credentials;
 pub mod dms;
 pub mod dynamodb;
 pub mod ec2;
+pub mod ecs;
 pub mod error;
 pub mod events;
 pub mod http;

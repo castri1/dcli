@@ -5015,7 +5015,8 @@ class H(BaseHTTPRequestHandler):
                    "AWSStepFunctions": stepfunctions, "DynamoDB_20120810": dynamodb, "AWSEvents": eventbridge,
                    "AmazonSQS": sqs, "PerformanceInsightsv20180227": performance_insights,
                    "AmazonDMSv20160101": dms, "RedshiftData": redshift_data,
-                   "AWSInsightsIndexService": cost_explorer}.get(prefix)
+                   "AWSInsightsIndexService": cost_explorer,
+                   "AmazonEC2ContainerServiceV20141113": ecs}.get(prefix)
         try:
             self.reply(200, handler(op, body))
         except Exception as e:
@@ -5664,6 +5665,492 @@ def elbv2(params):
 
 
 EXTRA_REST.append((lambda path: path.startswith("/2013-04-01/") or path.startswith("/2020-05-31/"), route53_rest))
+
+
+# ---- ECS (awsJson 1.1, AmazonEC2ContainerServiceV20141113) --------------------------------------
+# Two clusters: acme-apps (Fargate and Fargate Spot) and acme-batch (EC2 container instances).
+# checkout-web's last deployment (revision 18) failed: the circuit breaker rolled it back to 17
+# after its tasks exited (exit 1, and one out of memory). payments-worker is a task short after a
+# Spot interruption, legacy-web deploys with CodeDeploy, ingest with an external controller,
+# reports-cron is scaled to 0. UpdateService starts deployments that finish in about 8 seconds
+# (revision 18 of checkout-web fails again and rolls back); desired counts settle in 4 seconds.
+ECS_ARN = f"arn:aws:ecs:us-east-1:{ACCOUNT}"
+ECS_CLUSTERS = {
+    "acme-apps": {"capacityProviders": ["FARGATE", "FARGATE_SPOT"], "insights": "enabled", "instances": 0},
+    "acme-batch": {"capacityProviders": [], "insights": "disabled", "instances": 3},
+}
+# family → (revisions, cpu, memory, container port)
+ECS_FAMILIES = {
+    "orders-api": (range(38, 43), "512", "1024", 8080),
+    "checkout-web": (range(14, 19), "512", "1024", 3000),
+    "payments-worker": (range(9, 12), "256", "512", None),
+    "legacy-web": (range(4, 6), "1024", "2048", 80),
+    "reports-cron": (range(2, 4), "256", "512", None),
+    "image-worker": (range(5, 8), None, None, None),
+    "ingest": (range(1, 3), "256", "512", None),
+}
+ECS_SERVICES = {
+    ("acme-apps", "orders-api"): {"launchType": "FARGATE", "rev": 42, "desired": 3, "breaker": True, "tg": "orders-api-tg"},
+    ("acme-apps", "checkout-web"): {"launchType": "FARGATE", "rev": 17, "desired": 2, "breaker": True, "tg": "checkout-web-tg",
+                                    "failed": {"rev": 18, "ago": 540}},
+    ("acme-apps", "payments-worker"): {"capacity": [("FARGATE_SPOT", 4, 0), ("FARGATE", 1, 1)], "rev": 11, "desired": 2,
+                                       "running": 1, "breaker": False},
+    ("acme-apps", "legacy-web"): {"launchType": "FARGATE", "rev": 5, "desired": 2, "controller": "CODE_DEPLOY", "tg": "legacy-blue"},
+    ("acme-apps", "reports-cron"): {"launchType": "FARGATE", "rev": 3, "desired": 0, "breaker": True},
+    ("acme-batch", "image-worker"): {"launchType": "EC2", "rev": 7, "desired": 4, "breaker": True},
+    ("acme-batch", "ingest"): {"launchType": "EC2", "rev": 2, "desired": 1, "controller": "EXTERNAL"},
+}
+ECS_STATE = {}  # (cluster, service) → {"deployments": [...], "events": [...], "desired": n, "desired_at": t, "from": n}
+ECS_LOCK = __import__("threading").RLock()
+
+
+def _ecs_td_arn(family, rev):
+    return f"{ECS_ARN}:task-definition/{family}:{rev}"
+
+
+def _ecs_id(*parts):
+    return hashlib.md5("/".join(map(str, parts)).encode()).hexdigest()
+
+
+def _ecs_family(key):
+    return key[1]
+
+
+def _ecs_td(family, rev):
+    revs, cpu, memory, port = ECS_FAMILIES[family]
+    app = {
+        "name": "app", "image": f"{ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/{family}:1.{rev}.0", "essential": True,
+        "environment": [{"name": "NODE_ENV", "value": "production"},
+                        {"name": "DATABASE_URL", "value": "postgres://app:plain-text-password@db.internal:5432/app"}],
+        "secrets": [{"name": "STRIPE_KEY", "valueFrom": f"arn:aws:secretsmanager:us-east-1:{ACCOUNT}:secret:prod/{family}/stripe-AbCdEf"}],
+        "logConfiguration": {"logDriver": "awslogs", "options": {
+            "awslogs-group": f"/ecs/{family}", "awslogs-region": "us-east-1", "awslogs-stream-prefix": "ecs"}},
+    }
+    if port:
+        app["portMappings"] = [{"containerPort": port, "hostPort": port, "protocol": "tcp"}]
+    if family == "orders-api":
+        app["healthCheck"] = {"command": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"], "interval": 30,
+                              "timeout": 5, "retries": 3, "startPeriod": 60}
+    if family == "checkout-web" and rev == 18:
+        app["memory"] = 512
+    if family == "image-worker":
+        # No stream prefix: on EC2 the streams are then named after the Docker container ids.
+        del app["logConfiguration"]["options"]["awslogs-stream-prefix"]
+        app["cpu"], app["memory"] = 1024, 2048
+    if family == "ingest":
+        app["logConfiguration"] = {"logDriver": "awsfirelens", "options": {"Name": "datadog"}}
+    containers = [app]
+    if family == "orders-api":
+        containers.append({"name": "datadog-agent", "image": "public.ecr.aws/datadog/agent:7", "essential": False, "cpu": 64,
+                           "memoryReservation": 128, "environment": [{"name": "DD_API_KEY", "value": "dd-plain-text-key"}],
+                           "logConfiguration": {"logDriver": "awslogs", "options": {
+                               "awslogs-group": "/ecs/orders-api", "awslogs-region": "us-east-1", "awslogs-stream-prefix": "ecs"}}})
+    ec2 = family in ("image-worker", "ingest")
+    td = {"taskDefinitionArn": _ecs_td_arn(family, rev), "family": family, "revision": rev, "status": "ACTIVE",
+          "containerDefinitions": containers, "networkMode": "bridge" if ec2 else "awsvpc",
+          "requiresCompatibilities": ["EC2"] if ec2 else ["FARGATE"],
+          "executionRoleArn": f"arn:aws:iam::{ACCOUNT}:role/ecsTaskExecutionRole",
+          "taskRoleArn": f"arn:aws:iam::{ACCOUNT}:role/{family}-task",
+          "registeredAt": T0 - 86400 * (max(revs) - rev + 1) - 3600 * (rev % 5)}
+    if cpu:
+        td["cpu"], td["memory"] = cpu, memory
+    return td
+
+
+def _ecs_find_td(ref):
+    """A task definition by ARN, `family:revision` or `family` (its latest)."""
+    name = ref.rsplit("/", 1)[-1]
+    family, _, rev = name.partition(":")
+    if family not in ECS_FAMILIES:
+        raise KeyError(f"ClientException: Unable to describe task definition {ref}")
+    revs = ECS_FAMILIES[family][0]
+    rev = int(rev) if rev else max(revs)
+    if rev not in revs:
+        raise KeyError(f"ClientException: Unable to describe task definition {ref}")
+    return _ecs_td(family, rev)
+
+
+def _ecs_dep(key, rev, created, status="PRIMARY", fail=False):
+    return {"id": f"ecs-svc/{_ecs_id(key, rev, created)[:19]}", "rev": rev, "created": created,
+            "status": status, "fail": fail, "done_at": None, "failed_at": None, "keep_until": None, "slow": False}
+
+
+def _ecs_state(key):
+    st = ECS_STATE.get(key)
+    if st is not None:
+        return st
+    cfg = ECS_SERVICES[key]
+    now = time.time()
+    first = _ecs_dep(key, cfg["rev"], T0 - 86400 * 3)
+    first["done_at"] = T0 - 86400 * 3 + 120
+    deps = [first]
+    events = [(first["done_at"], f"(service {key[1]}) has reached a steady state.")]
+    if "failed" in cfg:
+        f = cfg["failed"]
+        bad = _ecs_dep(key, f["rev"], now - f["ago"], status="ACTIVE", fail=True)
+        bad["failed_at"], bad["keep_until"], bad["slow"] = now - f["ago"] + 240, now + 3600, True
+        first["created"], first["done_at"] = bad["failed_at"], bad["failed_at"] + 90
+        first["id"] = f"ecs-svc/{_ecs_id(key, 'rollback')[:19]}"
+        deps.append(bad)
+        events = [(now - f["ago"], f"(service {key[1]}) has started 2 tasks: (task {_ecs_id(key, bad['id'], 'f', 0)}) (task {_ecs_id(key, bad['id'], 'f', 1)})."),
+                  (now - f["ago"] + 120, f"(service {key[1]}) has started 2 tasks: (task {_ecs_id(key, bad['id'], 'f', 2)}) (task {_ecs_id(key, bad['id'], 'f', 3)})."),
+                  (bad["failed_at"], f"(service {key[1]}) (deployment {bad['id']}) deployment failed: tasks failed to start."),
+                  (bad["failed_at"] + 1, f"(service {key[1]}) rolling back to deployment {first['id']}."),
+                  (first["done_at"], f"(service {key[1]}) has reached a steady state.")]
+    if key[1] == "payments-worker":
+        events.append((now - 1500, f"(service {key[1]}) was unable to place a task. Reason: Capacity is unavailable at this time. "
+                                   "Please try again later or in a different availability zone."))
+    st = {"deployments": deps, "events": events, "desired": cfg["desired"], "desired_at": 0.0, "from": cfg["desired"],
+          "short": cfg.get("running") is not None}
+    ECS_STATE[key] = st
+    return st
+
+
+def _ecs_settle(key):
+    """Moves deployments along with the clock: a new one runs its tasks in 8 s; one that fails
+    (revision 18 of checkout-web) rolls back to the deployment before it."""
+    st, now = _ecs_state(key), time.time()
+    deps = st["deployments"]
+    primary = deps[0]
+    if primary["fail"] and primary["failed_at"] is None and now - primary["created"] >= 8:
+        primary["failed_at"], primary["status"] = primary["created"] + 8, "ACTIVE"
+        previous = next((d for d in deps[1:] if not d["fail"]), None)
+        rollback = _ecs_dep(key, previous["rev"] if previous else primary["rev"] - 1, primary["failed_at"])
+        st["events"] += [(primary["failed_at"], f"(service {key[1]}) (deployment {primary['id']}) deployment failed: tasks failed to start."),
+                         (primary["failed_at"] + 0.5, f"(service {key[1]}) rolling back to deployment {rollback['id']}.")]
+        deps.insert(0, rollback)
+        primary = rollback
+    if not primary["fail"] and primary["done_at"] is None and now - primary["created"] >= 8:
+        primary["done_at"] = primary["created"] + 8
+        st["events"].append((primary["done_at"], f"(service {key[1]}) has reached a steady state."))
+        for d in deps[1:]:
+            if d["fail"]:
+                d["keep_until"] = min(d["keep_until"] or float("inf"), primary["done_at"] + 60)
+    if primary["done_at"] is not None:
+        # Replaced deployments drain once the new one is steady; a failed one stays listed a while.
+        st["deployments"] = [primary] + [d for d in deps[1:] if d["fail"] and (d["keep_until"] is None or now < d["keep_until"])]
+    return st
+
+
+def _ecs_running(key, st, d, now):
+    """Tasks of deployment `d` running now."""
+    if d["fail"]:
+        return 0
+    primary = st["deployments"][0]
+    if d is primary:
+        if d["done_at"] is None:
+            return min(st["desired"], int(st["desired"] * (now - d["created"]) / 8))
+        if st["short"] and now - st["desired_at"] > 4:
+            return max(0, st["desired"] - 1)
+        if now - st["desired_at"] < 4:
+            return st["from"] + int((st["desired"] - st["from"]) * (now - st["desired_at"]) / 4)
+        return st["desired"]
+    # The deployment it replaced hands its tasks over as the new one starts them; older ones are gone.
+    replaced = next((x for x in st["deployments"][1:] if not x["fail"]), None)
+    if d is not replaced:
+        return 0
+    if primary["fail"]:
+        return st["desired"]
+    return max(0, st["desired"] - _ecs_running(key, st, primary, now))
+
+
+def _ecs_service_json(key):
+    cfg, st, now = ECS_SERVICES[key], _ecs_settle(key), time.time()
+    cluster, name = key
+    deployments = []
+    for d in st["deployments"]:
+        running = _ecs_running(key, st, d, now)
+        rollout = "FAILED" if d["failed_at"] else ("COMPLETED" if d["done_at"] else "IN_PROGRESS")
+        dep = {"id": d["id"], "status": d["status"], "taskDefinition": _ecs_td_arn(_ecs_family(key), d["rev"]),
+               "desiredCount": 0 if d["failed_at"] else st["desired"], "runningCount": running,
+               "pendingCount": max(0, st["desired"] - running) if d["status"] == "PRIMARY" and not d["done_at"] else 0,
+               "failedTasks": (4 if d["failed_at"] else 2) if d["fail"] else 0,
+               "createdAt": d["created"], "updatedAt": d["done_at"] or d["failed_at"] or now}
+        if cfg.get("launchType"):
+            dep["launchType"] = cfg["launchType"]
+        if cfg.get("breaker"):
+            dep["rolloutState"] = rollout
+            dep["rolloutStateReason"] = {"FAILED": "ECS deployment circuit breaker: tasks failed to start.",
+                                         "COMPLETED": "ECS deployment completed.", "IN_PROGRESS": "ECS deployment in progress."}[rollout]
+        deployments.append(dep)
+    if cfg.get("controller") in ("CODE_DEPLOY", "EXTERNAL"):
+        # Those services run task sets; their deployments are not ECS's.
+        deployments = []
+    primary = st["deployments"][0]
+    running = sum(_ecs_running(key, st, d, now) for d in st["deployments"])
+    svc = {
+        "serviceName": name, "serviceArn": f"{ECS_ARN}:service/{cluster}/{name}", "clusterArn": f"{ECS_ARN}:cluster/{cluster}",
+        "status": "ACTIVE", "desiredCount": st["desired"], "runningCount": running,
+        "pendingCount": max(0, st["desired"] - running) if primary["done_at"] is None else 0,
+        "taskDefinition": _ecs_td_arn(_ecs_family(key), primary["rev"]),
+        "deployments": deployments, "deploymentController": {"type": cfg.get("controller", "ECS")},
+        "deploymentConfiguration": {"maximumPercent": 200, "minimumHealthyPercent": 100,
+                                    "deploymentCircuitBreaker": {"enable": bool(cfg.get("breaker")), "rollback": bool(cfg.get("breaker"))}},
+        "events": [{"id": _ecs_id(key, t, m)[:36], "createdAt": t, "message": m} for t, m in sorted(st["events"], reverse=True)][:100],
+        "createdAt": T0 - 86400 * 200, "schedulingStrategy": "REPLICA", "enableExecuteCommand": name == "orders-api",
+    }
+    if cfg.get("launchType") != "EC2":
+        svc["platformVersion"] = "LATEST"
+    if cfg.get("launchType"):
+        svc["launchType"] = cfg["launchType"]
+    else:
+        svc["capacityProviderStrategy"] = [{"capacityProvider": c, "weight": w, "base": b} for c, w, b in cfg["capacity"]]
+    if cfg.get("tg"):
+        svc["healthCheckGracePeriodSeconds"] = 60
+        svc["loadBalancers"] = [{"targetGroupArn": f"arn:aws:elasticloadbalancing:us-east-1:{ACCOUNT}:targetgroup/{cfg['tg']}/0a1b2c3d4e5f",
+                                 "containerName": "app", "containerPort": ECS_FAMILIES[_ecs_family(key)][3]}]
+    return svc
+
+
+def _ecs_task(key, task_id, rev, status, started, stopped=None, reason=None, exit_code=None, container_reason=None, stop_code=None):
+    cluster, name = key
+    cfg = ECS_SERVICES[key]
+    td = _ecs_td(_ecs_family(key), rev)
+    containers = []
+    for c in td["containerDefinitions"]:
+        main = c["name"] == "app"
+        cont = {"name": c["name"], "lastStatus": status, "image": c["image"], "imageDigest": "sha256:" + _ecs_id(c["image"]) * 2,
+                "healthStatus": ("HEALTHY" if status == "RUNNING" else "UNHEALTHY") if "healthCheck" in c else "UNKNOWN"}
+        if status == "STOPPED":
+            cont["exitCode"] = exit_code if main else 0
+            if main and container_reason:
+                cont["reason"] = container_reason
+        containers.append(cont)
+    task = {"taskArn": f"{ECS_ARN}:task/{cluster}/{task_id}", "taskDefinitionArn": _ecs_td_arn(_ecs_family(key), rev),
+            "clusterArn": f"{ECS_ARN}:cluster/{cluster}", "lastStatus": status, "desiredStatus": "STOPPED" if stopped else "RUNNING",
+            "createdAt": started - 20, "startedAt": started, "group": f"service:{name}", "startedBy": "ecs-svc/deploy",
+            "containers": containers, "launchType": cfg.get("launchType") or "FARGATE",
+            "availabilityZone": ["us-east-1a", "us-east-1b", "us-east-1c"][int(task_id[:2], 16) % 3],
+            "cpu": td.get("cpu", "1024"), "memory": td.get("memory", "2048"),
+            "healthStatus": "HEALTHY" if status == "RUNNING" and name == "orders-api" else "UNKNOWN"}
+    if cfg.get("launchType") != "EC2":
+        task["attachments"] = [{"type": "ElasticNetworkInterface", "status": "ATTACHED", "details": [
+            {"name": "subnetId", "value": "subnet-0a1b2c3d"},
+            {"name": "privateIPv4Address", "value": f"10.0.{int(task_id[2:4], 16) % 4}.{int(task_id[4:6], 16) % 250 + 4}"}]}]
+    if stopped:
+        task.update({"stoppedAt": stopped, "stoppingAt": stopped - 5, "executionStoppedAt": stopped - 4,
+                     "stoppedReason": reason, "stopCode": stop_code or "EssentialContainerExited"})
+    return task
+
+
+def _ecs_tasks(key):
+    st, now = _ecs_settle(key), time.time()
+    out = []
+    for d in st["deployments"]:
+        for i in range(_ecs_running(key, st, d, now)):
+            out.append(_ecs_task(key, _ecs_id(key, d["id"], i), d["rev"], "RUNNING", d["created"] + 6))
+        if d["fail"]:
+            for i in range(4 if d["failed_at"] else 2):
+                oom = i == 3
+                # The demo's failure spread over minutes; one made here over its 8 seconds.
+                started, stopped = (d["created"] + 60 * i + 10, d["created"] + 60 * i + 50) if d["slow"] else (d["created"] + i + 1, d["created"] + i + 4)
+                out.append(_ecs_task(key, _ecs_id(key, d["id"], "f", i), d["rev"], "STOPPED", started,
+                                     stopped=stopped,
+                                     reason="Essential container in task exited", exit_code=137 if oom else 1,
+                                     container_reason="OutOfMemoryError: Container killed due to memory usage" if oom else None))
+    if key[1] == "payments-worker":
+        out.append(_ecs_task(key, _ecs_id(key, "spot"), 11, "STOPPED", T0 - 7200, stopped=now - 1600,
+                             reason="Your Spot Task was interrupted.", exit_code=143, stop_code="SpotInterruption"))
+    if key[1] == "orders-api":
+        out.append(_ecs_task(key, _ecs_id(key, "scaled"), 42, "STOPPED", T0 - 9000, stopped=now - 2400,
+                             reason="Scaling activity initiated by deployment ecs-svc/4815162342", exit_code=143,
+                             stop_code="ServiceSchedulerInitiated"))
+    # ECS forgets stopped tasks after about an hour.
+    return [t for t in out if "stoppedAt" not in t or now - t["stoppedAt"] < 3600]
+
+
+ECS_LOG_LINES = {
+    "ok": ["{ts} INFO server listening on :{port}", "{ts} INFO GET /health 200 2ms", "{ts} INFO POST /orders 201 48ms",
+           "{ts} WARN slow query (812 ms): SELECT * FROM orders WHERE status = $1", "{ts} INFO GET /orders/{n} 200 12ms"],
+    "exit1": ["{ts} INFO starting checkout-web 1.18.0", "{ts} INFO loading config from /app/config/production.json",
+              "{ts} ERROR Error: Cannot find module '/app/dist/server.js'",
+              "    at Module._resolveFilename (node:internal/modules/cjs/loader:1145:15)",
+              "    at Module._load (node:internal/modules/cjs/loader:986:27)",
+              "{ts} ERROR process exited with code 1"],
+    "oom": ["{ts} INFO starting checkout-web 1.18.0", "{ts} INFO warming the product cache (48,000 items)",
+            "{ts} WARN heap used 482 MB of 512 MB", "<--- Last few GCs --->",
+            "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory"],
+    "spot": ["{ts} INFO processing payment batch 9921", "{ts} INFO received SIGTERM: draining", "{ts} INFO stopped cleanly"],
+}
+
+
+def _ecs_stream_lines(group, stream):
+    """The events of an ECS container's stream (`ecs/<container>/<task id>`), or None."""
+    parts = stream.split("/")
+    if not group.startswith("/ecs/") or len(parts) != 3:
+        return None
+    family, task_id = group[len("/ecs/"):], parts[2]
+    key = next((k for k in ECS_SERVICES if _ecs_family(k) == family), None)
+    if key is None:
+        return None
+    kind = "ok"
+    with ECS_LOCK:
+        tasks = _ecs_tasks(key)
+    for t in tasks:
+        if t["taskArn"].endswith("/" + task_id) and t["lastStatus"] == "STOPPED":
+            code = next((c.get("exitCode") for c in t["containers"] if c["name"] == "app"), 0)
+            kind = "oom" if code == 137 else ("spot" if code == 143 else "exit1")
+    lines = ECS_LOG_LINES[kind] * (3 if kind == "ok" else 1)
+    port = ECS_FAMILIES[family][3] or 0
+    start = int(T0 * 1000) - 60_000
+    return [{"timestamp": start + 1000 * i, "message": ln.format(ts=f"2026-11-05T10:{i // 60:02d}:{i % 60:02d}Z", port=port, n=1000 + i),
+             "ingestionTime": start + 1000 * i + 300} for i, ln in enumerate(lines)]
+
+
+_cwlogs_before_ecs = cwlogs
+
+
+def cwlogs(op, body):  # noqa: F811
+    if op == "GetLogEvents":
+        events = _ecs_stream_lines(body.get("logGroupName", ""), body.get("logStreamName", ""))
+        if events is not None:
+            limit = int(body.get("limit") or 10_000)
+            page = events[:limit] if body.get("startFromHead", False) else events[-limit:]
+            return {"events": page, "nextForwardToken": f"f/{len(events)}", "nextBackwardToken": "b/0"}
+        if body.get("logGroupName", "").startswith("/ecs/"):
+            raise KeyError(f"ResourceNotFoundException: The specified log stream does not exist: {body.get('logStreamName')}")
+    return _cwlogs_before_ecs(op, body)
+
+
+def _ecs_group_lines(lines, port):
+    """Stream lines as the Logs module's synthetic events take them (their own placeholders)."""
+    return [ln.replace("{ts} ", "").replace("{port}", str(port or 8080)) for ln in lines]
+
+
+LINES_BY_GROUP.update({f"/ecs/{f}": _ecs_group_lines(ECS_LOG_LINES["ok"], v[3]) for f, v in ECS_FAMILIES.items()})
+LINES_BY_GROUP["/ecs/checkout-web"] = _ecs_group_lines(ECS_LOG_LINES["ok"] + ECS_LOG_LINES["exit1"], 3000)
+_log_groups_before_ecs = log_groups
+
+
+def log_groups():  # noqa: F811
+    return _log_groups_before_ecs() + [f"/ecs/{f}" for f in ECS_FAMILIES if f != "orders-api"]
+
+
+def _ecs_cluster(body):
+    cluster = (body.get("cluster") or "default").rsplit("/", 1)[-1]
+    if cluster not in ECS_CLUSTERS:
+        raise KeyError(f"ClusterNotFoundException: Cluster not found: {cluster}")
+    return cluster
+
+
+def ecs(op, body):
+    with ECS_LOCK:
+        return _ecs(op, body)
+
+
+def _ecs(op, body):
+    if op == "ListClusters":
+        return {"clusterArns": [f"{ECS_ARN}:cluster/{c}" for c in ECS_CLUSTERS]}
+    if op == "DescribeClusters":
+        out, failures = [], []
+        for ref in body.get("clusters") or ["default"]:
+            name = ref.rsplit("/", 1)[-1]
+            c = ECS_CLUSTERS.get(name)
+            if c is None:
+                failures.append({"arn": ref, "reason": "MISSING"})
+                continue
+            keys = [k for k in ECS_SERVICES if k[0] == name]
+            cluster = {"clusterName": name, "clusterArn": f"{ECS_ARN}:cluster/{name}", "status": "ACTIVE",
+                       "runningTasksCount": sum(_ecs_service_json(k)["runningCount"] for k in keys), "pendingTasksCount": 0,
+                       "activeServicesCount": len(keys), "registeredContainerInstancesCount": c["instances"],
+                       "capacityProviders": c["capacityProviders"]}
+            if "SETTINGS" in (body.get("include") or []):
+                cluster["settings"] = [{"name": "containerInsights", "value": c["insights"]}]
+            out.append(cluster)
+        return {"clusters": out, "failures": failures}
+    if op == "ListServices":
+        cluster = _ecs_cluster(body)
+        return {"serviceArns": [f"{ECS_ARN}:service/{c}/{s}" for c, s in ECS_SERVICES if c == cluster]}
+    if op == "DescribeServices":
+        cluster = _ecs_cluster(body)
+        if len(body.get("services", [])) > 10:
+            raise KeyError("InvalidParameterException: services can have at most 10 items")
+        out, failures = [], []
+        for ref in body.get("services", []):
+            key = (cluster, ref.rsplit("/", 1)[-1])
+            if key in ECS_SERVICES:
+                out.append(_ecs_service_json(key))
+            else:
+                failures.append({"arn": ref, "reason": "MISSING"})
+        return {"services": out, "failures": failures}
+    if op == "ListTasks":
+        cluster = _ecs_cluster(body)
+        want = body.get("desiredStatus", "RUNNING")
+        keys = [k for k in ECS_SERVICES if k[0] == cluster and (not body.get("serviceName") or k[1] == body["serviceName"])]
+        if body.get("serviceName") and not keys:
+            raise KeyError(f"ServiceNotFoundException: Service not found: {body['serviceName']}")
+        return {"taskArns": [t["taskArn"] for k in keys for t in _ecs_tasks(k) if t["desiredStatus"] == want]}
+    if op == "DescribeTasks":
+        cluster = _ecs_cluster(body)
+        if len(body.get("tasks", [])) > 100:
+            raise KeyError("InvalidParameterException: tasks can have at most 100 items")
+        every = {t["taskArn"]: t for k in ECS_SERVICES if k[0] == cluster for t in _ecs_tasks(k)}
+        wanted = body.get("tasks", [])
+        return {"tasks": [every[a] for a in wanted if a in every],
+                "failures": [{"arn": a, "reason": "MISSING"} for a in wanted if a not in every]}
+    if op == "DescribeTaskDefinition":
+        return {"taskDefinition": _ecs_find_td(body["taskDefinition"])}
+    if op == "ListTaskDefinitions":
+        prefix = body.get("familyPrefix", "")
+        arns = [_ecs_td_arn(f, r) for f, v in ECS_FAMILIES.items() if f.startswith(prefix) for r in v[0]]
+        arns.sort(key=lambda a: (a.rsplit("/", 1)[-1].split(":")[0], int(a.rsplit(":", 1)[-1])), reverse=body.get("sort") == "DESC")
+        return {"taskDefinitionArns": arns[:body.get("maxResults", 100)]}
+    if op == "UpdateService":
+        cluster = _ecs_cluster(body)
+        key = (cluster, body["service"].rsplit("/", 1)[-1])
+        if key not in ECS_SERVICES:
+            raise KeyError(f"ServiceNotFoundException: Service not found: {body['service']}")
+        cfg, st, now = ECS_SERVICES[key], _ecs_settle(key), time.time()
+        deploys = "taskDefinition" in body or body.get("forceNewDeployment")
+        if deploys and cfg.get("controller") == "CODE_DEPLOY":
+            raise KeyError("InvalidParameterException: Unable to update task definition on services with a CODE_DEPLOY "
+                           "deployment controller. Use AWS CodeDeploy to trigger a new deployment.")
+        if deploys and cfg.get("controller") == "EXTERNAL":
+            raise KeyError("InvalidParameterException: Unable to update the task definition or force a new deployment of "
+                           "a service with an EXTERNAL deployment controller.")
+        rev = None
+        if "taskDefinition" in body:
+            td = _ecs_find_td(body["taskDefinition"])
+            if td["family"] != _ecs_family(key):
+                raise KeyError(f"InvalidParameterException: {td['family']} is not the task definition family of {key[1]}")
+            rev = td["revision"]
+        if "desiredCount" in body:
+            n = int(body["desiredCount"])
+            if n < 0:
+                raise KeyError("InvalidParameterException: desiredCount must be at least 0")
+            st["from"], st["desired"], st["desired_at"], st["short"] = _ecs_service_json(key)["runningCount"], n, now, False
+        if deploys:
+            rev = rev if rev is not None else st["deployments"][0]["rev"]
+            for d in st["deployments"]:
+                if d["status"] == "PRIMARY":
+                    d["status"] = "ACTIVE"
+            dep = _ecs_dep(key, rev, now, fail=_ecs_family(key) == "checkout-web" and rev == 18)
+            dep["id"] = f"ecs-svc/{_ecs_id(key, rev, now, uuid.uuid4())[:19]}"
+            st["deployments"].insert(0, dep)
+            st["short"] = False
+            st["events"].append((now + 0.2, f"(service {key[1]}) has started {st['desired']} tasks: "
+                                             + " ".join(f"(task {_ecs_id(key, dep['id'], i)})" for i in range(st["desired"])) + "."))
+        return {"service": _ecs_service_json(key)}
+    raise KeyError(f"InvalidAction: {op} is not in the mock yet")
+
+
+def ecs_metric(namespace, name, dims, stat, period, ts):
+    """AWS/ECS: checkout-web close to its memory limit, payments-worker busy, reports-cron idle."""
+    if namespace != "AWS/ECS":
+        return None
+    base = {"orders-api": (34, 52), "checkout-web": (58, 88), "payments-worker": (81, 61), "legacy-web": (12, 40),
+            "image-worker": (22, 35), "ingest": (9, 20)}.get(dims.get("ServiceName", ""))
+    if base is None:
+        return CW_NO_DATA
+    seed = int(hashlib.sha256(f"{name}{sorted(dims.items())}{int(ts)}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    wave = 1 + 0.25 * math.sin(ts / 86400 * 2 * math.pi)
+    v = (base[0] if name == "CPUUtilization" else base[1]) * wave + 6 * seed
+    if stat == "Maximum":
+        v *= 1.25
+    return round(min(v, 100.0), 2)
+
+
+CW_METRIC_HOOKS.append(ecs_metric)
 
 
 if __name__ == "__main__":

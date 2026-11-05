@@ -2,8 +2,8 @@
 
 Terminal UI and CLI to deploy and explore AWS: **CodePipeline** (a matrix of what is deployed
 where, promote and rollback, an inbox of approvals), **CloudWatch** alarms, Logs and Logs
-Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke), **API
-Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **Aurora**
+Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke), **ECS** and
+Fargate (deployments, why tasks stopped, redeploy, scale, roll back), **API Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **Aurora**
 (topology, performance, top SQL, failover), **Redshift** (nodes, queries, table health),
 **DMS** (tasks, tables, CDC latency), **EventBridge**, **AppConfig** feature flags and
 **Route 53** records, plus
@@ -96,6 +96,12 @@ dcli lambda dev my-function --json
 dcli lambda payments-webhook --metrics --since 7d                 # invocations, errors, p95, concurrency, throttles
 dcli lambda payments-webhook --report                             # Markdown report for an AI agent
 dcli lambda payments-webhook --invoke '{"orderId": "ORD-1"}'      # asks first; exit 1 on a function error
+dcli ecs                                                          # ECS clusters (then: dcli ecs prod CLUSTER for its services)
+dcli ecs prod checkout-web                                        # deployments and events (the cluster when several have it)
+dcli ecs prod checkout-web --tasks                                # running tasks and those stopped in the last hour, and why
+dcli ecs prod checkout-web --report                               # Markdown report of a failing deployment for an AI agent
+dcli ecs prod orders-api --force-deploy --wait                    # new deployment (asks first); --wait follows it, exit 1 if it fails
+dcli ecs prod orders-api --desired 4                              # also --rollback (the previous revision) or --rollback 41
 dcli insights /aws/lambda/orders -q 'fields @timestamp, @message | filter @message like /ERROR/' --since 2h
 dcli insights --saved "Errors per 5 minutes" /aws/lambda/orders  # a saved query (--json, --csv)
 dcli alarms                                                       # firing first; exit code 1 when any is firing
@@ -166,8 +172,8 @@ dcli costs prod --commitments                                     # Savings Plan
 dcli update                # update dcli (npm installs update through npm); --check only tells
 ```
 
-Writes (`--set`, `events send`, API Gateway stage changes and tests, Aurora, Redshift and DMS
-actions) ask for confirmation, or for the environment name in
+Writes (`--set`, `events send`, API Gateway stage changes and tests, ECS, Aurora, Redshift and
+DMS actions) ask for confirmation, or for the environment name in
 production-looking environments; `--yes` skips it (needed when the value comes from stdin).
 
 The environment argument is optional everywhere: without it, commands use the current
@@ -195,6 +201,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name · `n` new parameter · `u` new value |
 | Secrets | `/` search · `v` reveal · `c` copy value · `y` copy name · `n` new secret · `u` new value · `o` open in console |
 | Lambda | `/` search · `m` metrics 1h/24h/7d · `M` memory used, from its logs (Logs Insights) · `i` invoke with a payload · `c` copy a report for an AI agent · `y` copy ARN · `v` show env values · `l` its logs · `o` console · `r` refresh · `PgUp/PgDn` scroll |
+| ECS | `Enter`/`Esc` clusters → services → tasks / back · `/` search · `m` 1h/24h/7d · `D` new deployment · `s` desired count · `R` deploy another revision (roll back) · `c` copy a report for an AI agent · `l` the log group · `Enter` on a task: a container's last log lines · `y` copy ARN · `o` console · `r` refresh · `PgUp/PgDn` scroll |
 | API Gateway | `/` search · `←→` routes / stages / metrics / domains · `Enter` a route opens its integration (Lambda, SQS, Step Functions, EventBridge), a stage shows its settings, a domain mapping opens its API · `s` next stage · `m` 1h/24h/7d · `t` test the route · `y` copy a `curl` (`wscat` for WebSocket) or the URL · `x` export OpenAPI · `c` copy a report for AI · `l` logs · `d` redeploy · `b` roll back · `p` promote a stage · `v` show stage variables · `o` console · `r` reload |
 | Logs | `Enter` open a log group · `/` search groups · `t` time range · `f` filter pattern · `p` pause/resume live · `z` full screen · `y` copy · `o` console · `Space` mark groups · `i` Logs Insights on them |
 | Logs Insights | `Enter` run (`Alt+Enter` new line) · `i` edit · `r` run again · `t` range · `g` log groups · `s` saved and recent queries · `Enter` on a row: the whole record · `←→` columns · `y`/`Y` copy the table as Markdown/CSV · `c` copy for AI · `Esc` stop / back |
@@ -218,8 +225,8 @@ The header shows every module while they fit; with more modules (or a narrow ter
 shows only the current one, and `:` reaches the rest by name. Modules with something to say
 show it there: approvals waiting, alarms firing, DMS tasks failed.
 
-Typing in `:` also searches the environment's resources by name: pipelines, functions, log
-groups, parameters, secrets, stacks, buckets, state machines, queues, tables, APIs, Aurora and
+Typing in `:` also searches the environment's resources by name: pipelines, functions, ECS
+clusters and services, log groups, parameters, secrets, stacks, buckets, state machines, queues, tables, APIs, Aurora and
 Redshift clusters, DMS tasks, event buses, AppConfig applications, alarms and Route 53 hosted zones (listed in the background the first time, then kept for
 five minutes). Enter opens the resource in its module.
 
@@ -275,6 +282,20 @@ before deploying and before creating or changing parameters and secrets.
   it is never sent twice. `c` copies a report for an AI agent: the configuration (environment
   variable names, never their values), the last 24 hours of metrics, and the errors,
   timeouts and crashes in its logs grouped by kind with their stack traces.
+- **ECS**: a cluster's services come with their state (deployment failed, deploying, tasks
+  missing, steady). A service shows its deployments with their rollout state and the circuit
+  breaker's verdict, CPU and memory against what its tasks reserve, and its recent events;
+  `Enter` lists its running tasks and those stopped in the last hour (ECS forgets them after
+  that). A stopped task says why: the stop code and reason, each container's exit code and
+  reason, and the likely cause (out of memory, an image that cannot be pulled, secrets or
+  network at start, failing health checks). `Enter` on a task reads a container's last log
+  lines (awslogs). `D` starts a new deployment (new tasks pull the image again), `s` changes the
+  desired count and `R` deploys another task definition revision, a rollback; each is followed
+  until it completes or fails, with a notification. Services deployed by CodeDeploy (blue/green)
+  or an external controller only take desired counts: their deployments go through that tool.
+  Environment variable values in task definitions are never read, so they cannot show or reach
+  a report; `c` copies a report of a failing deployment (deployments, events, stopped tasks,
+  their containers' last log lines) for an AI agent.
 - **Logs Insights**: `i` in Logs runs a query over the selected group, or several marked with
   `Space`, showing results as they arrive with the records matched and data scanned
   (Insights is billed by the data it scans: narrow the range or the groups on big ones).
