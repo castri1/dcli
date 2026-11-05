@@ -59,7 +59,7 @@ impl Tab {
 
 enum Msg {
     Overview(aws::Result<eks::Overview>),
-    Detail { cluster: String, result: aws::Result<Detail> },
+    Detail { cluster: String, result: Box<aws::Result<Detail>> },
     Workloads { cluster: String, result: Result<k8s::Workloads, String> },
     /// A pod's (or deployment's) warning events and a container's logs, for the zoomed view.
     Look { cluster: String, title: String, lines: Vec<String> },
@@ -241,7 +241,7 @@ impl Eks {
         let aws = ctx.env().aws.clone();
         let versions = self.versions.clone();
         let cluster = name.to_string();
-        ctx.spawn(move || Msg::Detail { result: eks::detail(&aws, &cluster, &versions), cluster });
+        ctx.spawn(move || Msg::Detail { result: Box::new(eks::detail(&aws, &cluster, &versions)), cluster });
     }
 
     fn load_workloads(&mut self, cluster: Cluster, ctx: &mut Ctx) {
@@ -1089,6 +1089,7 @@ impl Module for Eks {
                 Err(e) => self.load = LoadState::Failed(e),
             },
             Msg::Detail { cluster, result } => {
+                let result = *result;
                 self.in_flight.remove(&(cluster.clone(), "detail"));
                 // The cluster as described now (endpoint, version) replaces the list's.
                 if let Ok(d) = &result

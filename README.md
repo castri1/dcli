@@ -405,6 +405,19 @@ before deploying and before creating or changing parameters and secrets.
   record changed since it was read. Records Route 53 or a traffic policy manages (SOA, the
   apex NS) are left alone. Every change is followed until all of Route 53's name servers
   answer with it. `dcli dns` does the same from scripts.
+- **EKS**: each cluster with its Kubernetes version and support: when standard support ends,
+  and clusters already on extended support (it costs about six times as much per hour; Savings
+  counts it too). Upgrade insights say what blocks the next version (APIs still in use that it
+  removes); node groups show their health issues, scaling and AMI release, add-ons the newer
+  versions compatible with the cluster, and access lists who may use the cluster (access
+  entries and their policies). `w` reads inside the cluster, with dcli's own EKS token (no
+  kubectl or AWS CLI needed): deployments that are not well and pods that fail (crash loops,
+  images that cannot be pulled, out-of-memory kills, unschedulable, not ready), with their
+  warning events and the logs of the last run. It only reads, and never shows environment
+  values from pod specs. When the cluster refuses dcli, it says which IAM role it used and how
+  to give it access. `K` opens k9s on the cluster (dcli pauses and comes back when k9s
+  exits) through a kubeconfig in `~/.deployment-cli/kube/` whose tokens come from dcli;
+  `~/.kube/config` is never touched. `c` copies a report for an AI agent.
 
 Production-looking environments ask for their name before these writes too (redrive, start,
 stop, test events, flag deploys and new flags and profiles, Route 53 record creates and edits, invoking a function, SQS redrives, promote and rollback, API

