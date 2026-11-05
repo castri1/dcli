@@ -28,37 +28,52 @@ impl Resource {
 
 type Lister = fn(&Aws) -> aws::Result<Vec<Resource>>;
 
-const LISTERS: &[Lister] = &[
-    functions,
-    apis,
-    log_groups,
-    parameters,
-    secret_list,
-    stacks,
-    buckets,
-    state_machines,
-    queues,
-    tables,
-    db_clusters,
-    redshift_clusters,
-    dms_tasks,
-    buses,
-    applications,
-    alarm_list,
-    zones,
+/// Each service's lister and the module that shows it (by title).
+const LISTERS: &[(&str, Lister)] = &[
+    ("Lambda", functions),
+    ("API Gateway", apis),
+    ("Logs", log_groups),
+    ("Parameters", parameters),
+    ("Secrets", secret_list),
+    ("CloudFormation", stacks),
+    ("S3", buckets),
+    ("Step Functions", state_machines),
+    ("SQS", queues),
+    ("DynamoDB", tables),
+    ("Aurora", db_clusters),
+    ("Redshift", redshift_clusters),
+    ("DMS", dms_tasks),
+    ("EventBridge", buses),
+    ("AppConfig", applications),
+    ("Alarms", alarm_list),
+    ("Route 53", zones),
 ];
 
-/// The resources of the environment `aws` points at, `pipelines` being those in its config,
-/// and how many services could be listed (none: the session has probably expired).
-pub fn list(aws: &Aws, pipelines: &[String]) -> (Vec<Resource>, usize) {
-    let mut all: Vec<Resource> = pipelines.iter().map(|p| Resource::new("Pipelines", p, p.clone(), "pipeline")).collect();
-    let found: Vec<Option<Vec<Resource>>> = std::thread::scope(|s| {
-        let jobs: Vec<_> = LISTERS.iter().map(|list| s.spawn(move || list(aws).ok())).collect();
-        jobs.into_iter().map(|j| j.join().ok().flatten()).collect()
+/// What [`list`] found.
+pub struct Listing {
+    pub resources: Vec<Resource>,
+    /// The modules whose service could be listed, with how many resources it has there. A
+    /// module missing here could not be listed (no permission, an expired session).
+    pub counts: Vec<(&'static str, usize)>,
+}
+
+/// The resources of the environment `aws` points at, `pipelines` being those in its config.
+/// No counts at all: the session has probably expired.
+pub fn list(aws: &Aws, pipelines: &[String]) -> Listing {
+    let mut resources: Vec<Resource> =
+        pipelines.iter().map(|p| Resource::new("Pipelines", p, p.clone(), "pipeline")).collect();
+    let found: Vec<(&'static str, Option<Vec<Resource>>)> = std::thread::scope(|s| {
+        let jobs: Vec<_> = LISTERS.iter().map(|&(module, list)| (module, s.spawn(move || list(aws).ok()))).collect();
+        jobs.into_iter().map(|(module, j)| (module, j.join().ok().flatten())).collect()
     });
-    let listed = found.iter().filter(|f| f.is_some()).count();
-    all.extend(found.into_iter().flatten().flatten());
-    (all, listed)
+    let mut counts = Vec::new();
+    for (module, list) in found {
+        if let Some(list) = list {
+            counts.push((module, list.len()));
+            resources.extend(list);
+        }
+    }
+    Listing { resources, counts }
 }
 
 /// Follows a paginated listing until its end or [`MAX`] items.

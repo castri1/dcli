@@ -98,11 +98,15 @@ impl Hook {
 pub struct Defaults {
     pub poll_interval_seconds: u64,
     pub notifications: bool,
+    /// The modules the header, Tab and the digits show, in this order (titles). Empty: the
+    /// ones the environment uses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<String>,
 }
 
 impl Default for Defaults {
     fn default() -> Self {
-        Defaults { poll_interval_seconds: 10, notifications: true }
+        Defaults { poll_interval_seconds: 10, notifications: true, modules: Vec::new() }
     }
 }
 

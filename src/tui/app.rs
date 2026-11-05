@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
 use super::module::{AppEvent, Ctx, Env, Handled, Level, Module, Payload, Shared, View};
 use super::picker::{Item, Outcome, Picker};
+use super::usage::{self, Usage};
 use super::{theme, widgets};
 use crate::aws::Aws;
 use crate::aws::credentials::{effective_profile, sso_login_command};
@@ -40,9 +41,8 @@ struct UpdateAvailable(String);
 
 /// The resources of an environment, listed for the `:` palette.
 struct CatalogLoaded {
-    env: String,
-    resources: Vec<crate::catalog::Resource>,
-    listed: usize,
+    env: Arc<Env>,
+    listing: crate::catalog::Listing,
 }
 
 /// How long the resources listed for the palette are reused.
@@ -73,6 +73,8 @@ pub struct App {
     /// Resources listed per environment for the palette, and when.
     catalogs: HashMap<String, (Instant, Vec<crate::catalog::Resource>)>,
     catalog_loading: HashSet<String>,
+    /// Which modules each environment uses (see [`super::usage`]).
+    usage: HashMap<String, Usage>,
     started: Instant,
     tab_hits: Vec<(Rect, usize)>,
     login_running: bool,
@@ -121,16 +123,21 @@ impl App {
                 intent: None,
                 switch_env: None,
                 login: None,
+                interactive: None,
             },
             overlay: None,
             catalogs: HashMap::new(),
             catalog_loading: HashSet::new(),
+            usage: HashMap::new(),
             started: Instant::now(),
             tab_hits: Vec::new(),
             login_running: false,
             login_profile: String::new(),
             quit: false,
         };
+        app.load_usage();
+        // Start on the first module shown (the config may name others first).
+        app.active = app.shown()[0];
         app.reset_modules();
         let tx = app.shared.tx.clone();
         std::thread::spawn(move || {
@@ -144,6 +151,44 @@ impl App {
     fn with_module<R>(&mut self, i: usize, f: impl FnOnce(&mut dyn Module, &mut Ctx) -> R) -> R {
         let mut ctx = Ctx { shared: &mut self.shared, module: i };
         f(self.modules[i].as_mut(), &mut ctx)
+    }
+
+    fn titles(&self) -> Vec<&'static str> {
+        self.modules.iter().map(|m| m.title()).collect()
+    }
+
+    /// The modules the header, Tab and the digits offer, in order (see [`super::usage`]).
+    fn shown(&self) -> Vec<usize> {
+        usage::shown(&self.titles(), &self.shared.loaded.config.defaults.modules, self.usage.get(&self.shared.env.name))
+    }
+
+    /// Which modules the current environment uses: saved from an earlier listing, listed
+    /// again (in the background, like `:` does) when there is none or it is a day old.
+    fn load_usage(&mut self) {
+        let env = self.shared.env.clone();
+        if !self.usage.contains_key(&env.name)
+            && let Some(u) = Usage::load(&env)
+        {
+            self.usage.insert(env.name.clone(), u);
+        }
+        let stale = self.usage.get(&env.name).is_none_or(|u| u.stale(now_secs()));
+        if stale && self.shared.loaded.config.defaults.modules.is_empty() {
+            self.list_resources();
+        }
+    }
+
+    /// Next (or previous) module among those shown; from a module that is not shown, the
+    /// nearest one in the registry order.
+    fn step_module(&mut self, forward: bool) {
+        let shown = self.shown();
+        let n = shown.len();
+        let next = match shown.iter().position(|&i| i == self.active) {
+            Some(p) if forward => shown[(p + 1) % n],
+            Some(p) => shown[(p + n - 1) % n],
+            None if forward => shown.iter().copied().find(|&i| i > self.active).unwrap_or(shown[0]),
+            None => shown.iter().rev().copied().find(|&i| i < self.active).unwrap_or(shown[n - 1]),
+        };
+        self.select_module(next);
     }
 
     /// New generation: in-flight results of the old one are discarded.
@@ -171,6 +216,7 @@ impl App {
         }
         self.shared.env = make_env(&self.shared.loaded.config, name);
         self.reset_modules();
+        self.load_usage();
         let env = self.shared.env.clone();
         self.shared.toasts.push(super::module::Toast {
             level: Level::Info,
@@ -188,6 +234,22 @@ impl App {
         for i in 0..self.modules.len() {
             let active = i == self.active;
             self.with_module(i, |m, ctx| m.tick(ctx, active));
+        }
+    }
+
+    /// A program a module asked to hand the terminal to.
+    pub fn take_interactive(&mut self) -> Option<super::module::Interactive> {
+        self.shared.interactive.take()
+    }
+
+    /// The program handed the terminal by [`App::take_interactive`] exited (or could not start).
+    pub fn interactive_done(&mut self, program: &str, missing: String, result: std::io::Result<std::process::ExitStatus>) {
+        let mut ctx = Ctx { shared: &mut self.shared, module: APP };
+        match result {
+            Ok(status) if status.success() => {}
+            Ok(status) => ctx.toast(Level::Warn, format!("{program} exited with {status}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ctx.toast(Level::Warn, missing),
+            Err(e) => ctx.toast(Level::Error, format!("cannot run {program}: {e}")),
         }
     }
 
@@ -251,9 +313,13 @@ impl App {
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => self.open_palette(true),
             KeyCode::Char('e') => self.open_palette(false),
             KeyCode::Char('L') => self.start_login_for(self.shared.env.profile.clone()),
-            KeyCode::Tab => self.select_module((active + 1) % self.modules.len()),
-            KeyCode::BackTab => self.select_module((active + self.modules.len() - 1) % self.modules.len()),
-            KeyCode::Char(c @ '1'..='9') => self.select_module(c as usize - '1' as usize),
+            KeyCode::Tab => self.step_module(true),
+            KeyCode::BackTab => self.step_module(false),
+            KeyCode::Char(c @ '1'..='9') => {
+                if let Some(&i) = self.shown().get(c as usize - '1' as usize) {
+                    self.select_module(i);
+                }
+            }
             _ => {
                 self.with_module(active, |m, ctx| m.key(key, ctx));
             }
@@ -299,7 +365,7 @@ impl App {
         }
         let (items, jumps) = self.palette_items(with_modules);
         let cursor = if with_modules {
-            self.active
+            jumps.iter().position(|j| matches!(j, Jump::Module(i) if *i == self.active)).unwrap_or(0)
         } else {
             self.shared.loaded.config.environments.get_index_of(&self.shared.env.name).unwrap_or(0)
         };
@@ -312,8 +378,20 @@ impl App {
         let mut items = Vec::new();
         let mut jumps = Vec::new();
         if with_modules {
-            for (i, m) in self.modules.iter().enumerate() {
-                items.push(Item::new(m.title(), m.description()).current(i == self.active));
+            // The modules shown first, then the others, dimmed, with why they are not shown.
+            let shown = self.shown();
+            let pinned = !self.shared.loaded.config.defaults.modules.is_empty();
+            let rest = (0..self.modules.len()).filter(|i| !shown.contains(i));
+            for i in shown.iter().copied().chain(rest) {
+                let m = &self.modules[i];
+                let mut item = if shown.contains(&i) {
+                    Item::new(m.title(), m.description())
+                } else {
+                    let why = if pinned { "not in defaults.modules".to_string() } else { format!("nothing in {}", self.shared.env.name) };
+                    Item::new(m.title(), format!("{why} · {}", m.description())).color(theme::MUTED)
+                };
+                item = item.current(i == self.active);
+                items.push(item);
                 jumps.push(Jump::Module(i));
             }
         }
@@ -362,8 +440,8 @@ impl App {
         let tx = self.shared.tx.clone();
         let pipelines: Vec<String> = env.pipelines.iter().map(|p| p.name.clone()).collect();
         std::thread::spawn(move || {
-            let (resources, listed) = crate::catalog::list(&env.aws, &pipelines);
-            let loaded = CatalogLoaded { env: env.name.clone(), resources, listed };
+            let listing = crate::catalog::list(&env.aws, &pipelines);
+            let loaded = CatalogLoaded { env, listing };
             let _ = tx.send(AppEvent::Task { module: APP, generation: 0, payload: Box::new(loaded) });
         });
     }
@@ -383,6 +461,27 @@ impl App {
         }
         let active = self.active;
         if let Handled::No = self.with_module(active, |m, ctx| m.mouse(event, ctx)) {}
+    }
+
+    /// Saves which modules `env` uses, and says so when that hides modules it did not before.
+    fn update_usage(&mut self, env: &Env, counts: &[(&'static str, usize)]) {
+        let titles = self.titles();
+        let usage = Usage::new(env, counts, now_secs());
+        let hidden = usage.hidden(&titles);
+        let before = self.usage.get(&env.name).map(|u| u.hidden(&titles));
+        usage.save(&env.name);
+        self.usage.insert(env.name.clone(), usage);
+        let current = env.name == self.shared.env.name;
+        if current && self.shared.loaded.config.defaults.modules.is_empty() && !hidden.is_empty() && before.as_ref() != Some(&hidden) {
+            let text = format!(
+                "{} modules have nothing in {} and leave Tab and the header (: still opens them): {}",
+                hidden.len(),
+                env.name,
+                hidden.join(", ")
+            );
+            let mut ctx = Ctx { shared: &mut self.shared, module: APP };
+            ctx.toast(Level::Info, text);
+        }
     }
 
     // ---- SSO login --------------------------------------------------------------
@@ -445,11 +544,12 @@ impl App {
     fn app_task(&mut self, payload: Payload) {
         let payload = match payload.downcast::<CatalogLoaded>() {
             Ok(loaded) => {
-                let CatalogLoaded { env, resources, listed } = *loaded;
-                self.catalog_loading.remove(&env);
+                let CatalogLoaded { env, listing } = *loaded;
+                self.catalog_loading.remove(&env.name);
                 // Nothing could be listed (an expired session): try again next time.
-                if listed > 0 {
-                    self.catalogs.insert(env, (Instant::now(), resources));
+                if !listing.counts.is_empty() {
+                    self.catalogs.insert(env.name.clone(), (Instant::now(), listing.resources));
+                    self.update_usage(&env, &listing.counts);
                 }
                 if matches!(self.overlay, Some(Overlay::Palette { modules: true, .. })) {
                     let (items, new_jumps) = self.palette_items(true);
@@ -534,18 +634,27 @@ impl App {
 
         let logo = format!(" ◆ {} ", crate::util::program());
         let active = Style::new().fg(ratatui::style::Color::Black).bg(theme::ACCENT).bold();
-        let labels: Vec<String> =
-            self.modules.iter().enumerate().map(|(i, m)| format!(" {} {} ", i + 1, m.title())).collect();
+        // The modules shown, numbered for the digits; the current one too when it is not shown.
+        let mut tabs: Vec<(usize, String)> = self
+            .shown()
+            .into_iter()
+            .enumerate()
+            .map(|(n, i)| (i, if n < 9 { format!(" {} {} ", n + 1, self.modules[i].title()) } else { format!(" {} ", self.modules[i].title()) }))
+            .collect();
+        if !tabs.iter().any(|(i, _)| *i == self.active) {
+            tabs.push((self.active, format!(" {} ", self.modules[self.active].title())));
+        }
         let badges: Vec<Option<(String, ratatui::style::Color)>> = self.modules.iter().map(|m| m.badge()).collect();
         let badge_width = |b: &Option<(String, ratatui::style::Color)>| b.as_ref().map_or(0, |(t, _)| t.chars().count() + 2);
-        let tabs_width: usize = labels.iter().zip(&badges).map(|(l, b)| l.chars().count() + badge_width(b) + 1).sum();
+        let tabs_width: usize = tabs.iter().map(|(i, l)| l.chars().count() + badge_width(&badges[*i]) + 1).sum();
         let fits = logo.chars().count() + 1 + tabs_width + badge.width() + 2 <= area.width as usize;
 
         let mut spans = vec![Span::styled(logo.clone(), theme::accent().bold()), Span::raw(" ")];
         let mut x = area.x + logo.chars().count() as u16 + 1;
         self.tab_hits.clear();
         if fits {
-            for (i, (label, badge)) in labels.into_iter().zip(&badges).enumerate() {
+            for (i, label) in tabs {
+                let badge = &badges[i];
                 let width = (label.chars().count() + badge_width(badge)) as u16;
                 self.tab_hits.push((Rect::new(x, area.y, width, 1), i));
                 spans.push(Span::styled(label, if i == self.active { active } else { theme::muted() }));

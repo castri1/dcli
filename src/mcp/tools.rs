@@ -471,7 +471,8 @@ fn inventory(s: &Server, args: &Value) -> Result<String, String> {
     let (name, env) = s.env(args)?;
     let aws = s.session(name, env)?;
     let pipelines: Vec<String> = env.pipelines.iter().map(|p| p.name.clone()).collect();
-    let (all, listed) = crate::catalog::list(&aws, &pipelines);
+    let crate::catalog::Listing { resources: all, counts } = crate::catalog::list(&aws, &pipelines);
+    let listed = counts.len();
     let module = arg_str(args, "module").map(str::to_lowercase);
     let search = arg_str(args, "search").map(str::to_lowercase);
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;

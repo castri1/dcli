@@ -67,6 +67,15 @@ pub struct Shared {
     pub switch_env: Option<String>,
     /// A module asked for an SSO sign-in with this profile.
     pub login: Option<String>,
+    /// A program to hand the terminal to (see [`Ctx::run_interactive`]).
+    pub interactive: Option<Interactive>,
+}
+
+/// A program that takes over the terminal (k9s, say) until it exits.
+pub struct Interactive {
+    pub command: std::process::Command,
+    /// Shown when the program is not installed.
+    pub missing: String,
 }
 
 /// Per-frame values for rendering.
@@ -208,6 +217,12 @@ impl Ctx<'_> {
     /// Starts an SSO sign-in for `profile`, which may belong to another environment.
     pub fn login(&mut self, profile: impl Into<String>) {
         self.shared.login = Some(profile.into());
+    }
+
+    /// Hands the terminal to `command` until it exits (the UI pauses meanwhile), then
+    /// redraws. `missing` is shown when the program is not installed; a failed exit is shown too.
+    pub fn run_interactive(&mut self, command: std::process::Command, missing: impl Into<String>) {
+        self.shared.interactive = Some(Interactive { command, missing: missing.into() });
     }
 
     /// Toast plus a desktop notification when enabled in the config.
