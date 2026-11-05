@@ -12,6 +12,7 @@ pub mod costs;
 pub mod dms;
 pub mod dns;
 pub mod dynamodb;
+pub mod eks;
 pub mod events;
 pub mod insights;
 pub mod lambda;
