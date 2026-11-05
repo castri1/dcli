@@ -182,7 +182,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 
 | Where | Keys |
 |---|---|
-| Everywhere | `:` / `Ctrl+K` go to a module, an environment or (type its name) any resource of the environment · `Tab` / `1`-`9` switch module · `e` environment · `L` SSO login · `?` help · `q` quit |
+| Everywhere | `:` / `Ctrl+K` go to a module, an environment or (type its name) any resource of the environment · `Tab` / `1`-`9` switch module (among those shown, see below) · `e` environment · `L` SSO login · `?` help · `q` quit |
 | Pipelines | `↑↓` pipeline · `←→` stage · `d` deploy · `a` approve/reject · `s` stop · `R` roll back · `l` logs · `h` history · `o` open in console · `r` refresh · `n` search the account and add pipelines · `x` remove from config · `c` copy a failure report · `C` save it with the full log |
 | Matrix | `↑↓←→` move · `Enter` open the pipeline in that environment (or sign in) · `p` promote what the environment to the left runs · `R` roll back · `g` compare with the environment to the left · `r` refresh |
 | Approvals | `↑↓` move · `a` approve / reject (with a comment) · `Enter` open the pipeline (or sign in) · `o` open the approval's link · `r` refresh |
@@ -225,6 +225,23 @@ five minutes). Enter opens the resource in its module.
 
 The mouse works too: wheel to scroll, click to select and switch modules. Forms accept pasted
 text (multi-line JSON included); `Ctrl+R` shows a hidden value while typing it.
+
+### Only the modules you use
+
+The header, `Tab` and the digits skip the modules of services the environment does not use:
+dcli lists each service in the background (as `:` does) and hides those with nothing in it, so
+an account without Redshift or EKS does not cycle through them. A service dcli cannot read
+(no permission) stays. `:` still lists every module, the hidden ones last and dimmed with the
+reason. What each environment uses is kept in `~/.deployment-cli/cache/modules-<env>.json`
+and listed again after a day (or whenever you open `:`).
+
+To choose them yourself, name them under `defaults.modules` (in the order you want; dcli
+starts on the first one):
+
+```yaml
+defaults:
+  modules: [Pipelines, Lambda, ECS, Logs, Alarms]
+```
 
 ### When a pipeline fails
 
@@ -566,6 +583,7 @@ environments:
 defaults:
   pollIntervalSeconds: 10
   notifications: true        # desktop notifications on finish / approval needed
+  modules: [Pipelines, Lambda, Logs]   # optional: the modules Tab and the header show
 ```
 
 Search order: `--config FILE`, `~/.deployment-cli/config.yaml`, `./deployment-cli.yaml`,
@@ -634,7 +652,9 @@ blocks. There is no async runtime and no AWS SDK: each service is a handful of t
    `activate` (load lazily), `key`, `task` (results from `ctx.spawn`), `render`, `hints`.
    `parameters.rs` is a compact example.
 3. **Register** it in `src/modules/mod.rs`. It appears in the header and the palette. To make
-   its resources searchable from `:`, add a lister to `src/catalog.rs` and implement `open`.
+   its resources searchable from `:`, add a lister to `src/catalog.rs` (with the module's
+   title: an environment where it lists nothing hides the module) and implement `open`.
+   `ctx.run_interactive` hands the terminal to another program (EKS opens k9s) and takes it back.
 4. **CLI** (optional): a `src/clicmd/<name>.rs` with a clap `Args` struct and `run`, added to
    the `Command` enum in `src/cli.rs`.
 
