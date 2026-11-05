@@ -183,6 +183,8 @@ pub enum Command {
     },
     /// Show a Lambda function's configuration: lambda [ENV] NAME
     Lambda(crate::clicmd::lambda::Args),
+    /// ECS: clusters, services, deployments, why tasks stopped; redeploy, scale, roll back
+    Ecs(crate::clicmd::ecs::Args),
     /// S3: list buckets and objects, presigned download links, downloads
     S3(crate::clicmd::s3::Args),
     /// Step Functions: executions of a state machine, failure reports
@@ -573,6 +575,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Advisor(args) => crate::clicmd::advisor::run(config, args),
         Command::Mcp(args) => crate::mcp::serve(&loaded, args),
         Command::Lambda(args) => crate::clicmd::lambda::run(config, args),
+        Command::Ecs(args) => crate::clicmd::ecs::run(config, args),
     }
 }
 

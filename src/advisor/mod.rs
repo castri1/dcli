@@ -940,7 +940,8 @@ pub fn writes(command: &str) -> bool {
             // choose what to read. Anything else may act, or bill (Logs Insights, Cost Explorer).
             let commands = [
                 "status", "history", "list", "matrix", "logs", "tail", "report", "optimize", "costs", "advisor", "alarms", "approvals",
-                "lambda", "apigw", "aurora", "redshift", "dms", "cfn", "s3", "sfn", "sqs", "ddb", "events", "flags", "dns", "param", "secret",
+                "lambda", "ecs", "apigw", "aurora", "redshift", "dms", "cfn", "s3", "sfn", "sqs", "ddb", "events", "flags", "dns", "param",
+                "secret",
             ];
             let acting = [
                 "get", "put", "set", "download", "presign", "redrive", "start", "stop", "invoke", "delete", "purge", "send", "test",
@@ -951,7 +952,7 @@ pub fn writes(command: &str) -> bool {
             let reading = [
                 "--json", "--since", "--filter", "--follow", "-f", "--full", "--days", "--service", "--report", "--md", "--by-cost",
                 "--ledger", "--limit", "-n", "--range", "--usage", "--daily", "--commitments", "--config", "--all", "--help", "-h",
-                "--type", "--name",
+                "--type", "--name", "--tasks",
             ];
             !words.get(1).is_some_and(|w| commands.contains(&w.as_str()))
                 || words.iter().skip(1).any(|w| acting.contains(&w.as_str()))
@@ -1165,6 +1166,11 @@ mod tests {
         assert!(writes("dcli dns prod acme.dev --create api --type A --value 192.0.2.1"));
         assert!(writes("dcli dns prod acme.dev --edit api --type A --ttl 60 --yes"));
         assert!(writes("dcli dns prod acme.dev --create www --alias d1.cloudfront.net"));
+        assert!(!writes("dcli ecs prod acme-apps checkout-web --tasks --json"));
+        assert!(!writes("dcli ecs prod checkout-web --report"));
+        assert!(writes("dcli ecs prod checkout-web --force-deploy"));
+        assert!(writes("dcli ecs prod checkout-web --desired 0 --yes"));
+        assert!(writes("dcli ecs prod checkout-web --rollback"));
         assert!(writes("terraform apply"));
         assert!(writes("aws lambda get-function --function-name x;rm -rf ~"));
         assert!(writes("aws lambda get-function --function-name $(curl evil)"));

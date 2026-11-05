@@ -1,5 +1,5 @@
-//! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, log
-//! groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues,
+//! What an environment has, by name, for the `:` palette: pipelines, Lambda functions, ECS
+//! clusters and services, log groups, parameters, secrets, CloudFormation stacks, buckets, state machines, queues,
 //! tables, API Gateway APIs, Aurora and Redshift clusters, DMS replication tasks, event
 //! buses, AppConfig applications, alarms and Route 53 hosted zones, each with the module that opens it. Services are listed in parallel and capped; a service the user cannot read is left out.
 
@@ -31,6 +31,7 @@ type Lister = fn(&Aws) -> aws::Result<Vec<Resource>>;
 /// Each service's lister and the module that shows it (by title).
 const LISTERS: &[(&str, Lister)] = &[
     ("Lambda", functions),
+    ("ECS", ecs_resources),
     ("API Gateway", apis),
     ("Logs", log_groups),
     ("Parameters", parameters),
@@ -92,6 +93,20 @@ fn pages<T>(mut page: impl FnMut(Option<&str>) -> aws::Result<(Vec<T>, Option<St
 fn functions(aws: &Aws) -> aws::Result<Vec<Resource>> {
     let list = pages(|t| lambda::list_functions(aws, t))?;
     Ok(list.iter().map(|f| Resource::new("Lambda", &f.function_name, f.function_name.clone(), f.runtime.as_deref().unwrap_or("function"))).collect())
+}
+
+/// ECS clusters and their services; the targets are `cluster` and `cluster/service`. Nothing
+/// when the region has no cluster, so the module filter hides ECS there.
+fn ecs_resources(aws: &Aws) -> aws::Result<Vec<Resource>> {
+    let mut out = Vec::new();
+    for c in aws::ecs::clusters(aws)? {
+        out.push(Resource::new("ECS", &c.cluster_name, c.cluster_name.clone(), &format!("cluster · {} services", c.active_services_count)));
+        // A cluster whose services cannot be listed still shows.
+        for name in aws::ecs::service_names(aws, &c.cluster_name).unwrap_or_default() {
+            out.push(Resource::new("ECS", &name, format!("{}/{name}", c.cluster_name), &format!("service · {}", c.cluster_name)));
+        }
+    }
+    Ok(out)
 }
 
 /// API Gateway APIs (REST, HTTP and WebSocket); the target is the API id.
