@@ -88,6 +88,12 @@ fn target() -> Result<&'static str> {
 }
 
 /// `dcli update`: `check` only reports; `to` installs that release tag (even an older one).
+/// False only when the npm registry answers that it has no such version.
+fn on_npm(version: &str) -> bool {
+    let url = format!("https://registry.npmjs.org/@castri1%2fdcli/{version}");
+    !matches!(http::send("GET", &url, &[], Vec::new()), Ok(resp) if resp.status == 404)
+}
+
 pub fn run(check: bool, to: Option<String>) -> Result<ExitCode> {
     let pinned = to.is_some();
     let tag = match to {
@@ -114,7 +120,13 @@ pub fn run(check: bool, to: Option<String>) -> Result<ExitCode> {
 
     let exe = std::env::current_exe()?.canonicalize()?;
     if exe.components().any(|c| c.as_os_str() == "node_modules") {
-        let spec = format!("@castri1/dcli@{}", tag.trim_start_matches('v'));
+        let version = tag.trim_start_matches('v');
+        // A release reaches GitHub some minutes before npm serves it.
+        if !pinned && !on_npm(version) {
+            println!("npm does not have {version} yet (a release takes a few minutes to get there). Try again shortly.");
+            return Ok(ExitCode::SUCCESS);
+        }
+        let spec = format!("@castri1/dcli@{version}");
         if cfg!(windows) {
             // npm cannot replace dcli.exe while it runs.
             println!("Installed with npm. Close dcli and run: npm install -g {spec}");
