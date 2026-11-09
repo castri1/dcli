@@ -992,8 +992,10 @@ mod tests {
         assert!(text.contains("certificate-authority-data: \"LS0tQ0E=\""));
         assert!(text.contains("args: [\"eks\", \"prod\", \"shop\", \"--token\"]"));
         assert!(text.contains("current-context: \"prod-shop\""));
+        // The config file goes in absolute: on Windows that adds the drive.
+        let config = std::path::absolute("/tmp/c.yaml").unwrap().to_string_lossy().into_owned();
         let (_, args) = token_command(Some(std::path::Path::new("/tmp/c.yaml")), "prod", "shop");
-        assert_eq!(args, ["--config", "/tmp/c.yaml", "eks", "prod", "shop", "--token"]);
+        assert_eq!(args, ["--config", config.as_str(), "eks", "prod", "shop", "--token"]);
     }
 
     #[test]
