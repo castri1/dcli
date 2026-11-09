@@ -4988,6 +4988,10 @@ class H(BaseHTTPRequestHandler):
         self.check_sig()
         return self.route_rest("PATCH", self.raw_body())
 
+    def do_PUT(self):
+        self.check_sig()
+        return self.route_rest("PUT", self.raw_body())
+
     def reply_xml(self, code, text):
         data = text.encode()
         self.send_response(code)
@@ -5667,6 +5671,66 @@ def elbv2(params):
 
 
 EXTRA_REST.append((lambda path: path.startswith("/2013-04-01/") or path.startswith("/2020-05-31/"), route53_rest))
+
+
+# ---- EventBridge Schemas (restJson1): Lambda's shareable test events ------------------------------
+# The console keeps a function's shared test events as the examples of the OpenAPI schema
+# `_<function>-schema` in the registry `lambda-testevent-schemas`. payments-webhook has two;
+# report-builder's cannot be read (no permission).
+SCHEMA_REGISTRIES = {"lambda-testevent-schemas"}
+SCHEMAS = {("lambda-testevent-schemas", "_payments-webhook-schema"): json.dumps({
+    "openapi": "3.0.0", "info": {"version": "1.0.0", "title": "Event"}, "paths": {},
+    "components": {
+        "schemas": {"Event": {"type": "object", "required": ["id", "type"],
+                              "properties": {"id": {"type": "string"}, "type": {"type": "string"}, "fail": {"type": "boolean"}}}},
+        "examples": {"charge-succeeded": {"value": {"id": "evt_1", "type": "charge.succeeded", "amount": 4200}},
+                     "provider-timeout": {"value": {"id": "evt_2", "type": "charge.pending", "fail": True}}}}})}
+
+
+def schemas_rest(method, path, query, headers, body):
+    json_type = {"content-type": "application/json"}
+
+    def error(status, code, message):
+        return status, {**json_type, "x-amzn-errortype": code}, json.dumps({"Code": code, "Message": message}).encode()
+
+    parts = [unquote(p) for p in path.split("/") if p]
+    if len(parts) == 4 and parts[:3] == ["v1", "registries", "name"] and method == "POST":
+        if parts[3] in SCHEMA_REGISTRIES:
+            return error(409, "ConflictException", f"Registry with name {parts[3]} already exists.")
+        SCHEMA_REGISTRIES.add(parts[3])
+        return 201, json_type, json.dumps({"RegistryName": parts[3]}).encode()
+    if len(parts) != 7 or parts[:3] != ["v1", "registries", "name"] or parts[4:6] != ["schemas", "name"]:
+        return error(404, "NotFoundException", f"mock: no route for {method} {path}")
+    key = (parts[3], parts[6])
+    if parts[6] == "_report-builder-schema":
+        return error(403, "ForbiddenException", "User is not authorized to perform: schemas:DescribeSchema")
+    if method == "GET":
+        if key not in SCHEMAS:
+            return error(404, "NotFoundException", f"Schema with name {parts[6]} does not exist.")
+        return 200, json_type, json.dumps({"Content": SCHEMAS[key], "SchemaName": parts[6], "SchemaVersion": "1", "Type": "OpenApi3"}).encode()
+    if method in ("POST", "PUT"):
+        if parts[3] not in SCHEMA_REGISTRIES:
+            return error(404, "NotFoundException", f"Registry with name {parts[3]} does not exist.")
+        if method == "POST" and key in SCHEMAS:
+            return error(409, "ConflictException", f"Schema with name {parts[6]} already exists.")
+        if method == "PUT" and key not in SCHEMAS:
+            return error(404, "NotFoundException", f"Schema with name {parts[6]} does not exist.")
+        req = json.loads(body or b"{}")
+        try:
+            doc = json.loads(req.get("Content", ""))
+            assert req.get("Type") == "OpenApi3" and doc.get("openapi") and isinstance(doc["components"]["examples"], dict)
+        except (ValueError, KeyError, AssertionError, AttributeError):
+            return error(400, "BadRequestException", "The schema content is not a valid OpenApi3 document.")
+        SCHEMAS[key] = req["Content"]
+        return (201 if method == "POST" else 200), json_type, json.dumps({"SchemaName": parts[6], "Type": "OpenApi3"}).encode()
+    if method == "DELETE":
+        if SCHEMAS.pop(key, None) is None:
+            return error(404, "NotFoundException", f"Schema with name {parts[6]} does not exist.")
+        return 204, json_type, b""
+    return error(404, "NotFoundException", f"mock: no route for {method} {path}")
+
+
+EXTRA_REST.append((lambda path: path.startswith("/v1/registries/"), schemas_rest))
 
 
 # ---- ECS (awsJson 1.1, AmazonEC2ContainerServiceV20141113) --------------------------------------

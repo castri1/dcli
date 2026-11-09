@@ -34,6 +34,7 @@ pub mod redshift_data;
 pub mod route53;
 pub mod s3;
 pub mod savingsplans;
+pub mod schemas;
 pub mod secrets;
 pub mod sfn;
 pub mod sigv4;

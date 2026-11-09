@@ -2,7 +2,7 @@
 
 Terminal UI and CLI to deploy and explore AWS: **CodePipeline** (a matrix of what is deployed
 where, promote and rollback, an inbox of approvals), **CloudWatch** alarms, Logs and Logs
-Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke), **ECS** and
+Insights, **Parameter Store**, **Secrets Manager**, **Lambda** (metrics, invoke, saved test events), **ECS** and
 Fargate (deployments, why tasks stopped, redeploy, scale, roll back), **API Gateway**, **CloudFormation**, **S3**, **Step Functions**, **SQS**, **DynamoDB**, **Aurora**
 (topology, performance, top SQL, failover), **Redshift** (nodes, queries, table health),
 **DMS** (tasks, tables, CDC latency), **EventBridge**, **AppConfig** feature flags,
@@ -97,6 +97,10 @@ dcli lambda dev my-function --json
 dcli lambda payments-webhook --metrics --since 7d                 # invocations, errors, p95, concurrency, throttles
 dcli lambda payments-webhook --report                             # Markdown report for an AI agent
 dcli lambda payments-webhook --invoke '{"orderId": "ORD-1"}'      # asks first; exit 1 on a function error
+dcli lambda payments-webhook --save-event paid --payload '{"orderId": "ORD-1"}'   # a test event, on this machine
+dcli lambda payments-webhook --save-event paid --payload - --shared   # in AWS: the console's shareable test events
+dcli lambda payments-webhook --events                             # saved test events, local and shared
+dcli lambda payments-webhook --event paid                         # invoke with a saved event
 dcli ecs                                                          # ECS clusters (then: dcli ecs prod CLUSTER for its services)
 dcli ecs prod checkout-web                                        # deployments and events (the cluster when several have it)
 dcli ecs prod checkout-web --tasks                                # running tasks and those stopped in the last hour, and why
@@ -206,7 +210,7 @@ environment: you pick an AWS profile from `~/.aws/config` and confirm the region
 | Full-screen logs | `/` search · `n`/`N` next/previous match · `e`/`E` next/previous error · `y` copy every line · `Esc` back. The mouse is left to the terminal: drag to select and copy |
 | Parameters | `Enter`/`←` open folder / go up · `/` search all names · `v` reveal secret · `c` copy value · `y` copy name · `n` new parameter · `u` new value |
 | Secrets | `/` search · `v` reveal · `c` copy value · `y` copy name · `n` new secret · `u` new value · `o` open in console |
-| Lambda | `/` search · `m` metrics 1h/24h/7d · `M` memory used, from its logs (Logs Insights) · `i` invoke with a payload · `c` copy a report for an AI agent · `y` copy ARN · `v` show env values · `l` its logs · `o` console · `r` refresh · `PgUp/PgDn` scroll |
+| Lambda | `/` search · `m` metrics 1h/24h/7d · `M` memory used, from its logs (Logs Insights) · `i` invoke with a payload or a saved test event (`Ctrl+S` saves one, `Ctrl+O` lists them, `Ctrl+D` deletes) · `c` copy a report for an AI agent · `y` copy ARN · `v` show env values · `l` its logs · `o` console · `r` refresh · `PgUp/PgDn` scroll |
 | ECS | `Enter`/`Esc` clusters → services → tasks / back · `/` search · `m` 1h/24h/7d · `D` new deployment · `s` desired count · `R` deploy another revision (roll back) · `c` copy a report for an AI agent · `l` the log group · `Enter` on a task: a container's last log lines · `y` copy ARN · `o` console · `r` refresh · `PgUp/PgDn` scroll |
 | API Gateway | `/` search · `←→` routes / stages / metrics / domains · `Enter` a route opens its integration (Lambda, SQS, Step Functions, EventBridge), a stage shows its settings, a domain mapping opens its API · `s` next stage · `m` 1h/24h/7d · `t` test the route · `y` copy a `curl` (`wscat` for WebSocket) or the URL · `x` export OpenAPI · `c` copy a report for AI · `l` logs · `d` redeploy · `b` roll back · `p` promote a stage · `v` show stage variables · `o` console · `r` reload |
 | Logs | `Enter` open a log group · `/` search groups · `t` time range · `f` filter pattern · `p` pause/resume live · `z` full screen · `y` copy · `o` console · `Space` mark groups · `i` Logs Insights on them |
@@ -303,7 +307,16 @@ before deploying and before creating or changing parameters and secrets.
 - **Lambda**: charts of the last hour, day or week: invocations with their errors, p95
   duration against the timeout, concurrency and throttles. `i` invokes the function for real
   (type the environment name in production) and shows its response and the end of its log;
-  it is never sent twice. `c` copies a report for an AI agent: the configuration (environment
+  it is never sent twice.
+  - **Test events**: in the invoke form, `Ctrl+S` keeps the payload under the name in
+    *Save as*, without invoking. Events are kept on this machine
+    (`~/.deployment-cli/test-events/`, private) or shared in AWS: those are the Lambda
+    console's shareable test events, so the team sees the same ones there and in dcli
+    (saving or deleting one writes in the account, and production asks for its name; it
+    needs permissions for EventBridge Schemas, where AWS keeps them). Once a function has
+    saved events, `i` lists them first: `Enter` loads one into the form, `Ctrl+D` deletes it.
+
+  `c` copies a report for an AI agent: the configuration (environment
   variable names, never their values), the last 24 hours of metrics, and the errors,
   timeouts and crashes in its logs grouped by kind with their stack traces.
 - **ECS**: a cluster's services come with their state (deployment failed, deploying, tasks

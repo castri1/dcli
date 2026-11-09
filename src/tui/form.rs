@@ -164,6 +164,12 @@ impl Form {
             self.error = Some(format!("{} is required", f.label));
             return false;
         }
+        self.confirmed()
+    }
+
+    /// True when the environment name was typed (or none is asked for); else says so and
+    /// moves there. For an action of the form other than submitting it.
+    pub fn confirmed(&mut self) -> bool {
         if let Some((name, input)) = &self.confirm
             && input.value.trim() != name
         {

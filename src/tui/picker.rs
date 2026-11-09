@@ -123,6 +123,11 @@ impl Picker {
         self.state.select(if self.visible.is_empty() { None } else { Some(0) });
     }
 
+    /// The item under the cursor (an index into the items).
+    pub fn selected(&self) -> Option<usize> {
+        self.cursor()
+    }
+
     fn cursor(&self) -> Option<usize> {
         self.state.selected().and_then(|pos| self.visible.get(pos).copied())
     }

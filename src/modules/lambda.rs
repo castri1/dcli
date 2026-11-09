@@ -24,7 +24,9 @@ use crate::savings::lambda::{self as memory, Estimate, MemoryRun};
 use crate::tui::chart::{Agg, Chart, fmt_count, fmt_ms};
 use crate::tui::form::{Field, Form, FormEvent};
 use crate::tui::logview::{LogKey, LogView};
+use crate::testevents::{self, Event, Place};
 use crate::tui::module::{Ctx, Emitter, Handled, Level, Module, Payload, View};
+use crate::tui::picker::{Item, Outcome, Picker};
 use crate::tui::theme;
 use crate::tui::widgets::{self, InputEvent, TextInput};
 use crate::util::{ellipsize, fmt_ago, fmt_bytes, now_secs, parse_rfc3339, pretty_json};
@@ -40,6 +42,9 @@ enum Msg {
     Detail { name: String, result: Box<aws::Result<lambda::FunctionDetail>> },
     Metrics { name: String, range: Range, result: Box<aws::Result<Metrics>> },
     Invoked { name: String, payload: String, result: Box<aws::Result<Invocation>> },
+    SharedEvents { name: String, result: aws::Result<Vec<Event>> },
+    EventSaved { name: String, event: Event, result: aws::Result<()> },
+    EventDeleted { name: String, event: String, result: aws::Result<bool> },
     Report { name: String, result: aws::Result<String> },
     MemoryEstimate { name: String, result: aws::Result<Estimate> },
     Memory { name: String, result: aws::Result<MemoryRun> },
@@ -56,7 +61,44 @@ struct MemoryCheck {
 struct Invoke {
     name: String,
     form: Form,
+    /// What is running: invoking, or saving a shared event.
+    busy: Option<&'static str>,
+}
+
+/// A function's shared test events (the console's), as far as they are known.
+enum Shared {
+    Loading,
+    Loaded(Vec<Event>),
+    Failed,
+}
+
+/// The saved test events of a function, to pick one. Item 0 is a new event; item `i` is
+/// `events[i - 1]`.
+struct EventList {
+    name: String,
+    picker: Picker,
+    events: Vec<Event>,
+}
+
+/// Confirming the removal of a shared test event.
+struct DeleteEvent {
+    name: String,
+    event: String,
+    form: Form,
     busy: bool,
+}
+
+const PLACES: &[&str] = &["this machine", "shared in AWS"];
+const INVOKE_NOTE: &str = "Enter runs the function now, for real: whatever it does (writes, messages, charges) happens. \
+    Ctrl+S keeps this payload as a test event, under the name in Save as, without invoking. Ctrl+O lists the saved ones.";
+
+fn event_items(events: &[Event]) -> Vec<Item> {
+    let mut items = vec![Item::new("New event", "write a payload, starting from the last one sent")];
+    items.extend(events.iter().map(|e| {
+        let item = Item::new(e.name.clone(), format!("{} · {}", e.place.label(), ellipsize(&e.compact(), 90)));
+        if e.place == Place::Shared { item.color(theme::APPROVAL) } else { item }
+    }));
+    items
 }
 
 pub struct Lambda {
@@ -82,6 +124,9 @@ pub struct Lambda {
     invoke: Option<Invoke>,
     /// The last payload sent to each function, for the next invoke.
     payloads: HashMap<String, String>,
+    events: Option<EventList>,
+    shared: HashMap<String, Shared>,
+    deleting: Option<DeleteEvent>,
     /// An invocation's response and log, full screen.
     result: Option<(String, LogView)>,
     /// Functions whose report is being written.
@@ -116,6 +161,9 @@ impl Lambda {
             metrics_in_flight: HashSet::new(),
             invoke: None,
             payloads: HashMap::new(),
+            events: None,
+            shared: HashMap::new(),
+            deleting: None,
             result: None,
             reporting: HashSet::new(),
             memory: None,
@@ -237,18 +285,215 @@ impl Lambda {
         });
     }
 
-    fn open_invoke(&mut self) {
+    /// `i`: the saved test events when the function has any, else the invoke form.
+    fn open_invoke(&mut self, ctx: &mut Ctx) {
         let Some(name) = self.selected().map(|f| f.function_name.clone()) else { return };
-        let payload = self.payloads.get(&name).cloned().unwrap_or_else(|| "{}".into());
-        let field = Field::text("Payload", payload).hint("JSON; paste works");
-        let mut form = Form::new(format!("Invoke · {name}"), vec![Field::fixed("Function", name.clone()), field])
-            .submit_label("invoke")
-            .focus_on("Payload");
-        form.note = Some("Runs the function now, for real: whatever it does (writes, messages, charges) happens.".into());
+        self.fetch_shared(&name, ctx);
+        if self.saved(&name).is_empty() {
+            self.open_form(name, None);
+        } else {
+            self.open_events(name);
+        }
+    }
+
+    /// The invoke form, with a saved event or the last payload sent.
+    fn open_form(&mut self, name: String, event: Option<Event>) {
+        let payload = match &event {
+            Some(e) => e.compact(),
+            None => self.payloads.get(&name).cloned().unwrap_or_else(|| "{}".into()),
+        };
+        let (save_as, place) = event.map_or((String::new(), Place::Local), |e| (e.name, e.place));
+        let fields = vec![
+            Field::fixed("Function", name.clone()),
+            Field::text("Payload", payload).hint("JSON; paste works"),
+            Field::text("Save as", save_as).optional("a name, to keep this event with Ctrl+S"),
+            Field::choice("Keep in", PLACES, place.label()),
+        ];
+        let mut form = Form::new(format!("Invoke · {name}"), fields).submit_label("invoke").focus_on("Payload").enter_submits();
+        form.note = Some(INVOKE_NOTE.into());
         if is_production(&self.env_name) {
             form = form.confirm_with(&self.env_name);
         }
-        self.invoke = Some(Invoke { name, form, busy: false });
+        self.invoke = Some(Invoke { name, form, busy: None });
+    }
+
+    // ---- saved test events ------------------------------------------------------------
+
+    /// The saved events of `name`: this machine's, then the shared ones read so far.
+    fn saved(&self, name: &str) -> Vec<Event> {
+        let mut events = testevents::local(name);
+        if let Some(Shared::Loaded(shared)) = self.shared.get(name) {
+            events.extend(shared.iter().cloned());
+        }
+        events
+    }
+
+    /// Reads the function's shared events (again: someone may have saved one meanwhile).
+    fn fetch_shared(&mut self, name: &str, ctx: &mut Ctx) {
+        match self.shared.get(name) {
+            Some(Shared::Loading) => return,
+            Some(Shared::Loaded(_)) => {}
+            _ => {
+                self.shared.insert(name.to_string(), Shared::Loading);
+            }
+        }
+        let (aws, name) = (ctx.env().aws.clone(), name.to_string());
+        ctx.spawn(move || {
+            let result = testevents::shared(&aws, &name);
+            Msg::SharedEvents { name, result }
+        });
+    }
+
+    fn open_events(&mut self, name: String) {
+        let events = self.saved(&name);
+        let picker = Picker::new(format!("Invoke · {name} · test events · Ctrl+D deletes"), "use", event_items(&events), false);
+        self.events = Some(EventList { name, picker, events });
+    }
+
+    /// The open list again after its events changed; it closes with the last one.
+    fn refresh_events(&mut self, name: &str) {
+        if self.events.as_ref().is_none_or(|l| l.name != name) {
+            return;
+        }
+        let events = self.saved(name);
+        match &mut self.events {
+            Some(list) if !events.is_empty() => {
+                list.picker.set_items(event_items(&events));
+                list.events = events;
+            }
+            _ => self.events = None,
+        }
+    }
+
+    fn on_shared_events(&mut self, name: String, result: aws::Result<Vec<Event>>, ctx: &mut Ctx) {
+        let in_form = self.invoke.as_ref().is_some_and(|i| i.name == name);
+        let watching = in_form || self.events.as_ref().is_some_and(|l| l.name == name);
+        let known = matches!(self.shared.get(&name), Some(Shared::Loaded(_)));
+        match result {
+            Ok(events) => {
+                if in_form && !known && !events.is_empty() {
+                    let n = events.len();
+                    ctx.toast(Level::Info, format!("{name} has {n} shared test event{} · Ctrl+O lists them", if n == 1 { "" } else { "s" }));
+                }
+                self.shared.insert(name.clone(), Shared::Loaded(events));
+            }
+            // What was read before stays.
+            Err(_) if known => {}
+            Err(e) => {
+                self.shared.insert(name.clone(), Shared::Failed);
+                if watching {
+                    ctx.toast(Level::Warn, format!("The shared test events of {name} could not be read: {}", e.short()));
+                }
+            }
+        }
+        self.refresh_events(&name);
+    }
+
+    /// Ctrl+S in the invoke form: keeps the payload under the name in Save as.
+    fn save_event(&mut self, ctx: &mut Ctx) {
+        let Some(invoke) = &mut self.invoke else { return };
+        let name = invoke.form.get("Save as").trim().to_string();
+        if let Err(e) = testevents::check_name(&name) {
+            return invoke.form.fail(e);
+        }
+        let text = match invoke.form.get("Payload").trim() {
+            "" => "{}",
+            text => text,
+        };
+        let payload: serde_json::Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(e) => return invoke.form.fail(format!("The payload is not valid JSON: {e}")),
+        };
+        let function = invoke.name.clone();
+        if invoke.form.get("Keep in") == Place::Local.label() {
+            let existed = testevents::local(&function).iter().any(|e| e.name == name);
+            return match testevents::save_local(&function, &name, &payload) {
+                Ok(()) => ctx.toast(Level::Success, format!("{} the test event {name} on this machine", if existed { "Updated" } else { "Saved" })),
+                Err(e) => invoke.form.fail(format!("Not saved: {e}")),
+            };
+        }
+        // A shared event is a write in the account: production asks for its name first.
+        if !invoke.form.confirmed() {
+            return;
+        }
+        invoke.busy = Some("Saving…");
+        let aws = ctx.env().aws.clone();
+        ctx.spawn(move || {
+            let result = aws::schemas::save(&aws, &function, &name, &payload);
+            Msg::EventSaved { name: function, event: Event { name, place: Place::Shared, payload }, result }
+        });
+    }
+
+    fn on_event_saved(&mut self, name: String, event: Event, result: aws::Result<()>, ctx: &mut Ctx) {
+        if let Some(invoke) = self.invoke.as_mut().filter(|i| i.name == name) {
+            invoke.busy = None;
+            if let Err(e) = &result {
+                return invoke.form.fail(format!("Not saved: {}", e.short()));
+            }
+        }
+        if let Err(e) = result {
+            return ctx.toast(Level::Error, format!("The test event {} was not saved: {}", event.name, e.short()));
+        }
+        ctx.toast(Level::Success, format!("Saved the shared test event {} · the Lambda console lists it too", event.name));
+        match self.shared.get_mut(&name) {
+            Some(Shared::Loaded(events)) => {
+                events.retain(|e| e.name != event.name);
+                events.push(event);
+                events.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            _ => {
+                self.shared.remove(&name);
+                self.fetch_shared(&name, ctx);
+            }
+        }
+    }
+
+    /// Ctrl+D in the list: removes the event under the cursor; a shared one asks first.
+    fn delete_event(&mut self, ctx: &mut Ctx) {
+        let Some(list) = &self.events else { return };
+        let Some(event) = list.picker.selected().and_then(|i| i.checked_sub(1)).and_then(|i| list.events.get(i)).cloned() else {
+            return;
+        };
+        let name = list.name.clone();
+        if event.place == Place::Local {
+            match testevents::delete_local(&name, &event.name) {
+                Ok(_) => ctx.toast(Level::Success, format!("Deleted the test event {} from this machine", event.name)),
+                Err(e) => ctx.toast(Level::Error, format!("Not deleted: {e}")),
+            }
+            return self.refresh_events(&name);
+        }
+        let fields = vec![Field::fixed("Function", name.clone()), Field::fixed("Event", event.name.clone())];
+        let mut form = Form::new("Delete shared test event", fields).submit_label("delete").enter_submits();
+        form.note = Some("It is removed from AWS: nobody sees it any more, in dcli or in the Lambda console.".into());
+        if is_production(&self.env_name) {
+            form = form.confirm_with(&self.env_name);
+        }
+        self.deleting = Some(DeleteEvent { name, event: event.name, form, busy: false });
+    }
+
+    fn submit_delete(&mut self, ctx: &mut Ctx) {
+        let Some(deleting) = &mut self.deleting else { return };
+        deleting.busy = true;
+        let (aws, name, event) = (ctx.env().aws.clone(), deleting.name.clone(), deleting.event.clone());
+        ctx.spawn(move || {
+            let result = aws::schemas::delete(&aws, &name, &event);
+            Msg::EventDeleted { name, event, result }
+        });
+    }
+
+    fn on_event_deleted(&mut self, name: String, event: String, result: aws::Result<bool>, ctx: &mut Ctx) {
+        self.deleting = None;
+        match result {
+            Ok(found) => {
+                if let Some(Shared::Loaded(events)) = self.shared.get_mut(&name) {
+                    events.retain(|e| e.name != event);
+                }
+                let text = if found { format!("Deleted the shared test event {event}") } else { format!("{event} was already gone") };
+                ctx.toast(Level::Success, text);
+            }
+            Err(e) => ctx.toast(Level::Error, format!("Not deleted: {}", e.short())),
+        }
+        self.refresh_events(&name);
     }
 
     fn submit_invoke(&mut self, ctx: &mut Ctx) {
@@ -260,7 +505,7 @@ impl Lambda {
         if let Err(e) = serde_json::from_str::<serde_json::Value>(&payload) {
             return invoke.form.fail(format!("The payload is not valid JSON: {e}"));
         }
-        invoke.busy = true;
+        invoke.busy = Some("Invoking…");
         let (aws, name) = (ctx.env().aws.clone(), invoke.name.clone());
         ctx.spawn(move || {
             let result = Box::new(lambda::invoke(&aws, &name, &payload));
@@ -270,7 +515,7 @@ impl Lambda {
 
     fn on_invoked(&mut self, name: String, payload: String, result: aws::Result<Invocation>, ctx: &mut Ctx) {
         let Some(invoke) = &mut self.invoke else { return };
-        invoke.busy = false;
+        invoke.busy = None;
         let inv = match result {
             Ok(inv) => inv,
             Err(e) => return invoke.form.fail(e.short()),
@@ -674,12 +919,84 @@ impl Lambda {
         let Some(invoke) = &self.invoke else { return };
         let color = if is_production(&self.env_name) { theme::ERR } else { theme::ACCENT };
         invoke.form.render(f, area, color);
-        if invoke.busy {
-            let body = Text::from(vec![
-                Line::raw(""),
-                Line::from(vec![Span::styled(format!("{} ", theme::spinner(view.tick)), theme::accent()), Span::raw("Invoking…")]),
-            ]);
-            widgets::popup(f, widgets::popup_area(area, 30, 5), "Lambda", theme::ACCENT, body);
+        if let Some(what) = invoke.busy {
+            busy_popup(f, area, view, what);
+        }
+    }
+
+    fn render_events(&mut self, f: &mut Frame, area: Rect, view: &View) {
+        if let Some(list) = &mut self.events {
+            let rect = widgets::popup_area(area, 110, list.picker.height(area.height.saturating_sub(4)));
+            list.picker.render(f, rect, theme::ACCENT);
+        }
+        if let Some(deleting) = &self.deleting {
+            deleting.form.render(f, area, theme::ERR);
+            if deleting.busy {
+                busy_popup(f, area, view, "Deleting…");
+            }
+        }
+    }
+}
+
+fn busy_popup(f: &mut Frame, area: Rect, view: &View, what: &str) {
+    let body = Text::from(vec![
+        Line::raw(""),
+        Line::from(vec![Span::styled(format!("{} ", theme::spinner(view.tick)), theme::accent()), Span::raw(what.to_string())]),
+    ]);
+    widgets::popup(f, widgets::popup_area(area, 30, 5), "Lambda", theme::ACCENT, body);
+}
+
+impl Lambda {
+    fn invoke_key(&mut self, key: KeyEvent, ctx: &mut Ctx) {
+        let Some(invoke) = &mut self.invoke else { return };
+        if invoke.busy.is_some() {
+            return;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('s') if ctrl => self.save_event(ctx),
+            KeyCode::Char('o') if ctrl => {
+                let name = invoke.name.clone();
+                if self.saved(&name).is_empty() {
+                    if let Some(invoke) = &mut self.invoke {
+                        invoke.form.fail("No saved test events yet: name this one in Save as and press Ctrl+S");
+                    }
+                } else {
+                    self.invoke = None;
+                    self.open_events(name);
+                }
+            }
+            _ => match invoke.form.handle(key) {
+                FormEvent::Submit => self.submit_invoke(ctx),
+                FormEvent::Cancel => self.invoke = None,
+                FormEvent::Pending => {}
+            },
+        }
+    }
+
+    fn events_key(&mut self, key: KeyEvent, ctx: &mut Ctx) {
+        if let Some(deleting) = &mut self.deleting {
+            if !deleting.busy {
+                match deleting.form.handle(key) {
+                    FormEvent::Submit => self.submit_delete(ctx),
+                    FormEvent::Cancel => self.deleting = None,
+                    FormEvent::Pending => {}
+                }
+            }
+            return;
+        }
+        let Some(list) = &mut self.events else { return };
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            return self.delete_event(ctx);
+        }
+        match list.picker.handle(key) {
+            Outcome::Pending => {}
+            Outcome::Cancel => self.events = None,
+            Outcome::Done(chosen) => {
+                let Some(list) = self.events.take() else { return };
+                let event = chosen.first().and_then(|i| i.checked_sub(1)).and_then(|i| list.events.get(i)).cloned();
+                self.open_form(list.name, event);
+            }
         }
     }
 }
@@ -732,15 +1049,12 @@ impl Module for Lambda {
             }
             return Handled::Yes;
         }
-        if let Some(invoke) = &mut self.invoke {
-            if invoke.busy {
-                return Handled::Yes;
-            }
-            match invoke.form.handle(key) {
-                FormEvent::Submit => self.submit_invoke(ctx),
-                FormEvent::Cancel => self.invoke = None,
-                FormEvent::Pending => {}
-            }
+        if self.events.is_some() || self.deleting.is_some() {
+            self.events_key(key, ctx);
+            return Handled::Yes;
+        }
+        if self.invoke.is_some() {
+            self.invoke_key(key, ctx);
             return Handled::Yes;
         }
         let selected = self.list_state.selected().unwrap_or(0);
@@ -780,7 +1094,7 @@ impl Module for Lambda {
                 self.range = self.range.next();
                 self.fetch_metrics(ctx);
             }
-            KeyCode::Char('i') => self.open_invoke(),
+            KeyCode::Char('i') => self.open_invoke(ctx),
             KeyCode::Char('M') => self.check_memory(ctx),
             KeyCode::Char('c') => self.copy_report(ctx),
             KeyCode::Char('y') => {
@@ -824,7 +1138,7 @@ impl Module for Lambda {
 
     fn mouse(&mut self, event: MouseEvent, _ctx: &mut Ctx) -> Handled {
         let pos = (event.column, event.row).into();
-        if self.invoke.is_some() || self.memory.is_some() || !self.list_area.contains(pos) {
+        if self.invoke.is_some() || self.events.is_some() || self.memory.is_some() || !self.list_area.contains(pos) {
             return Handled::No;
         }
         let selected = self.list_state.selected().unwrap_or(0);
@@ -868,6 +1182,9 @@ impl Module for Lambda {
                 self.metrics.insert((name, range), (Instant::now(), *result));
             }
             Msg::Invoked { name, payload, result } => self.on_invoked(name, payload, *result, ctx),
+            Msg::SharedEvents { name, result } => self.on_shared_events(name, result, ctx),
+            Msg::EventSaved { name, event, result } => self.on_event_saved(name, event, result, ctx),
+            Msg::EventDeleted { name, event, result } => self.on_event_deleted(name, event, result, ctx),
             Msg::Report { name, result } => self.on_report(name, result, ctx),
             Msg::MemoryEstimate { name, result } => self.on_memory_estimate(name, result, ctx),
             Msg::Memory { name, result } => self.on_memory(name, result, ctx),
@@ -904,6 +1221,7 @@ impl Module for Lambda {
         self.render_list(f, left, view);
         self.render_detail(f, right, view);
         self.render_invoke(f, area, view);
+        self.render_events(f, area, view);
         if let Some(check) = &self.memory {
             check.form.render(f, area, theme::ACCENT);
         }
@@ -913,8 +1231,14 @@ impl Module for Lambda {
         if self.result.is_some() {
             return vec![("/", "search"), ("y", "copy"), ("Esc", "back")];
         }
+        if self.deleting.is_some() {
+            return vec![("Enter", "delete"), ("Esc", "cancel")];
+        }
+        if self.events.is_some() {
+            return vec![("↑↓", "event"), ("Enter", "use"), ("Ctrl+D", "delete"), ("Esc", "cancel")];
+        }
         if self.invoke.is_some() {
-            return vec![("Enter", "invoke"), ("Esc", "cancel")];
+            return vec![("Enter", "invoke"), ("Ctrl+S", "save event"), ("Ctrl+O", "saved events"), ("Tab", "next field"), ("Esc", "cancel")];
         }
         if self.memory.is_some() {
             return vec![("←→", "window"), ("Enter", "analyse"), ("Esc", "cancel")];
@@ -945,11 +1269,12 @@ impl Module for Lambda {
             || !self.metrics_in_flight.is_empty()
             || !self.reporting.is_empty()
             || !self.reading_memory.is_empty()
-            || self.invoke.as_ref().is_some_and(|i| i.busy)
+            || self.invoke.as_ref().is_some_and(|i| i.busy.is_some())
+            || self.deleting.as_ref().is_some_and(|d| d.busy)
     }
 
     fn capturing(&self) -> bool {
-        self.filtering || self.invoke.is_some() || self.memory.is_some() || self.result.is_some()
+        self.filtering || self.invoke.is_some() || self.events.is_some() || self.deleting.is_some() || self.memory.is_some() || self.result.is_some()
     }
 
     fn wants_mouse(&self) -> bool {
@@ -957,8 +1282,14 @@ impl Module for Lambda {
     }
 
     fn paste(&mut self, text: &str, _ctx: &mut Ctx) {
+        if let Some(deleting) = &mut self.deleting {
+            return deleting.form.paste(text);
+        }
+        if let Some(list) = &mut self.events {
+            return list.picker.paste(text);
+        }
         match &mut self.invoke {
-            Some(invoke) if !invoke.busy => invoke.form.paste(text),
+            Some(invoke) if invoke.busy.is_none() => invoke.form.paste(text),
             Some(_) => {}
             None if self.filtering => {
                 self.filter.insert_str(text, false);

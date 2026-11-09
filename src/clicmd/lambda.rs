@@ -1,16 +1,17 @@
-//! `dcli lambda`: a function's configuration, its metrics, a report for an AI agent, and
-//! invoking it.
+//! `dcli lambda`: a function's configuration, its metrics, a report for an AI agent,
+//! invoking it, and its saved test events.
 
 use std::process::ExitCode;
 
 use anyhow::{Result, anyhow, bail};
 
 use crate::aws::lambda::{self, Range};
-use crate::aws::Aws;
+use crate::aws::{self, Aws};
+use crate::testevents::{self, Event};
 use crate::cli::{aws_for, confirm_write, env_and, paint, print_json, read_value};
 use crate::config::Config;
 use crate::tui::chart::{Agg, columns, fmt_count, fmt_ms, sparkline};
-use crate::util::{now_secs, pretty_json, program};
+use crate::util::{ellipsize, now_secs, pretty_json, program};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -32,7 +33,25 @@ pub struct Args {
     /// Invoke the function with this JSON payload ("-" reads stdin, with --yes); exit code 1 when it fails
     #[arg(long, value_name = "PAYLOAD", allow_hyphen_values = true)]
     invoke: Option<String>,
-    /// Do not ask for confirmation before invoking
+    /// The saved test events: this machine's and the ones shared in AWS (the Lambda console's)
+    #[arg(long, conflicts_with_all = ["report", "metrics", "invoke"])]
+    events: bool,
+    /// Invoke with a saved test event (this machine's first; --shared takes the one in AWS)
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["report", "metrics", "invoke", "events"])]
+    event: Option<String>,
+    /// Save --payload as a test event, on this machine or, with --shared, in AWS
+    #[arg(long, value_name = "NAME", requires = "payload", conflicts_with_all = ["report", "metrics", "invoke", "events", "event"])]
+    save_event: Option<String>,
+    /// The JSON payload for --save-event ("-" reads stdin)
+    #[arg(long, value_name = "PAYLOAD", allow_hyphen_values = true, requires = "save_event")]
+    payload: Option<String>,
+    /// Delete a saved test event, from this machine or, with --shared, from AWS
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["report", "metrics", "invoke", "events", "event", "save_event"])]
+    delete_event: Option<String>,
+    /// With --event, --save-event and --delete-event: the events shared in AWS, which the Lambda console lists too
+    #[arg(long)]
+    shared: bool,
+    /// Do not ask for confirmation before invoking or changing a shared event
     #[arg(short, long)]
     yes: bool,
 }
@@ -50,6 +69,22 @@ pub fn run(config: &Config, args: Args) -> Result<ExitCode> {
     }
     if let Some(payload) = args.invoke {
         return invoke(&aws, &env, &name, &payload, args.yes, args.json);
+    }
+    if args.events {
+        return events(&aws, &name, args.json);
+    }
+    if let Some(event) = args.event {
+        let payload = saved_event(&aws, &name, &event, args.shared)?.compact();
+        return invoke(&aws, &env, &name, &payload, args.yes, args.json);
+    }
+    if let (Some(event), Some(payload)) = (&args.save_event, &args.payload) {
+        return save_event(&aws, &env, &name, event, payload, args.shared, args.yes);
+    }
+    if let Some(event) = args.delete_event {
+        return delete_event(&aws, &env, &name, &event, args.shared, args.yes);
+    }
+    if args.shared {
+        bail!("--shared goes with --event, --save-event or --delete-event");
     }
     show(&aws, &name, args.json)
 }
@@ -139,4 +174,85 @@ fn invoke(aws: &Aws, env: &str, name: &str, payload: &str, yes: bool, json: bool
         }
     }
     Ok(if inv.function_error.is_some() { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
+/// The saved events: this machine's, then the shared ones. Shared events that cannot be read
+/// (no permission for EventBridge Schemas) are told apart from having none.
+fn events(aws: &Aws, name: &str, json: bool) -> Result<ExitCode> {
+    let local = testevents::local(name);
+    let shared = testevents::shared(aws, name);
+    if json {
+        let list = |events: &[Event]| -> Vec<serde_json::Value> {
+            events.iter().map(|e| serde_json::json!({ "name": e.name, "payload": e.payload })).collect()
+        };
+        print_json(&serde_json::json!({
+            "function": name,
+            "local": list(&local),
+            "shared": shared.as_ref().map(|s| list(s)).unwrap_or_default(),
+            "sharedError": shared.as_ref().err().map(aws::AwsError::short),
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("{} · test events", paint(name, "1"));
+    let width = local.iter().chain(shared.iter().flatten()).map(|e| e.name.chars().count()).max().unwrap_or(0);
+    let print = |events: &[Event]| {
+        for e in events {
+            println!("  {:<width$}  {}  {}", e.name, paint(&format!("{:<13}", e.place.label()), "90"), ellipsize(&e.compact(), 100));
+        }
+    };
+    print(&local);
+    match &shared {
+        Ok(shared) => {
+            print(shared);
+            if local.is_empty() && shared.is_empty() {
+                println!("  {}", paint(&format!("none yet · {} lambda {name} --save-event NAME --payload '{{…}}'", program()), "90"));
+            }
+        }
+        Err(e) => println!("  {}", paint(&format!("the shared ones could not be read: {}", e.short()), "33")),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The saved event `event`: this machine's unless `shared`, else the one in AWS.
+fn saved_event(aws: &Aws, name: &str, event: &str, shared: bool) -> Result<Event> {
+    if !shared && let Some(e) = testevents::local(name).into_iter().find(|e| e.name == event) {
+        return Ok(e);
+    }
+    testevents::shared(aws, name)?
+        .into_iter()
+        .find(|e| e.name == event)
+        .ok_or_else(|| anyhow!("{name} has no saved test event named {event} ({} lambda {name} --events lists them)", program()))
+}
+
+fn save_event(aws: &Aws, env: &str, name: &str, event: &str, payload: &str, shared: bool, yes: bool) -> Result<ExitCode> {
+    testevents::check_name(event).map_err(|e| anyhow!(e))?;
+    let payload: serde_json::Value =
+        serde_json::from_str(read_value(payload)?.trim()).map_err(|e| anyhow!("the payload is not valid JSON: {e}"))?;
+    if !shared {
+        testevents::save_local(name, event, &payload)?;
+        println!("Saved the test event {event} of {name} on this machine");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !confirm_write(env, &format!("Save the shared test event {event} of {name} in {env}? Everyone with the account sees it."), yes)? {
+        bail!("not saved");
+    }
+    aws::schemas::save(aws, name, event, &payload)?;
+    println!("Saved the shared test event {event} of {name} · the Lambda console lists it too");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn delete_event(aws: &Aws, env: &str, name: &str, event: &str, shared: bool, yes: bool) -> Result<ExitCode> {
+    let found = if shared {
+        if !confirm_write(env, &format!("Delete the shared test event {event} of {name} in {env}? Nobody sees it any more."), yes)? {
+            bail!("not deleted");
+        }
+        aws::schemas::delete(aws, name, event)?
+    } else {
+        testevents::delete_local(name, event)?
+    };
+    if !found {
+        bail!("{name} has no {} test event named {event}", if shared { "shared" } else { "local" });
+    }
+    println!("Deleted the {} test event {event} of {name}", if shared { "shared" } else { "local" });
+    Ok(ExitCode::SUCCESS)
 }

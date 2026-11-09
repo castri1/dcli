@@ -952,7 +952,7 @@ pub fn writes(command: &str) -> bool {
             let reading = [
                 "--json", "--since", "--filter", "--follow", "-f", "--full", "--days", "--service", "--report", "--md", "--by-cost",
                 "--ledger", "--limit", "-n", "--range", "--usage", "--daily", "--commitments", "--config", "--all", "--help", "-h",
-                "--type", "--name", "--tasks", "--pods",
+                "--type", "--name", "--tasks", "--pods", "--events",
             ];
             !words.get(1).is_some_and(|w| commands.contains(&w.as_str()))
                 || words.iter().skip(1).any(|w| acting.contains(&w.as_str()))
@@ -1176,6 +1176,11 @@ mod tests {
         // A bearer token for the cluster, and a file written: never run for Claude.
         assert!(writes("dcli eks prod shop-prod --token"));
         assert!(writes("dcli eks prod shop-prod --kubeconfig"));
+        // Listing saved test events reads; using, saving or deleting one acts.
+        assert!(!writes("dcli lambda prod payments-webhook --events --json"));
+        assert!(writes("dcli lambda prod payments-webhook --event charge-succeeded --yes"));
+        assert!(writes("dcli lambda prod payments-webhook --save-event x --payload {} --shared"));
+        assert!(writes("dcli lambda prod payments-webhook --delete-event x"));
         assert!(writes("terraform apply"));
         assert!(writes("aws lambda get-function --function-name x;rm -rf ~"));
         assert!(writes("aws lambda get-function --function-name $(curl evil)"));
