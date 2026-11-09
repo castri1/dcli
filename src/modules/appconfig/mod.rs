@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use self::new_flag::{Builder, Step};
-use super::common::LoadState;
+use super::common::{LoadState, filter_bar, matches_filter};
 use crate::aws::appconfig::{
     self as ac, ALL_AT_ONCE, Application, Deployment, EnvState, Environment, Flag, FlagsDoc, Profile, Strategy,
 };
@@ -30,7 +30,7 @@ use crate::tui::form::{Field, Form, FormEvent};
 use crate::tui::module::{Ctx, Handled, Level, Module, Payload, View};
 use crate::tui::picker::{Item, Outcome, Picker};
 use crate::tui::theme;
-use crate::tui::widgets::{self, TextInput};
+use crate::tui::widgets::{self, InputEvent, TextInput};
 use crate::util::{ellipsize, fmt_ago, sanitize};
 
 const POLL_EVERY: Duration = Duration::from_secs(3);
@@ -132,6 +132,9 @@ pub struct AppConfig {
     open_target: Option<String>,
     /// A new flag being deployed: reopened with AppConfig's error if that fails.
     pending_flag: Option<Box<Builder>>,
+    /// The `/` search over the open profile's flags (name or key).
+    filter: TextInput,
+    filtering: bool,
 }
 
 /// Grey hint for an empty attribute field: its constraints.
@@ -193,6 +196,8 @@ impl AppConfig {
             list_area: Rect::default(),
             open_target: None,
             pending_flag: None,
+            filter: TextInput::default(),
+            filtering: false,
         }
     }
 
@@ -214,6 +219,7 @@ impl AppConfig {
         });
         self.list_state.select(Some(0));
         self.focus = Focus::List;
+        self.clear_filter();
         let aws = ctx.env().aws.clone();
         ctx.spawn(move || {
             let result = (|| -> aws::Result<AppData> {
@@ -238,6 +244,37 @@ impl AppConfig {
         let index = id.and_then(|id| self.apps.iter().position(|a| a.id == id)).unwrap_or(0);
         self.list_state.select(Some(index));
         self.focus = Focus::List;
+        self.clear_filter();
+    }
+
+    fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.filtering = false;
+    }
+
+    /// The key of the selected flag.
+    fn selected_key(&self) -> Option<String> {
+        let profile = self.profile()?;
+        self.rows(profile).get(self.row).map(|f| f.key.clone())
+    }
+
+    /// After the search changed: stays on flag `key` while it still matches, else the first.
+    fn reselect(&mut self, key: Option<String>) {
+        let rows = self.profile().map(|p| self.rows(p)).unwrap_or_default();
+        self.row = key.and_then(|k| rows.iter().position(|f| f.key == k)).unwrap_or(0);
+    }
+
+    /// Starts the flag search, from the profile list too.
+    fn start_filter(&mut self, ctx: &mut Ctx) {
+        match self.profile() {
+            Some(p) if p.is_feature_flags() && p.is_hosted() => {
+                self.focus = Focus::Table;
+                self.filtering = true;
+                self.ensure_docs(ctx);
+            }
+            Some(_) => ctx.toast(Level::Info, "/ searches the flags of a feature flag profile"),
+            None => ctx.toast(Level::Info, "Open a feature flag profile to search its flags with /"),
+        }
     }
 
     fn profile(&self) -> Option<&Profile> {
@@ -298,8 +335,18 @@ impl AppConfig {
         })
     }
 
-    /// Flags of every loaded version (latest first), by key.
+    /// The flags that match the search (all of them without one).
     fn rows(&self, profile: &Profile) -> Vec<Flag> {
+        let mut rows = self.all_rows(profile);
+        let query = self.filter.value.trim().to_lowercase();
+        if !query.is_empty() {
+            rows.retain(|f| matches_filter(&format!("{} {}", f.name, f.key), &query));
+        }
+        rows
+    }
+
+    /// Flags of every loaded version (latest first), by key.
+    fn all_rows(&self, profile: &Profile) -> Vec<Flag> {
         let Some(open) = &self.open else { return Vec::new() };
         let mut versions: Vec<i64> = self.latest.get(&profile.id).copied().flatten().into_iter().collect();
         versions.extend((0..open.envs.len()).filter_map(|e| self.env_state(e, profile).version()));
@@ -328,6 +375,7 @@ impl AppConfig {
         if self.list_state.selected() != Some(index) {
             self.row = 0;
             self.scroll = 0;
+            self.clear_filter();
         }
         self.list_state.select(Some(index));
         self.ensure_docs(ctx);
@@ -451,7 +499,7 @@ impl AppConfig {
             None if base.is_none() => None,
             None => return ctx.toast(Level::Info, "Still loading that version"),
         };
-        let mut taken: Vec<String> = self.rows(&profile).into_iter().map(|f| f.key).collect();
+        let mut taken: Vec<String> = self.all_rows(&profile).into_iter().map(|f| f.key).collect();
         taken.extend(base_doc.into_iter().flat_map(FlagsDoc::flags).map(|f| f.key));
         if let Some(active) = &state.active {
             ctx.toast(Level::Warn, format!("{} has a deployment {} — a new one waits for it", env.name, active.progress()));
@@ -732,7 +780,9 @@ impl AppConfig {
         let detail_h = 10u16.min(area.height / 2);
         let [table, detail] = area.layout(&Layout::vertical([Constraint::Fill(1), Constraint::Length(detail_h)]));
         let focused = self.focus == Focus::Table && self.dialog.is_none();
-        let block = widgets::panel(format!(" {} · flags × environments ", profile.name), focused);
+        let searching = self.filtering || !self.filter.value.is_empty();
+        let count = if searching { format!(" · {} of {}", rows.len(), self.all_rows(profile).len()) } else { String::new() };
+        let block = widgets::panel(format!(" {} · flags × environments{count} ", profile.name), focused);
         let inner = block.inner(table);
         f.render_widget(block, table);
 
@@ -754,9 +804,20 @@ impl AppConfig {
             };
             status.push(Span::styled(format!("{:<col_w$}", ellipsize(&text, col_w - 1)), style));
         }
-        let mut lines = vec![Line::from(header), Line::from(status), Line::raw("")];
+        // The search takes the blank line under the header.
+        let (bar, cursor) = filter_bar(&self.filter, self.filtering, "type / to search flags");
+        if let Some(col) = cursor.filter(|_| self.dialog.is_none() && inner.height > 2) {
+            f.set_cursor_position((inner.x + col, inner.y + 2));
+        }
+        let mut lines = vec![Line::from(header), Line::from(status), bar];
         if rows.is_empty() {
-            let text = if self.docs_loading.is_empty() { "No flags in this profile · n creates one" } else { "Loading…" };
+            let text = if !self.docs_loading.is_empty() {
+                "Loading…".to_string()
+            } else if searching {
+                format!("No flag matches \"{}\" · Esc clears", self.filter.value.trim())
+            } else {
+                "No flags in this profile · n creates one".to_string()
+            };
             lines.push(Line::styled(format!("{:<flag_w$}{text}", ""), theme::muted()));
         }
         let height = inner.height.saturating_sub(3) as usize;
@@ -836,7 +897,7 @@ impl AppConfig {
                 Style::new().fg(theme::RUNNING),
             ));
         }
-        lines.push(Line::styled("Enter edit · n new flag · y copy the document · Esc back", theme::muted()));
+        lines.push(Line::styled("Enter edit · / search · n new flag · y copy the document · Esc back", theme::muted()));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(widgets::panel(format!(" {} ", env.name), false)), area);
     }
 
@@ -1107,6 +1168,27 @@ impl Module for AppConfig {
             return Handled::Yes;
         }
         let selected = self.list_state.selected().unwrap_or(0);
+        if self.filtering {
+            let key_before = self.selected_key();
+            match self.filter.handle(key) {
+                InputEvent::Changed => self.reselect(key_before),
+                InputEvent::Submit => self.filtering = false,
+                InputEvent::Moved => {}
+                InputEvent::Cancel => {
+                    self.clear_filter();
+                    self.reselect(key_before);
+                }
+                InputEvent::Ignored => {
+                    let rows = self.cell_count().0;
+                    match key.code {
+                        KeyCode::Up => self.row = self.row.saturating_sub(1),
+                        KeyCode::Down => self.row = (self.row + 1).min(rows.saturating_sub(1)),
+                        _ => {}
+                    }
+                }
+            }
+            return Handled::Yes;
+        }
         if self.focus == Focus::Table {
             let (rows, cols) = self.cell_count();
             let flags = self.profile().is_some_and(Profile::is_feature_flags);
@@ -1142,6 +1224,12 @@ impl Module for AppConfig {
                         self.focus = Focus::Table;
                     }
                 }
+                KeyCode::Char('/') => self.start_filter(ctx),
+                KeyCode::Esc if !self.filter.value.is_empty() => {
+                    let key_before = self.selected_key();
+                    self.clear_filter();
+                    self.reselect(key_before);
+                }
                 KeyCode::Esc => self.focus = Focus::List,
                 _ => return Handled::No,
             }
@@ -1161,6 +1249,7 @@ impl Module for AppConfig {
                 }
             },
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') if self.open.is_some() => self.close_app(),
+            KeyCode::Char('/') => self.start_filter(ctx),
             KeyCode::Char('n') => self.open_new_profile(ctx),
             KeyCode::Char('y') => self.copy_document(ctx),
             KeyCode::Char('r') => match self.open.as_ref().and_then(|o| self.apps.iter().position(|a| a.id == o.app.id)) {
@@ -1257,7 +1346,8 @@ impl Module for AppConfig {
                         self.last_poll = Some(Instant::now());
                         match builder {
                             Some(b) => {
-                                // The new flag's row, selected.
+                                // The new flag's row, selected (a search could hide it).
+                                self.clear_filter();
                                 if let Some(i) = self.profile().cloned().and_then(|p| self.rows(&p).iter().position(|f| f.key == b.flag.key)) {
                                     self.row = i;
                                 }
@@ -1399,14 +1489,18 @@ impl Module for AppConfig {
             Some(Dialog::Busy(_)) => return Vec::new(),
             None => {}
         }
+        if self.filtering {
+            return vec![("Enter", "keep search"), ("Esc", "clear"), ("↑↓", "flag")];
+        }
         match (&self.open, &self.focus) {
             (None, _) => vec![("↑↓", "application"), ("Enter", "open"), ("r", "reload")],
             (Some(_), Focus::List) => {
-                vec![("↑↓", "profile"), ("Enter", "flags"), ("n", "new profile"), ("Esc", "applications"), ("y", "copy"), ("r", "reload")]
+                vec![("↑↓", "profile"), ("Enter", "flags"), ("/", "search flags"), ("n", "new profile"), ("Esc", "applications"), ("y", "copy"), ("r", "reload")]
             }
             (Some(_), Focus::Table) => vec![
                 ("↑↓←→", "flag/env"),
                 ("Enter", "edit"),
+                ("/", "search"),
                 ("n", "new flag"),
                 ("x", "stop deployment"),
                 ("y", "copy"),
@@ -1425,10 +1519,15 @@ impl Module for AppConfig {
     }
 
     fn capturing(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || self.filtering
     }
 
     fn paste(&mut self, text: &str, _ctx: &mut Ctx) {
+        if self.filtering && self.dialog.is_none() {
+            let key_before = self.selected_key();
+            self.filter.insert_str(text, false);
+            return self.reselect(key_before);
+        }
         match &mut self.dialog {
             Some(Dialog::Edit { form, .. }) | Some(Dialog::NewProfile(form)) => form.paste(text),
             Some(Dialog::NewFlag(b)) => b.paste(text),
